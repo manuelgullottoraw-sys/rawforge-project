@@ -183,7 +183,29 @@ jobs:
           path: shared/src/desktopMain/kotlin
 
       - name: Build Windows EXE installer
-        run: gradle :desktopApp:packageExe --stacktrace
+        # Rete: repo.maven.apache.org (Maven Central) a volte risponde 403
+        # Forbidden a runner GitHub Windows durante la risoluzione di
+        # runtimeClasspath (molte richieste POM sequenziali) — causa nota,
+        # corretta disabilitando l'HTTP keep-alive in gradle.properties. Come
+        # rete di sicurezza, se dovesse ricapitare (es. rate-limit transitorio
+        # lato Maven Central) ritentiamo il task fino a 3 volte con una pausa,
+        # invece di far fallire subito l'intera build.
+        shell: pwsh
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Tentativo $attempt di $maxAttempts..."
+            gradle :desktopApp:packageExe --stacktrace
+            if ($LASTEXITCODE -eq 0) {
+              break
+            }
+            if ($attempt -lt $maxAttempts) {
+              Write-Host "Fallito, attendo 30s prima di ritentare (possibile blocco transitorio di Maven Central)..."
+              Start-Sleep -Seconds 30
+            } else {
+              exit $LASTEXITCODE
+            }
+          }
 
       - name: Collect EXE artifact
         shell: pwsh
