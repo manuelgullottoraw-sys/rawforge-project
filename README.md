@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 69 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 71 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -382,6 +382,70 @@ scenario reale: due tinte unite a tonalità quasi identica (134°/136°, appena 
 confine banda), con un Look che alza molto la saturazione di una sola delle due bande — con il
 vecchio bucket netto le due immagini finivano con saturazioni radicalmente diverse pur partendo da
 tonalità quasi identiche, con l'interpolazione la differenza resta piccola.
+
+## Corretto: dominante di colore diffusa segnalata come "peggiorata" dopo la correzione precedente
+
+Secondo bug reale segnalato dall'utente con uno screenshot, subito dopo la consegna della
+correzione qui sopra: su un'altra foto (niente più "a blocchi", ma una forte dominante
+rosa/arancio su gran parte del fotogramma), con l'avviso "ombre schiacciate" delle slider sicure
+visibile e uno slider Neri già portato a -60 in risposta a quell'avviso. Invece di modificare di
+nuovo alla cieca partendo solo dallo screenshot, l'indagine è stata condotta scrivendo piccoli
+programmi Rust di debug che usano le stesse funzioni del motore per stampare i valori intermedi
+(il `HarmonicLook` estratto, i pixel renderizzati) e salvare il rendering risultante, così da
+poter verificare — non solo ipotizzare — quale componente fosse davvero responsabile. Sono emersi
+due difetti reali, distinti, entrambi corretti:
+
+**1. `hsl_sat` nell'estrazione (`harmonic`) aveva un range troppo ampio.** La saturazione per
+banda di tonalità (`HarmonicLook.hsl.sat[banda]`) veniva calcolata come scarto percentuale della
+saturazione media della banda rispetto a una soglia fissa (`BASELINE_HSL_SATURATION = 0.35`),
+poi limitata a `±100`. Ma quella media è una media aritmetica di valori sempre non-negativi (a
+differenza, per esempio, del centroide Lab usato per lo split toning, che invece cancella
+naturalmente il rumore in direzioni opposte): nella grande maggioranza delle foto reali, quasi
+tutte le 8 bande hanno una saturazione media ben sotto 0.35 (poca scena è davvero satura), il che
+spinge quelle bande verso l'estremo -100 ("desatura completamente questa tonalità"); al contrario
+una banda che cattura anche poco colore incidentale può schizzare al +100 opposto ("raddoppia la
+saturazione di questa tonalità"). Combinato con l'interpolazione circolare della correzione
+precedente (che, correttamente, DIFFONDE l'effetto di un valore estremo anche sulle tonalità
+vicine), il risultato su "Incolla impostazioni" poteva essere una dominante di colore diffusa e
+innaturale — esattamente il tipo di effetto segnalato. **Corretto**: il range è stato ristretto a
+`±50`, coerente con il fatto che questo è già il ritocco automatico più "rischioso" fra i tre HSL
+per banda (`hsl_lum` era già limitato a ±30, `hsl_hue` a ±15) — lo slider MANUALE dell'HSL nella UI
+resta invariato (±100, è una scelta creativa esplicita dell'utente, non un artefatto
+dell'estrazione automatica).
+
+**2. Gli slider "Bianchi"/"Neri" non avevano ALCUN effetto sul rendering.** Verificato con una
+ricerca diretta nel codice (`grep` di `look.whites`/`look.blacks` in `look-render`): zero
+riscontri. I due campi esistono nel modello dati, attraversano FFI e l'export `.xmp`, ma non
+venivano mai letti dal renderer — un difetto preesistente, non introdotto in questa consegna, ma
+scoperto proprio indagando su questo caso, perché era la causa diretta per cui portare Neri a -60
+non aveva avuto alcun effetto visibile sull'avviso "ombre schiacciate" che l'utente stava cercando
+di correggere. **Corretto**: aggiunte `blacks_mask`/`whites_mask`, zone tonali più STRETTE di
+`shadow_mask`/`highlight_mask` (mirate ai soli estremi nero/bianco puro, non all'ampia metà
+inferiore/superiore del range), con lo stesso segno di ombre/luci (positivo = schiarisce quella
+zona). **Nota pratica per l'avviso "ombre schiacciate"**: la correzione giusta è portare
+Neri/Ombre POSITIVO, non negativo — negativo le schiaccia ulteriormente. Prima di questa
+correzione, portare Neri a un valore qualsiasi non cambiava nulla; ora Neri POSITIVO alza il
+punto di nero come atteso.
+
+**Verificato ma escluso come causa**: il bilanciamento del bianco a gradiente è stato testato
+riproducendo ESATTAMENTE i valori dello screenshot dell'utente (Zona A/B, posizione e ampiezza
+della transizione) — il rendering risultante è una transizione fredda/calda morbida e
+ragionevole, non una dominante innaturale; la funzione stessa non è la causa del problema
+segnalato. Anche `smartbatch::apply_deltas` (Smart-Batch Contestuale) è stato escluso leggendone
+il codice per intero: modifica solo esposizione/luci/ombre, mai i campi del bilanciamento del
+bianco a gradiente.
+
+**Onestà su cosa resta incerto**: la dominante magenta/rosa esatta vista nello screenshot
+dell'utente non è stata riprodotta al 100% con gli stessi identici colori partendo dai soli
+valori slider visibili — è plausibile che il `HarmonicLook` reale dell'utente avesse anche valori
+di HSL per banda o split toning diversi da zero (fuori dallo screenshot, es. da un "Incolla
+impostazioni" precedente) che la correzione al punto 1 riduce direttamente. Se il problema
+dovesse ripresentarsi dopo questa consegna, condividere la foto campione e quella target userebbe
+per individuare la causa esatta invece di continuare a ipotizzare da uno screenshot.
+
+Due nuovi test in `look-render` (`positive_blacks_lifts_near_black_pixels_more_than_midtones`,
+`negative_whites_pulls_near_white_pixels_down_more_than_midtones`) verificano il punto 2, sul
+modello dell'analogo test già esistente per ombre/luci. Workspace completo: 71 test, tutti verdi.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

@@ -126,6 +126,30 @@ fn highlight_mask(luma: f32) -> f32 {
     ((luma - 0.6) * 2.5).clamp(0.0, 1.0)
 }
 
+/// **Bug reale scoperto e corretto in questo giro**: `look.whites`/`look.blacks`
+/// (gli slider "Bianchi"/"Neri" della UI, distinti da "Luci"/"Ombre") esistevano
+/// nel modello dati, attraversavano FFI e l'export `.xmp`, ma non venivano MAI
+/// letti da questo renderer — non avevano alcun effetto sull'immagine mostrata.
+/// Per l'utente che aveva impostato Neri=-60 in risposta all'avviso "ombre
+/// schiacciate" delle slider sicure, questo significava che l'unico strumento a
+/// disposizione per correggere l'avviso non faceva nulla, lasciando il problema
+/// visibile invariato.
+///
+/// `blacks_mask`/`whites_mask` seguono lo stesso schema di `shadow_mask`/
+/// `highlight_mask` ma con zone più STRETTE, mirate ai soli estremi tonali veri
+/// (nero/bianco pieno) invece dell'ampia metà inferiore/superiore del range
+/// tonale coperta da ombre/luci — la stessa distinzione concettuale che in
+/// Lightroom separa "Ombre"/"Luci" (zone ampie, morbide) da "Neri"/"Bianchi"
+/// (solo gli estremi, per fissare il punto di nero/bianco).
+fn blacks_mask(luma: f32) -> f32 {
+    (1.0 - luma * (1.0 / 0.12)).clamp(0.0, 1.0)
+}
+
+/// Come [`blacks_mask`] ma per la zona "bianchi": zero sotto 0.88, pieno a 1.0.
+fn whites_mask(luma: f32) -> f32 {
+    ((luma - 0.88) * (1.0 / 0.12)).clamp(0.0, 1.0)
+}
+
 /// Frazione (0.0..1.0) di pixel "vicini al nero puro" (luma <= 2) e "vicini al
 /// bianco puro" (luma >= 253) in `image` — pensato per essere chiamato
 /// sull'immagine GIÀ RENDERIZZATA (non sull'originale), così la UI può
@@ -257,6 +281,8 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     let contrast_amount = 1.0 + (look.contrast as f32 / 100.0);
     let shadows_amount = look.shadows as f32 / 100.0;
     let highlights_amount = look.highlights as f32 / 100.0;
+    let blacks_amount = look.blacks as f32 / 100.0;
+    let whites_amount = look.whites as f32 / 100.0;
 
     // Bilanciamento del bianco: un guadagno per canale in spazio lineare, non
     // un vero profilo colore camera (matrice o DCP) — quello richiederebbe
@@ -318,11 +344,21 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                 // Highlights/shadows: lift mascherato per zona tonale (positivo
                 // = schiarisce quella zona, come in Lightroom per le ombre;
                 // per le luci il segno è invertito, "highlights" negativo =
-                // recupero luci bruciate).
+                // recupero luci bruciate). Bianchi/Neri seguono la STESSA
+                // convenzione di segno (positivo = schiarisce quella zona) ma
+                // agiscono solo sugli estremi veri (vedi `blacks_mask`/
+                // `whites_mask`) — per questo Neri POSITIVO (non negativo) è la
+                // risposta corretta a un avviso di "ombre schiacciate": alza il
+                // punto di nero invece di scurirlo ulteriormente.
                 let luma = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
                 let s_mask = shadow_mask(luma);
                 let h_mask = highlight_mask(luma);
-                let lift = shadows_amount * s_mask * 0.25 + highlights_amount * h_mask * 0.25;
+                let b_mask = blacks_mask(luma);
+                let w_mask = whites_mask(luma);
+                let lift = shadows_amount * s_mask * 0.25
+                    + highlights_amount * h_mask * 0.25
+                    + blacks_amount * b_mask * 0.25
+                    + whites_amount * w_mask * 0.25;
                 for c in srgb.iter_mut() {
                     *c = (*c + lift).clamp(0.0, 1.0);
                 }
@@ -463,6 +499,37 @@ mod tests {
         let bright_delta = mean_luma(&render_preview_with_look(&bright, &look)) - mean_luma(&bright);
         assert!(dark_delta > bright_delta, "dark_delta={dark_delta} bright_delta={bright_delta}");
         assert!(dark_delta > 0.0);
+    }
+
+    #[test]
+    fn positive_blacks_lifts_near_black_pixels_more_than_midtones() {
+        // Bug reale corretto in questo giro: `look.blacks` non veniva mai
+        // letto dal renderer, quindi questo slider ("Neri") non aveva alcun
+        // effetto — regressione diretta contro quel difetto.
+        let near_black = solid_image(4, 4, [5, 5, 5]);
+        let midtone = solid_image(4, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.blacks = 100;
+
+        let black_delta = mean_luma(&render_preview_with_look(&near_black, &look)) - mean_luma(&near_black);
+        let mid_delta = mean_luma(&render_preview_with_look(&midtone, &look)) - mean_luma(&midtone);
+        assert!(black_delta > mid_delta, "black_delta={black_delta} mid_delta={mid_delta}");
+        assert!(black_delta > 0.0);
+    }
+
+    #[test]
+    fn negative_whites_pulls_near_white_pixels_down_more_than_midtones() {
+        // Bug reale corretto in questo giro: `look.whites` ("Bianchi") era
+        // anch'esso completamente inerte prima di questa modifica.
+        let near_white = solid_image(4, 4, [250, 250, 250]);
+        let midtone = solid_image(4, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.whites = -100;
+
+        let white_delta = mean_luma(&render_preview_with_look(&near_white, &look)) - mean_luma(&near_white);
+        let mid_delta = mean_luma(&render_preview_with_look(&midtone, &look)) - mean_luma(&midtone);
+        assert!(white_delta < mid_delta, "white_delta={white_delta} mid_delta={mid_delta}");
+        assert!(white_delta < 0.0);
     }
 
     #[test]

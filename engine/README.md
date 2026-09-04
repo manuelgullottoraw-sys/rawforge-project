@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (69 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 9, `look_render` 22, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
+Crate reali, compilati e testati (71 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 9, `look_render` 24, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -252,6 +252,76 @@ piacere sulla foto — una UI di posizionamento 2D e un'interpolazione multi-pun
 lavoro sostanzialmente più grande per lo stesso caso d'uso reale (cielo freddo in alto, terreno
 caldo in basso); "slider sicuri" mostra solo il clipping del valore ATTUALE, non un'anteprima
 dipinta sull'intero binario dello slider.
+
+## Corretto (questo giro): due bug reali di dominanti/blocchi di colore segnalati dall'utente
+
+Due segnalazioni consecutive dell'utente, ciascuna con uno screenshot, hanno portato a tre
+correzioni reali nel motore (non semplici ritocchi estetici):
+
+**1. Confine netto ogni 45° nell'applicazione HSL per banda (`look-render`).**
+`render_preview_with_look` applicava gli 8 aggiustamenti HSL per banda
+(`HarmonicLook.hsl.{hue,sat,lum}`) assegnando ogni pixel a un'UNICA banda in base alla sua
+tonalità (`floor(hue / 45) % 8` implicito) e applicandone l'aggiustamento per intero — nessuna
+transizione fra bande adiacenti. Su tonalità che variano con continuità (fogliame, cielo) questo
+produceva bordi artificiali netti a forma di blocco ovunque la tonalità di due pixel vicini
+cadesse ai due lati di un confine banda — il difetto "immagine a blocchi/posterizzata" segnalato
+per primo. **Corretto** con `interpolate_hsl_band(values: &[i32; 8], hue: f32) -> f32`:
+interpolazione lineare circolare (wrap a 360°) fra i valori delle due bande più vicine al centro
+del proprio intervallo di 45° — ogni banda ha pieno effetto solo al proprio centro, ai bordi
+l'effetto sfuma 50/50, la somma dei pesi resta sempre 1. Cinque test dedicati (incluso uno
+end-to-end che riproduce lo scenario: due tinte a tonalità quasi identica ai due lati di un
+confine banda, verificando che la differenza di saturazione risultante resti piccola invece che
+radicale).
+
+**2. Range troppo ampio per `hsl_sat` in estrazione (`harmonic`).** Nella Sintesi Armonica,
+`hsl_sat[banda]` (scarto percentuale della saturazione media di banda rispetto alla soglia fissa
+`BASELINE_HSL_SATURATION = 0.35`) era limitato a `.clamp(-100.0, 100.0)`, a differenza dei suoi
+"fratelli" `hsl_lum` (±30) e `hsl_hue` (±15), i cui commenti nel codice già dichiaravano
+esplicitamente range più stretti "perché è il ritocco più visibile/rischioso". Meccanismo:
+`band_mean_sat` è una MEDIA ARITMETICA di valori di saturazione HSL sempre non-negativi (nessuna
+cancellazione vettoriale, a differenza per esempio del centroide Lab a/b usato dallo split
+toning, che invece cancella naturalmente rumore in direzioni opposte) — quasi ogni banda popolata
+prevalentemente da pixel quasi neutri/poco saturi (la stragrande maggioranza delle bande nella
+maggior parte delle foto reali) calcola una `band_mean_sat` ben sotto 0.35, spingendo il bias di
+quella banda verso l'estremo -100 ("desatura completamente questa tonalità"); al contrario una
+banda che cattura anche poco colore incidentale (verificato: un "rosso" test (200,30,40) ha hue
+effettivo ≈356.5°, quindi cade nella banda "Magenta" 315-360° invece che "Rosso", per la sua
+lieve componente blu) può schizzare all'estremo opposto +100. Combinato con la correzione al
+punto 1 (che DIFFONDE l'influenza di un valore estremo su un range di tonalità più ampio tramite
+l'interpolazione), questo spiega plausibilmente la dominante di colore diffusa segnalata come
+"peggiorata" dopo la prima correzione. **Corretto**: range ristretto a `.clamp(-50.0, 50.0)`. Lo
+slider HSL MANUALE nella UI (±100, esposto in `look-render`) resta deliberatamente invariato: è
+una scelta creativa esplicita dell'utente, non un artefatto dell'estrazione automatica.
+
+**3. `look.whites`/`look.blacks` mai letti dal renderer (`look-render`).** I campi
+`HarmonicLook.whites`/`.blacks` (slider UI "Bianchi"/"Neri") esistono nel modello dati,
+attraversano FFI e l'export `.xmp`, ma — verificato con `grep` diretto, zero riscontri — non
+venivano mai usati in `render_preview_with_look`: non avevano alcun effetto sull'immagine
+renderizzata. Difetto preesistente (non introdotto in questo giro), ma rilevante perché l'utente
+aveva provato a rispondere all'avviso "ombre schiacciate" delle slider sicure impostando
+Neri=-60, senza alcun effetto visibile. **Corretto**: aggiunte `blacks_mask(luma)`/
+`whites_mask(luma)`, sullo stesso schema di `shadow_mask`/`highlight_mask` ma con zone più
+STRETTE (`(1.0 - luma / 0.12).clamp(0,1)` e `((luma - 0.88) / 0.12).clamp(0,1)`, contro le zone
+larghe di ombre/luci sotto 0.4/sopra 0.6) — mirate ai soli estremi tonali veri, non all'ampia
+metà inferiore/superiore del range. Stesso segno di ombre/luci (positivo = schiarisce quella
+zona): per correggere "ombre schiacciate" la risposta corretta è Neri POSITIVO, non negativo.
+Due nuovi test: `positive_blacks_lifts_near_black_pixels_more_than_midtones`,
+`negative_whites_pulls_near_white_pixels_down_more_than_midtones`.
+
+**Verificato ma escluso come causa della dominante segnalata**: il bilanciamento del bianco a
+gradiente, testato riproducendo esattamente i valori slider dello screenshot dell'utente
+(`white_balance={5389,0}`, `white_balance_b={11038,0}`, gradiente verticale, posizione 47,
+ampiezza 9) tramite uno script di debug dedicato — produce una transizione fredda/calda morbida e
+ragionevole, non una dominante innaturale. Anche `smartbatch::apply_deltas` è stato escluso
+leggendone il codice per intero: modifica solo `exposure_ev`/`highlights`/`shadows`, mai i campi
+del bilanciamento del bianco (singolo o a gradiente).
+
+Non è stato possibile riprodurre al 100% l'esatta dominante magenta/rosa dello screenshot
+dell'utente partendo dai soli valori slider visibili in foto — è plausibile che il suo
+`HarmonicLook` reale avesse anche valori HSL per banda o split toning diversi da zero, fuori
+inquadratura nello screenshot, che la correzione al punto 2 riduce direttamente alla radice. Se
+il problema dovesse ripresentarsi, condividere la foto campione e quella target permetterebbe di
+individuare la causa esatta invece di continuare a ipotizzare da uno screenshot.
 
 ## Comandi
 

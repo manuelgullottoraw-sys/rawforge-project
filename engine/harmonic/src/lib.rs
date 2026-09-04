@@ -236,8 +236,34 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
         let band_mean_hue = (bucket.sum_hue / n_band) as f32;
         let band_center_hue = band as f32 * 45.0 + 22.5;
 
+        // Range stretto (+-50, non +-100): **bug reale scoperto e corretto in
+        // questo giro**, causa della dominante magenta/viola diffusa segnalata
+        // dall'utente su un rendering "incolla impostazioni". `BASELINE_HSL_
+        // SATURATION` (0.35) è una stima di quanto sia "tipicamente satura" UNA
+        // banda di tonalità in una foto qualunque — ma nella grande maggioranza
+        // delle foto reali quasi tutte le 8 bande hanno una saturazione media
+        // MOLTO più bassa di 0.35 (gran parte della scena è pavimentazione,
+        // pelle, cielo, grigi quasi neutri con solo una leggerissima e
+        // involontaria dominante di colore), quindi quasi ogni banda finiva
+        // clampata al -100 estremo ("azzera del tutto questa tonalità"), mentre
+        // la sola banda che per caso intercettava un'area davvero satura (anche
+        // solo per una classificazione di hue vicina al confine, es. un rosso
+        // con una lieve componente blu che cade nella banda "Magenta" invece di
+        // "Rosso") finiva clampata al +100 opposto ("raddoppia questa
+        // tonalità"). Il risultato, con l'interpolazione circolare fra bande
+        // adiacenti (vedi `look-render::interpolate_hsl_band`), è che un'ampia
+        // porzione della ruota dei colori finiva o quasi completamente
+        // desaturata o vistosamente amplificata verso quell'unica tonalità
+        // "vincente" — non uno stile estratto dalla foto campione, un
+        // artefatto della formula. Dimezzare il range (+-50, moltiplicatore
+        // 0.5x-1.5x invece di 0x-2x) tiene il segnale (quali tonalità la foto
+        // campione enfatizza/desatura rispetto alle altre) senza più poter
+        // azzerare o raddoppiare un'intera banda da solo. Non tocca il range
+        // dello slider MANUALE nel pannello Develop (-100..100, in
+        // `look-render`): lì è una scelta deliberata dell'utente, non
+        // un'estrazione automatica da guardrail.
         hsl_sat[band] = (((band_mean_sat - BASELINE_HSL_SATURATION) / BASELINE_HSL_SATURATION) * 100.0)
-            .clamp(-100.0, 100.0) as i32;
+            .clamp(-50.0, 50.0) as i32;
         // Range stretto (+-30): un ritocco di luminanza per banda, non una
         // riesposizione mascherata per colore.
         hsl_lum[band] = ((band_mean_lum - overall_hsl_lum) * 200.0).clamp(-30.0, 30.0) as i32;
