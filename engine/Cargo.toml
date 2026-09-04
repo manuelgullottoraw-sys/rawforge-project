@@ -9,6 +9,7 @@ members = [
     "metadata",
     "gpu-pipe",
     "raw-decode",
+    "look-render",
     "ffi",
 ]
 

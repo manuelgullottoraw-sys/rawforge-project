@@ -1,0 +1,11 @@
+[package]
+name = "look-render"
+version = "0.1.0"
+edition = "2021"
+description = "Applica un HarmonicLook ai pixel di un'immagine su CPU, per un'anteprima renderizzata in-app (docs/ARCHITECTURE.md, §3.2)"
+
+[dependencies]
+core-types = { path = "../core-types" }
+color-science = { path = "../color-science" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rayon = "1"

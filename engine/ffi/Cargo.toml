@@ -21,4 +21,5 @@ smartbatch = { path = "../smartbatch" }
 metadata = { path = "../metadata" }
 xmp = { path = "../xmp" }
 raw-decode = { path = "../raw-decode" }
+look-render = { path = "../look-render" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

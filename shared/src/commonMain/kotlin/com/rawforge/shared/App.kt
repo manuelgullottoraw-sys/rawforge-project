@@ -13,6 +13,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Button
 import androidx.compose.material.Divider
 import androidx.compose.material.MaterialTheme
+import androidx.compose.material.Slider
 import androidx.compose.material.Surface
 import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
@@ -24,11 +25,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 
 /**
  * Stato di una foto importata dall'utente: tiene anche i bytes originali
- * (servono per rilanciare la Sintesi Armonica sui dati grezzi, non sulla
- * sola anteprima) insieme a ciò che la UI mostra.
+ * (servono a rilanciare l'analisi sui dati grezzi, non sulla sola anteprima)
+ * insieme a ciò che la UI mostra. Usato sia per la foto campione sia per la
+ * foto da modificare.
  */
 private data class ImportState(
     val fileName: String,
@@ -38,44 +41,81 @@ private data class ImportState(
 )
 
 /**
- * UI condivisa (identica su Android e Windows). Le prime due sezioni (stato
- * motore, preset XMP di esempio) sono la demo minimale già verificata in CI;
- * la terza sezione è il flusso reale: importare una foto qualunque (anche un
- * vero file RAW di una fotocamera), vederne l'anteprima decodificata dal
- * motore Rust, e applicarci la Sintesi Armonica Automatica esportando subito
- * un preset Lightroom `.xmp` (docs/ARCHITECTURE.md, §2, §4.1, §5). Il modulo
- * Develop, la libreria a griglia e il batch multi-foto (Smart-Batch
- * Contestuale, §4.2) restano da costruire sopra questa base.
+ * UI condivisa (identica su Android e Windows). Tre sezioni:
+ * 1. la demo minimale originale (stato motore, preset XMP di esempio), già
+ *    verificata in CI su entrambe le piattaforme;
+ * 2. importa la foto campione (quella con il "look" da copiare) e copiane le
+ *    impostazioni come preset Lightroom `.xmp`;
+ * 3. apri la foto da modificare e incollaci le impostazioni copiate — non
+ *    identiche, ma adattate in modo intelligente alla scena specifica di
+ *    quella foto (Smart-Batch Contestuale, docs/ARCHITECTURE.md §4.2).
+ *    L'anteprima risultante resta e si vede subito nell'app, l'export `.xmp`
+ *    (sezione 2) resta un'azione separata e facoltativa.
+ * Il modulo Develop con slider in tempo reale, la libreria a griglia e il
+ * batch su centinaia di foto restano da costruire sopra questa base.
  */
 @Composable
 fun RawForgeApp() {
     var engineInfo by remember { mutableStateOf<String?>(null) }
     var xmpPreview by remember { mutableStateOf<String?>(null) }
 
-    var importState by remember { mutableStateOf<ImportState?>(null) }
-    var importError by remember { mutableStateOf<String?>(null) }
+    var sampleState by remember { mutableStateOf<ImportState?>(null) }
+    var sampleError by remember { mutableStateOf<String?>(null) }
     var harmonicXmp by remember { mutableStateOf<String?>(null) }
     var harmonicError by remember { mutableStateOf<String?>(null) }
 
-    val launchFilePicker = rememberFilePickerLauncher { bytes, fileName ->
-        importError = null
-        harmonicXmp = null
-        harmonicError = null
+    var targetState by remember { mutableStateOf<ImportState?>(null) }
+    var targetError by remember { mutableStateOf<String?>(null) }
+    var overrideStrength by remember { mutableStateOf(1f) }
+    var adaptedBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
+    var adaptedInfo by remember { mutableStateOf<String?>(null) }
+    var pasteError by remember { mutableStateOf<String?>(null) }
+
+    fun importInto(bytes: ByteArray, fileName: String, onDone: (ImportState) -> Unit, onError: (String) -> Unit) {
         Engine.importPhoto(bytes, fileName).fold(
             onSuccess = { photo ->
-                importState = ImportState(
-                    fileName = photo.fileName,
-                    rawBytes = bytes,
-                    cameraLabel = listOfNotNull(photo.cameraMake, photo.cameraModel)
-                        .joinToString(" ")
-                        .ifBlank { null },
-                    bitmap = decodeImageBitmapOrNull(photo.previewImageBytes),
+                onDone(
+                    ImportState(
+                        fileName = photo.fileName,
+                        rawBytes = bytes,
+                        cameraLabel = listOfNotNull(photo.cameraMake, photo.cameraModel)
+                            .joinToString(" ")
+                            .ifBlank { null },
+                        bitmap = decodeImageBitmapOrNull(photo.previewImageBytes),
+                    )
                 )
             },
-            onFailure = { error ->
-                importState = null
-                importError = error.message ?: "Errore sconosciuto durante l'importazione"
-            }
+            onFailure = { error -> onError(error.message ?: "Errore sconosciuto durante l'importazione") }
+        )
+    }
+
+    val launchSamplePicker = rememberFilePickerLauncher { bytes, fileName ->
+        sampleError = null
+        harmonicXmp = null
+        harmonicError = null
+        // Cambiando la foto campione, un'eventuale anteprima già incollata
+        // sulla foto target non rispecchia più le impostazioni correnti.
+        adaptedBitmap = null
+        adaptedInfo = null
+        pasteError = null
+        importInto(
+            bytes,
+            fileName,
+            onDone = { sampleState = it },
+            onError = { sampleError = it; sampleState = null }
+        )
+    }
+
+    val launchTargetPicker = rememberFilePickerLauncher { bytes, fileName ->
+        targetError = null
+        adaptedBitmap = null
+        adaptedInfo = null
+        pasteError = null
+        importInto(
+            bytes,
+            fileName,
+            onDone = { targetState = it },
+            onError = { targetError = it; targetState = null }
         )
     }
 
@@ -127,16 +167,16 @@ fun RawForgeApp() {
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
                 )
                 Spacer(Modifier.height(8.dp))
-                Button(onClick = { launchFilePicker() }) {
+                Button(onClick = { launchSamplePicker() }) {
                     Text("Importa foto campione…")
                 }
 
-                importError?.let {
+                sampleError?.let {
                     Spacer(Modifier.height(8.dp))
                     Text("Errore: $it", color = MaterialTheme.colors.error)
                 }
 
-                importState?.let { state ->
+                sampleState?.let { state ->
                     Spacer(Modifier.height(16.dp))
                     Text(state.fileName, style = MaterialTheme.typography.subtitle1)
                     state.cameraLabel?.let {
@@ -181,6 +221,101 @@ fun RawForgeApp() {
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                             style = MaterialTheme.typography.caption
                         )
+                    }
+                }
+
+                if (sampleState != null) {
+                    Spacer(Modifier.height(32.dp))
+                    Divider(modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(24.dp))
+
+                    Text("Apri la foto da modificare", style = MaterialTheme.typography.h5)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Le impostazioni copiate dalla foto campione verranno adattate in modo " +
+                            "intelligente alla scena di questa foto (Smart-Batch Contestuale), non " +
+                            "applicate identiche.",
+                        style = MaterialTheme.typography.caption,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = { launchTargetPicker() }) {
+                        Text("Apri foto da modificare…")
+                    }
+
+                    targetError?.let {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Errore: $it", color = MaterialTheme.colors.error)
+                    }
+
+                    targetState?.let { target ->
+                        Spacer(Modifier.height(16.dp))
+                        Text(target.fileName, style = MaterialTheme.typography.subtitle1)
+                        target.cameraLabel?.let {
+                            Text(it, style = MaterialTheme.typography.caption)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        val shownBitmap = adaptedBitmap ?: target.bitmap
+                        if (shownBitmap != null) {
+                            Image(
+                                bitmap = shownBitmap,
+                                contentDescription = target.fileName,
+                                modifier = Modifier.fillMaxWidth().padding(8.dp)
+                            )
+                        } else {
+                            Text("(anteprima non decodificabile dalla UI, ma il motore ha letto i metadati)")
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Intensità adattamento: ${(overrideStrength * 100).roundToInt()}% " +
+                                "(0% = impostazioni identiche alla foto campione, " +
+                                "100% = massimo adattamento intelligente alla scena)",
+                            style = MaterialTheme.typography.caption,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+                        )
+                        Slider(
+                            value = overrideStrength,
+                            onValueChange = { overrideStrength = it },
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
+                        )
+
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = {
+                            pasteError = null
+                            val sample = sampleState
+                            if (sample == null) {
+                                pasteError = "Importa prima una foto campione"
+                            } else {
+                                Engine.pasteLookOntoTarget(
+                                    sampleBytes = sample.rawBytes,
+                                    sampleFileName = sample.fileName,
+                                    lookName = "Look da ${sample.fileName}",
+                                    targetBytes = target.rawBytes,
+                                    targetFileName = target.fileName,
+                                    overrideStrength = overrideStrength,
+                                ).fold(
+                                    onSuccess = { adapted ->
+                                        adaptedBitmap = decodeImageBitmapOrNull(adapted.renderedImageBytes)
+                                        adaptedInfo = "Applicato: esposizione ${"%.2f".format(adapted.appliedExposureEv)} EV, " +
+                                            "highlights ${adapted.appliedHighlights}, shadows ${adapted.appliedShadows}"
+                                    },
+                                    onFailure = { error -> pasteError = error.message ?: "Errore sconosciuto" }
+                                )
+                            }
+                        }) {
+                            Text("Incolla impostazioni (adattamento intelligente)")
+                        }
+
+                        pasteError?.let {
+                            Spacer(Modifier.height(8.dp))
+                            Text("Errore: $it", color = MaterialTheme.colors.error)
+                        }
+
+                        adaptedInfo?.let {
+                            Spacer(Modifier.height(8.dp))
+                            Text(it, style = MaterialTheme.typography.caption)
+                        }
                     }
                 }
             }

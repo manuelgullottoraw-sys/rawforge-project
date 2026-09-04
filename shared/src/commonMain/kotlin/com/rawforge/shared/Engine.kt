@@ -38,6 +38,29 @@ expect object Engine {
      * scelto dall'utente, non su un esempio fisso.
      */
     fun extractLookAndExportXmp(bytes: ByteArray, fileName: String, lookName: String): Result<String>
+
+    /**
+     * "Incolla le impostazioni": prende il Look copiato dalla foto campione
+     * (`sampleBytes`/`sampleFileName`) e lo applica alla foto da modificare
+     * (`targetBytes`/`targetFileName`), adattandolo in modo intelligente alla
+     * scena specifica di quest'ultima — Smart-Batch Contestuale
+     * (docs/ARCHITECTURE.md, §4.2) — invece di applicarlo identico. Ritorna
+     * l'anteprima già renderizzata: tutto resta nell'app, l'export come
+     * preset `.xmp` (`extractLookAndExportXmp`, sulla sola foto campione)
+     * resta un'azione separata e facoltativa.
+     *
+     * `overrideStrength` (0f..1f) è lo slider "Override Strength": 0 applica
+     * il Look letterale (nessun adattamento), 1 applica il massimo
+     * adattamento consentito dai guardrail del motore.
+     */
+    fun pasteLookOntoTarget(
+        sampleBytes: ByteArray,
+        sampleFileName: String,
+        lookName: String,
+        targetBytes: ByteArray,
+        targetFileName: String,
+        overrideStrength: Float,
+    ): Result<AdaptedPreview>
 }
 
 /**
@@ -51,4 +74,17 @@ data class ImportedPhoto(
     val cameraMake: String?,
     val cameraModel: String?,
     val previewImageBytes: ByteArray,
+)
+
+/**
+ * Esito di "incolla impostazioni": l'anteprima della foto target già
+ * renderizzata con il Look adattato, più i valori di esposizione/highlights/
+ * shadows effettivamente applicati dopo l'adattamento — utile per mostrare in
+ * UI cosa ha deciso lo Smart-Batch, non solo il risultato finale.
+ */
+data class AdaptedPreview(
+    val renderedImageBytes: ByteArray,
+    val appliedExposureEv: Float,
+    val appliedHighlights: Int,
+    val appliedShadows: Int,
 )
