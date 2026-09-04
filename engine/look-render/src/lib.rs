@@ -110,7 +110,14 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     let contrast_amount = 1.0 + (look.contrast as f32 / 100.0);
     let shadows_amount = look.shadows as f32 / 100.0;
     let highlights_amount = look.highlights as f32 / 100.0;
-    let global_sat_mul = (1.0 + (look.saturation as f32 / 100.0) + (look.vibrance as f32 / 200.0)).max(0.0);
+    // Guardrail: anche se `saturation`/`vibrance` in teoria arrivano da
+    // `HarmonicLook` già limitati a +-100, mai spingere il moltiplicatore di
+    // saturazione globale a un estremo che desaturi (quasi) completamente o
+    // esploda l'immagine — un Look estratto da una scena con ampie zone quasi
+    // neutre (es. asfalto, cielo uniforme) può produrre una stima di vibrance
+    // molto negativa che, da sola, non rappresenta l'intento stilistico da
+    // trasferire quanto un artefatto della composizione della foto campione.
+    let global_sat_mul = (1.0 + (look.saturation as f32 / 100.0) + (look.vibrance as f32 / 200.0)).clamp(0.35, 2.5);
 
     let mut out = rgba.clone();
     out.par_chunks_mut(row_stride)

@@ -25,7 +25,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   `metadata` (sidecar non distruttivo), `xmp` (export preset Lightroom), `gpu-pipe` (shader
   WGSL validati con `naga`), `raw-decode` (decodifica RAW vera), **`look-render`** (applica un
   Look ai pixel su CPU, per l'anteprima "incolla impostazioni", vedi sotto) e **`ffi`** (la
-  superficie UniFFI che collega tutto quanto sopra a Kotlin). 45 test, tutti verdi, eseguiti in
+  superficie UniFFI che collega tutto quanto sopra a Kotlin). 48 test, tutti verdi, eseguiti in
   locale prima di ogni consegna. Dettagli in [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
   1. `rust-tests` — compila e testa l'intero workspace Rust.
@@ -82,16 +82,43 @@ silenziosamente azzerati ad ogni giro Kotlin→Rust→Kotlin, **compreso l'expor
 Ora `HarmonicLookFfi` porta tutti i campi; un test dedicato (`harmonic_look_ffi_round_trip_preserves_all_fields`)
 verifica che il giro di andata e ritorno non perda più nulla.
 
+## Corretto: esposizione/tonalità troppo aggressive su "incolla impostazioni"
+
+Dopo il giro precedente, un test reale ha mostrato un problema concreto: usando come campione una
+foto scattata ed editata dall'utente stesso in basso-chiave (molto asfalto/ombre scure) e come
+target la stessa foto non editata, il risultato era innaturalmente scuro e desaturato —
+"esposizione -1.09 EV" applicata, ben oltre il ±0.5 EV che il guardrail di Smart-Batch dovrebbe
+garantire come massimo.
+
+Causa reale (non un'ipotesi): `harmonic::extract_look_from_reference` calcola `exposure_ev` come lo
+scostamento ASSOLUTO tra la luminosità mediana della foto campione e un pivot di grigio neutro —
+cioè "quanto è scura quella specifica foto", non "quanta correzione di esposizione andrebbe
+replicata su un'altra scena" (impossibile saperlo con certezza da una sola immagine finale, senza
+l'originale non editato per confronto). Questo valore, senza freni fino a ±2.0 EV, veniva sommato
+per intero al delta di Smart-Batch — che invece è correttamente limitato — dominando il risultato
+anche con lo slider "intensità adattamento" al 100%. La tone curve aveva lo stesso problema in
+forma diversa: i suoi punti di controllo erano i percentili assoluti di luminosità del campione,
+quindi una foto campione scura trascinava verso il basso il midtone di qualsiasi target, sommandosi
+silenziosamente all'esposizione.
+
+Corretto in due punti, entrambi con un test dedicato che riproduce lo scenario segnalato:
+l'esposizione assoluta del campione ora si interpola con `(1 - intensità adattamento)` prima di
+sommare il delta guardrailato di Smart-Batch (a slider 100% il campo resta per intero al delta
+contestuale, ≤0.5 EV); la tone curve è ora calcolata relativa alla mediana del campione stesso, con
+il midtone sempre ancorato al pivot neutro, così trasporta solo la forma del contrasto e non la
+luminosità assoluta della scena campione. Aggiunto anche un guardrail difensivo sul moltiplicatore
+di saturazione/vibrance nel renderer, per evitare desaturazioni estreme in casi simili. Dettagli
+tecnici completi in [`engine/README.md`](engine/README.md).
+
 ## Cosa ho potuto verificare qui e cosa no
 
 Verificato **per davvero**, in locale, prima di questa consegna: build e test dell'intero
-workspace Rust (45 test, tutti verdi — inclusi 7 test di proprietà su `look-render`: un Look
-neutro non altera l'immagine, esposizione positiva/negativa schiarisce/scurisce, il recupero ombre
-schiarisce i pixel scuri più di quelli chiari, dimensioni dell'immagine invariate, e così via),
-compilazione del crate `ffi` con la nuova superficie, generazione reale dei binding Kotlin dal
-`.so` compilato e ispezione del loro contenuto (`pasteLookOntoTargetPhoto` prende solo
-bytes/stringhe primitive, `HarmonicLookFfi`/`TonePointFfi`/`AdaptedRenderFfi` hanno la forma
-attesa, nessuna collisione di nomi come quella già risolta in precedenza).
+workspace Rust (48 test, tutti verdi — inclusi i test aggiornati che riproducono e verificano la
+correzione del bug di esposizione/tone-curve descritta sopra: un campione scuro applicato alla
+stessa scena come target ora resta dentro al guardrail ±0.5 EV invece di produrre -1.09 EV). La
+superficie Kotlin (`pasteLookOntoTargetPhoto`, `HarmonicLookFfi`/`TonePointFfi`/`AdaptedRenderFfi`)
+non è cambiata in questo giro — solo la logica Rust sotto è stata corretta — quindi non è stato
+necessario rigenerare né ri-ispezionare i binding.
 
 **Non verificabile da qui** (l'ambiente di sviluppo non ha un Android NDK né un PC Windows, e non
 può scaricare un NDK per una verifica autonoma — la rete di questo ambiente blocca `dl.google.com`

@@ -97,12 +97,25 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
     let p50 = percentile(&sorted_l, 50.0);
     let p75 = percentile(&sorted_l, 75.0);
 
-    let to_u8 = |l_percent: f32| -> u8 { (l_percent * 2.55).clamp(0.0, 255.0) as u8 };
+    // Punti di controllo della tone curve: NON i percentili assoluti di
+    // luminanza del campione, ma la loro posizione RELATIVA al punto mediano
+    // (p50) del campione stesso, rimappata attorno al pivot neutro 128. Usare
+    // i percentili assoluti (come in una versione precedente) duplicava, in
+    // modo non guardrailed, l'informazione già portata da `exposure_ev`: una
+    // foto campione scura (p50 basso) produceva una tone curve che schiacciva
+    // il midtone di QUALSIASI target verso il basso, sommandosi all'esposizione
+    // e aggravando esattamente il tipo di scurimento/appiattimento eccessivo
+    // segnalato applicando questo Look a una scena diversa da quella campione.
+    // Così la curva trasporta solo la FORMA del roll-off ombre/luci (quanto è
+    // "morbido" o "contrastato" il look), lasciando all'asse esposizione
+    // (guardrailato da Smart-Batch in fase di adattamento) l'unico compito di
+    // spostare la luminosità assoluta.
+    let relative_to_u8 = |l_percent: f32| -> u8 { (128.0 + (l_percent - p50) * 2.55).clamp(0.0, 255.0) as u8 };
     let tone_curve = vec![
         (0u8, 0u8),
-        (64, to_u8(p25)),
-        (128, to_u8(p50)),
-        (192, to_u8(p75)),
+        (64, relative_to_u8(p25)),
+        (128, 128u8),
+        (192, relative_to_u8(p75)),
         (255, 255),
     ];
 
@@ -198,6 +211,33 @@ mod tests {
         let img = synthetic_image(|_, _| [235, 235, 235, 255]);
         let look = extract_look_from_reference(&img, "Bright Test");
         assert!(look.exposure_ev > 0.0, "un'immagine di riferimento chiara deve dare exposure_ev positivo, got {}", look.exposure_ev);
+    }
+
+    #[test]
+    fn dark_reference_tone_curve_midpoint_stays_neutral() {
+        // Il bug segnalato: una foto campione scura (basso-chiave) non deve
+        // "trascinare" la tone curve verso il basso — quel compito spetta solo
+        // a `exposure_ev` (guardrailato in fase di adattamento). Il midpoint
+        // (128 -> 128) resta il pivot neutro indipendentemente da quanto è
+        // scura o chiara la foto campione.
+        let dark = synthetic_image(|_, _| [20, 20, 20, 255]);
+        let bright = synthetic_image(|_, _| [235, 235, 235, 255]);
+        let dark_look = extract_look_from_reference(&dark, "Dark");
+        let bright_look = extract_look_from_reference(&bright, "Bright");
+        assert_eq!(dark_look.tone_curve[2], (128, 128), "midpoint non neutro per campione scuro: {:?}", dark_look.tone_curve);
+        assert_eq!(bright_look.tone_curve[2], (128, 128), "midpoint non neutro per campione chiaro: {:?}", bright_look.tone_curve);
+    }
+
+    #[test]
+    fn contrasty_reference_still_produces_asymmetric_curve_shape() {
+        // La decorrelazione dall'esposizione assoluta non deve annullare la
+        // capacità della curva di rappresentare la FORMA del contrasto: una
+        // scena con forte separazione ombre/luci deve comunque produrre punti
+        // di controllo distinti dall'identità.
+        let img = synthetic_image(|_, y| if y < 32 { [10, 10, 10, 255] } else { [245, 245, 245, 255] });
+        let look = extract_look_from_reference(&img, "Contrasty");
+        assert_ne!(look.tone_curve[1], (64, 64), "punto ombre non deve restare sull'identita' per una scena molto contrastata");
+        assert_ne!(look.tone_curve[3], (192, 192), "punto luci non deve restare sull'identita' per una scena molto contrastata");
     }
 
     #[test]

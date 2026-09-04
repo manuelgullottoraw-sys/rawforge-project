@@ -316,12 +316,29 @@ pub fn paste_look_onto_target_photo(
     let sample_descriptors = smartbatch::compute_scene_descriptors(&look_render::luminance_histogram(&sample_image));
     let target_descriptors = smartbatch::compute_scene_descriptors(&look_render::luminance_histogram(&target_image));
 
+    let clamped_strength = override_strength.clamp(0.0, 1.0);
     let params = smartbatch::AdaptationParams {
-        override_strength: override_strength.clamp(0.0, 1.0),
+        override_strength: clamped_strength,
         ..smartbatch::AdaptationParams::default()
     };
     let deltas = smartbatch::compute_adaptive_deltas(&sample_descriptors, &target_descriptors, &params);
-    let adapted_look = smartbatch::apply_deltas(&base_look, &deltas);
+
+    // `base_look.exposure_ev` (Sintesi Armonica) è una stima ASSOLUTA di quanto
+    // la mediana della foto CAMPIONE si discosta dal grigio neutro — riflette
+    // la luminosità della SUA scena (es. una foto scattata volutamente in
+    // basso-chiave), non un'esposizione da ricalcare pari pari su una scena
+    // diversa. Sommarla per intero al delta di Smart-Batch (che invece È
+    // guardrailato, +-max_exposure_delta_ev) permetteva a questo valore
+    // assoluto e senza freni di dominare il risultato anche a
+    // override_strength=1.0 ("massimo adattamento") — il bug segnalato: -1.09
+    // EV su una foto con ampie zone scure, ben oltre il guardrail di +-0.5 EV.
+    // Interpoliamo quindi la componente assoluta con (1 - intensita'
+    // adattamento): a override_strength=0.0 resta "applica il Look letterale"
+    // (l'assoluto del campione, invariato); a override_strength=1.0 lascia
+    // spazio per intero al delta contestuale e guardrailato di Smart-Batch.
+    let mut adapted_base = base_look.clone();
+    adapted_base.exposure_ev = base_look.exposure_ev * (1.0 - clamped_strength);
+    let adapted_look = smartbatch::apply_deltas(&adapted_base, &deltas);
 
     let rendered = look_render::render_preview_with_look(&target_image, &adapted_look);
     let rendered_preview_png_bytes = encode_preview_as_png(&rendered)?;
@@ -466,6 +483,46 @@ mod tests {
         assert!(
             result.applied_exposure_ev > 0.0,
             "atteso recupero positivo, got {}",
+            result.applied_exposure_ev
+        );
+        assert!(
+            result.applied_exposure_ev <= 0.5 + f32::EPSILON,
+            "esposizione applicata fuori dal guardrail Smart-Batch (max 0.5 EV): {}",
+            result.applied_exposure_ev
+        );
+    }
+
+    #[test]
+    fn paste_look_onto_target_photo_does_not_force_large_exposure_shift_when_target_matches_reference_scene() {
+        // Riproduce il bug segnalato dall'utente: campione scattato ed editato
+        // in basso-chiave (scuro), target la STESSA scena non editata (qui
+        // approssimata da un colore identico, la stessa condizione che
+        // rendeva l'istogramma di scena del target praticamente identico a
+        // quello del campione). L'esposizione ASSOLUTA del campione (p50
+        // basso -> exposure_ev fortemente negativo in `harmonic`) non deve
+        // dominare il risultato quando la scena del target è già simile a
+        // quella del campione: Smart-Batch calcola in quel caso un delta
+        // vicino a zero, e l'esposizione finale deve restare dentro al
+        // guardrail (default +-0.5 EV), non ereditare per intero la
+        // luminosità assoluta -- spesso puramente stilistica -- della foto
+        // campione (il caso reale riportato: "-1.09 EV", risultato scurito e
+        // desaturato non voluto).
+        let sample_bytes = png_bytes_of_solid_color(6, [20, 20, 20]);
+        let target_bytes = png_bytes_of_solid_color(6, [20, 20, 20]);
+
+        let result = paste_look_onto_target_photo(
+            sample_bytes,
+            "campione_scuro.png".to_string(),
+            "Look Scuro".to_string(),
+            target_bytes,
+            "target.png".to_string(),
+            1.0,
+        )
+        .unwrap();
+
+        assert!(
+            result.applied_exposure_ev.abs() <= 0.5 + f32::EPSILON,
+            "esposizione applicata fuori dal guardrail Smart-Batch (max 0.5 EV): {}",
             result.applied_exposure_ev
         );
     }

@@ -4,7 +4,7 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (45 test, tutti verdi):
+Crate reali, compilati e testati (48 test, tutti verdi):
 
 | Crate | Cosa fa | Rif. architettura |
 |---|---|---|
@@ -43,6 +43,40 @@ campi; `TonePointFfi` sostituisce la tupla `(u8, u8)` (non rappresentabile da Un
 HSL passano come `Vec<i32>` invece di array fissi. Test dedicato:
 `harmonic_look_ffi_round_trip_preserves_all_fields`.
 
+**Corretto un secondo bug, questo segnalato dall'utente dopo un test reale**: "incolla
+impostazioni" con una foto scattata ed editata in basso-chiave (molto asfalto/ombre scure) come
+campione produceva un'anteprima innaturalmente scura e desaturata — nei log dell'app, "esposizione
+-1.09 EV" applicata a una foto che avrebbe dovuto ricevere al più ±0.5 EV di correzione (il
+guardrail di `smartbatch::AdaptationParams::max_exposure_delta_ev`, già testato). Causa reale,
+confermata leggendo `harmonic::extract_look_from_reference`: `exposure_ev` vi è calcolato come uno
+scostamento ASSOLUTO tra la mediana di luminanza della foto campione e un pivot di grigio neutro
+(`NEUTRAL_L = 50.0`), clampato a ±2.0 EV — cioè "quanto è scura/chiara *quella specifica foto*", non
+"quanta correzione di esposizione replicare su un'altra scena" (impossibile da sapere con certezza
+da una sola immagine finale, senza l'originale non editato). Questo valore assoluto e senza freni
+veniva sommato per intero al delta di Smart-Batch, che invece è correttamente guardrailato — quindi
+anche a "intensità adattamento" 100% il risultato restava dominato dalla luminosità assoluta della
+foto campione, non dall'adattamento contestuale. Due correzioni, entrambe testate:
+
+1. `paste_look_onto_target_photo` ora interpola la componente assoluta di `exposure_ev` con
+   `(1 - intensità_adattamento)` prima di sommare il delta di Smart-Batch: a intensità 0.0 resta "Look
+   letterale" (comportamento invariato), a intensità 1.0 lascia il campo per intero al delta
+   guardrailato (±0.5 EV di default), a valori intermedi interpola tra i due. Test dedicato,
+   che riproduce lo scenario segnalato (campione scuro, stessa scena come target, intensità 100%):
+   `paste_look_onto_target_photo_does_not_force_large_exposure_shift_when_target_matches_reference_scene`.
+2. `harmonic::extract_look_from_reference` costruiva anche la tone curve dai percentili ASSOLUTI di
+   luminanza del campione — stesso problema in forma diversa: una foto campione scura trascinava il
+   midtone (128) di *qualsiasi* target verso il basso, sommandosi silenziosamente all'esposizione e
+   aggravando lo scurimento anche dopo la correzione (1). Ora i punti di controllo sono calcolati
+   RELATIVI alla mediana del campione stesso (il midpoint resta sempre ancorato a 128 = pivot
+   neutro): la curva trasporta solo la *forma* del contrasto/roll-off ombre-luci, non la luminosità
+   assoluta della scena campione. Test dedicati: `dark_reference_tone_curve_midpoint_stays_neutral`,
+   `contrasty_reference_still_produces_asymmetric_curve_shape`.
+
+Aggiunto anche un guardrail difensivo in `look-render`: il moltiplicatore globale di
+saturazione/vibrance è ora clampato a un intervallo sicuro (`[0.35, 2.5]`) invece che solo
+`.max(0.0)`, per evitare che una stima di vibrance molto negativa (es. da una foto campione con
+ampie zone quasi neutre come asfalto o cielo uniforme) desaturi quasi del tutto il target.
+
 `ffi` espone adesso, oltre alle funzioni già esistenti:
 
 - `decode_raw_file_preview(bytes)` — anteprima + metadati da un file RAW vero.
@@ -56,13 +90,13 @@ HSL passano come `Vec<i32>` invece di array fissi. Test dedicato:
   `expect`/`actual` a un tipo generato da UniFFI, che esiste solo nelle copie platform-specific dei
   binding.
 
-Verificato in locale prima di essere consegnato: build e test dell'intero workspace (45 test,
-inclusi 7 test di proprietà su `look-render` — Look neutro non altera l'immagine, esposizione
-positiva/negativa schiarisce/scurisce, recupero ombre più efficace sui pixel scuri che su quelli
-chiari, dimensioni invariate — e 3 nuovi test su `ffi`, incluso il round-trip di fedeltà di
-`HarmonicLookFfi`), generazione reale dei binding Kotlin dal `.so` compilato, ispezione del Kotlin
-generato (nessuna collisione di nomi come quella già risolta in un giro precedente;
-`pasteLookOntoTargetPhoto` ha la firma attesa, solo tipi primitivi).
+Verificato in locale prima di essere consegnato: build e test dell'intero workspace (48 test,
+tutti verdi — inclusi i test aggiornati su `harmonic`/`ffi`/`look-render` che riproducono e
+verificano la correzione del bug di esposizione/tone-curve descritto sopra), generazione reale dei
+binding Kotlin dal `.so` compilato, ispezione del Kotlin generato (nessuna collisione di nomi come
+quella già risolta in un giro precedente; `pasteLookOntoTargetPhoto` ha la firma attesa, solo tipi
+primitivi — questo giro non ha toccato la superficie Kotlin, solo la logica Rust sotto, quindi i
+binding non sono nemmeno cambiati di forma).
 
 **Non verificabile in locale** (richiede i runner reali di GitHub Actions, e questo ambiente non
 può scaricare un NDK Android per policy di rete): la build Gradle completa con la nuova UI (due
