@@ -104,12 +104,40 @@ fotografico professionale:
   Windows, selettore di destinazione di sistema su Android (nessun permesso runtime richiesto). Il
   pulsante mostra "Esportazione…" ed è disabilitato mentre il rendering finale è in corso.
 
-**Cosa NON c'è ancora in questo giro** (dichiarato, non nascosto): editor grafico della tone curve
-(trascinare i punti a mano) e slider HSL per singola banda colore — il motore li supporta e li
-calcola già (Sintesi Armonica include ora anche l'estrazione HSL per banda, vedi sotto), manca solo
-l'interfaccia; le maschere locali (pennello/gradiente/radiale) copiabili nei preset, la
-libreria/catalogo delle foto già modificate, e il batch reale su tante foto insieme — tutti
-pianificati per gli incrementi successivi, come discusso.
+**Novità di questo giro, su richiesta esplicita — "rendi l'interfaccia più simile a Lightroom"**:
+
+- **Modifica a schermo intero**: un nuovo pulsante ("Modifica a schermo intero", accanto a
+  "Esporta foto…") passa a una modalità in stile modulo Develop di Lightroom — niente più
+  confronto affiancato con la foto campione, solo la foto target grande al centro con il pannello
+  "Develop" accanto, e un pulsante "← Torna al confronto" per uscirne. Disponibile non solo dopo
+  "Incolla impostazioni", ma ogni volta che una foto è aperta per l'editing.
+- **Editor grafico della tone curve**: un grafico trascinabile con 5 punti di controllo (ombre,
+  scure, medi, chiare, luci, come il "point curve" semplificato di Lightroom) — trascina in un
+  punto qualsiasi del grafico per spostare in verticale il punto di controllo più vicino.
+- **Pannello HSL per banda colore**: 8 bande (Rosso/Arancio/Giallo/Verde/Acqua/Blu/Viola/Magenta,
+  stesso ordine usato dal motore), con tre "tab" Tonalità/Saturazione/Luminanza come in Lightroom,
+  invece di 24 slider tutti insieme.
+
+Con questo, la fase 1 del piano concordato (tema, layout, export, editing manuale) è completa: il
+motore calcolava già tone curve e HSL per banda dalla Sintesi Armonica, mancava solo poterli
+correggere a mano da qui.
+
+**Passata di rifinitura visiva**, su richiesta esplicita prima di questa consegna ("rendi
+l'interfaccia più accattivante, un look più moderno"): i pannelli piatti a sfondo colorato sono
+diventati `Card` vere con un'ombra leggera; gli angoli sono più ampi e morbidi ovunque; un filo
+sottile con un gradiente blu→viola (l'unico accento di colore "vivo" dell'app) segna la barra in
+alto e l'intestazione del pannello Develop, accanto a un piccolo marchio quadrato con lo stesso
+gradiente; i pulsanti principali sono diventati "pill" arrotondate; il riquadro dell'anteprima
+foto e il grafico della tone curve hanno ora un bordo sottile invece di un semplice sfondo scuro;
+i valori numerici degli slider sono in un piccolo badge arrotondato invece di testo nudo; e ogni
+slider HSL ha accanto un pallino colorato che richiama la banda a cui appartiene (Rosso/Arancio/
+Giallo/Verde/Acqua/Blu/Viola/Magenta), come le etichette colorate del pannello HSL vero di
+Lightroom. Nessuna nuova dipendenza Gradle (niente libreria di icone: i "pulsanti pill" e il
+marchio sono forme disegnate, non icone).
+
+**Cosa NON c'è ancora** (dichiarato, non nascosto, prossime fasi del piano concordato): le maschere
+locali (pennello/gradiente/radiale) copiabili nei preset, la libreria/catalogo delle foto già
+modificate, e il batch reale su tante foto insieme.
 
 ## Nuovo: rendering dal vivo mentre si trascina uno slider (`PhotoEditSession`)
 
@@ -202,12 +230,15 @@ il codice Kotlin che lo richiama.
 
 **Non verificabile da qui** (l'ambiente di sviluppo non ha un Android NDK né un PC Windows, e non
 può scaricare un NDK per una verifica autonoma — la rete di questo ambiente blocca `dl.google.com`
-per policy): l'intera build Gradle, in particolare le modifiche più estese di questo giro lato
-Kotlin — il nuovo `PhotoEditSession` in `Engine.kt`/`Engine.android.kt`/`Engine.desktop.kt` e la
-riscrittura di `App.kt` per il rendering dal vivo (`LaunchedEffect`/`snapshotFlow`/`collectLatest`,
-gli slider semplificati, i nuovi stati `session`/`exportBusy`). Riletto con attenzione più volte
-cercando gli errori tipici di Compose che non si vedono senza compilare (riferimenti residui a
-funzioni/parametri rimossi, chiavi ed effetti collaterali degli `Effect`, wiring degli stati) senza
+per policy, verificato anche provando a scaricare direttamente i sorgenti di Compose per un
+controllo extra sulle API usate): l'intera build Gradle, in particolare le modifiche più estese
+lato Kotlin — il nuovo `PhotoEditSession` in `Engine.kt`/`Engine.android.kt`/`Engine.desktop.kt`, la
+riscrittura di `App.kt` per il rendering dal vivo (`LaunchedEffect`/`snapshotFlow`/`collectLatest`),
+e in questo giro anche la modalità a schermo intero, l'editor grafico della tone curve (un
+`Canvas` con trascinamento via `pointerInput`/`detectDragGestures`) e il pannello HSL a tab. Riletto
+con attenzione più volte cercando gli errori tipici di Compose che non si vedono senza compilare
+(riferimenti residui a funzioni/parametri rimossi, chiavi ed effetti collaterali degli `Effect`,
+bilanciamento delle graffe nel nuovo ramo `if`/`else`, firme delle API di disegno su `Canvas`) senza
 trovarne, ma resta tutto da compilare per la prima volta su CI, come sempre in questo ambiente: se
 GitHub Actions segnala un errore Kotlin/Gradle, mandami il log e lo sistemiamo, esattamente come
 fatto finora.
@@ -221,10 +252,53 @@ fatto finora.
   camera.
 - Collegare `gpu-pipe` (gli shader WGSL già validati) alla UI per il rendering a piena risoluzione
   in tempo reale, al posto della pipeline CPU attuale.
-- Editor grafico della tone curve e slider HSL per singola banda nell'interfaccia (il motore li
-  supporta e li calcola già, vedi sopra).
 - `cache`, `catalog` (libreria/grid multi-foto), `job-scheduler` (batch reale su centinaia di
   foto insieme, non una alla volta) — oggi il flusso è a una foto campione + una foto target.
+- Maschere locali (pennello/gradiente/radiale) copiabili nei preset.
+- **"Coerenza di Set"** (idea originale, discussa e approvata con l'utente, da pianificare insieme
+  alla fase libreria/batch): data un'intera cartella di uno shooting, raggruppare automaticamente
+  le foto in "cluster di luce" (clustering sui descrittori di scena che `smartbatch` calcola già
+  oggi per singola foto — nessun modello ML esterno, k-means su poche dimensioni) e applicare
+  un'unica intenzione artistica di riferimento adattata PER CLUSTER, non foto per foto in
+  isolamento — per garantire che un'intera galleria consegnata a un cliente sembri una storia
+  visiva coerente anche quando le condizioni di luce cambiano scena per scena (cerimonia in
+  chiesa, ricevimento al tramonto, sala buia col flash...). Differenzia da "Sincronizza
+  impostazioni" (cieco alla scena) e da un "match color" foto-per-foto (non garantisce coerenza
+  collettiva sull'intero set).
+- **Quattro idee sui valori personalizzabili in editing**, discusse e approvate con l'utente,
+  ordinate per rapporto valore/sforzo:
+  1. ~~Dial "Intensità edit" che scala l'intero editing verso lo zero (o lo esagera oltre il
+     100%)~~ — **fatto in questo giro**, vedi sotto.
+  2. **Texture a bande di frequenza** (fine/media/grossa invece di un solo slider "Texture") — la
+     Texture di Lightroom tratta grana della pelle e trama di un muro come la stessa cosa perché è
+     un solo slider su un'unica banda; tre slider per bande di frequenza diverse (differenze tra
+     l'immagine e versioni sfocate a raggi diversi, pesate per banda) darebbero un controllo reale
+     in stile "frequency separation" da ritocco, oggi possibile solo uscendo su Photoshop.
+  3. **Slider "sicuri"**: colorare il binario dello slider (esposizione/bianchi/neri) nella zona
+     dove il valore corrente produce clipping di alte luci/ombre, invece di dover guardare
+     l'istogramma a parte.
+  4. **Bilanciamento del bianco a più punti/a gradiente**, per scene con luce mista (finestra +
+     lampada in tungsteno nella stessa inquadratura) che oggi richiedono maschere manuali pazienti
+     — la più ambiziosa delle quattro, da programmare per dopo.
+
+## Nuovo: dial "Intensità edit" (prima delle quattro idee sui valori personalizzabili)
+
+Un unico slider in cima al pannello Develop (0%–150%, 100% = editing esatto) che scala l'INTERO
+editing corrente verso lo zero (o lo esagera oltre il valore scelto), senza dover tornare indietro
+slider per slider — la cosa che oggi in Lightroom non esiste: l'unico modo di "attenuare" un
+editing è farlo in fase di applicazione di un preset ("Ammontare"), non su un editing che si sta
+già facendo a mano.
+
+Costruito interamente lato Kotlin, senza toccare il motore Rust: una funzione pura,
+`EditableLook.scaledBy(intensity)`, interpola ogni singolo campo tra il suo valore NEUTRO (quello
+di default, o l'identità per la tone curve) e il valore attualmente impostato dall'utente. Non
+modifica mai `currentLook` — viene ricalcolata solo al momento del rendering/esportazione — così
+riportare il dial al 100% ritorna sempre esattamente all'editing originale, senza arrotondamenti
+che si accumulano avanti e indietro, e ogni singolo slider continua a modificare "il 100%"
+esattamente come prima (nessuna complicazione nel back-solving dei valori mentre il dial è a una
+posizione diversa da 100%). La tinta del viraggio (`shadowHue`/`highlightHue`, gradi assoluti senza
+un "neutro" naturale) resta apposta invariata dal dial; conta solo quando la sua saturazione
+(quella sì scalata) è diversa da zero.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

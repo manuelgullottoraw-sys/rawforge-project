@@ -1,9 +1,13 @@
 package com.rawforge.shared
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.*
@@ -11,11 +15,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
@@ -53,8 +63,37 @@ private val PanelSurface = Color(0xFF262626)
 private val PanelSurfaceRaised = Color(0xFF2F2F2F)
 private val PanelDivider = Color(0xFF3A3A3A)
 private val AccentBlue = Color(0xFF4FA8FF)
+private val AccentViolet = Color(0xFFB07CFF)
 private val TextPrimary = Color(0xFFE6E6E6)
 private val TextMuted = Color(0xFFA0A0A0)
+
+// Gradiente d'accento (blu -> viola) usato con parsimonia — il marchio nella
+// barra in alto, il bordo/sfondo dei pulsanti primari — per dare un unico
+// punto di colore "vivo" a un'interfaccia altrimenti scura e neutra.
+private val AccentGradient = Brush.linearGradient(listOf(AccentBlue, AccentViolet))
+
+// Raggi degli angoli condivisi: più ampi delle versioni precedenti (era
+// 4-6dp ovunque) per un look più morbido/contemporaneo.
+private val CardShape = RoundedCornerShape(14.dp)
+private val InnerShape = RoundedCornerShape(8.dp)
+private val PillShape = RoundedCornerShape(10.dp)
+
+/** Elevazione/sfondo/angoli condivisi da tutti i pannelli principali
+ * (foto campione, foto target, Develop) — un `Card` vero con un'ombra
+ * leggera al posto di un semplice riquadro colorato piatto. */
+@Composable
+private fun PanelCard(
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    Card(
+        modifier = modifier,
+        shape = CardShape,
+        backgroundColor = PanelSurface,
+        elevation = 6.dp,
+        content = content,
+    )
+}
 
 private val RawForgeDarkColors = darkColors(
     primary = AccentBlue,
@@ -69,6 +108,48 @@ private val RawForgeDarkColors = darkColors(
     onSurface = TextPrimary,
     onError = Color.White,
 )
+
+private fun lerp(from: Float, to: Float, t: Float): Float = from + (to - from) * t
+
+/**
+ * Applica il dial "Intensità edit" (`intensity`, 1f = 100% = l'editing esatto
+ * così com'è, 0f = nessun editing, >1f = esagerato oltre il valore scelto):
+ * interpola OGNI campo di `EditableLook` fra il suo valore NEUTRO (quello di
+ * `EditableLook()`, o l'identità per la tone curve) e il valore attuale.
+ * Pura — non modifica `currentLook`, viene ricalcolata solo al momento del
+ * rendering/esportazione — così spostare il dial a 100% ritorna sempre
+ * esattamente all'editing originale, senza arrotondamenti che si accumulano
+ * avanti e indietro.
+ *
+ * La tinta del viraggio (`shadowHue`/`highlightHue`) resta invariata: sono
+ * gradi assoluti senza un "neutro" naturale, e contano solo quando la
+ * rispettiva saturazione (che invece scaliamo) è diversa da zero — a
+ * intensità 0 il viraggio sparisce comunque perché la sua saturazione è 0.
+ */
+private fun EditableLook.scaledBy(intensity: Float): EditableLook {
+    if (intensity == 1f) return this
+    fun scaleInt(value: Int, range: IntRange): Int =
+        lerp(0f, value.toFloat(), intensity).roundToInt().coerceIn(range.first, range.last)
+    return copy(
+        whiteBalanceTemp = lerp(5500f, whiteBalanceTemp.toFloat(), intensity).roundToInt().coerceIn(2000, 12000),
+        whiteBalanceTint = scaleInt(whiteBalanceTint, -100..100),
+        exposureEv = lerp(0f, exposureEv, intensity).coerceIn(-5f, 5f),
+        contrast = scaleInt(contrast, -100..100),
+        highlights = scaleInt(highlights, -100..100),
+        shadows = scaleInt(shadows, -100..100),
+        whites = scaleInt(whites, -100..100),
+        blacks = scaleInt(blacks, -100..100),
+        vibrance = scaleInt(vibrance, -100..100),
+        saturation = scaleInt(saturation, -100..100),
+        toneCurve = toneCurve.map { p -> p.copy(y = lerp(p.x.toFloat(), p.y.toFloat(), intensity).roundToInt().coerceIn(0, 255)) },
+        hslHue = hslHue.map { scaleInt(it, -100..100) },
+        hslSat = hslSat.map { scaleInt(it, -100..100) },
+        hslLum = hslLum.map { scaleInt(it, -100..100) },
+        shadowSat = scaleInt(shadowSat, 0..100),
+        highlightSat = scaleInt(highlightSat, 0..100),
+        splitToningBalance = scaleInt(splitToningBalance, -100..100),
+    )
+}
 
 /**
  * UI condivisa (identica su Android e Windows), in stile "Develop module" di
@@ -117,9 +198,21 @@ fun RawForgeApp() {
     var preview by remember { mutableStateOf<PreviewState?>(null) }
     var currentLook by remember { mutableStateOf(EditableLook()) }
 
+    // Dial "Intensità edit" (vedi `EditableLook.scaledBy`): 1f = editing
+    // esatto, 0f = nessun editing, oltre 1f lo esagera. Applicato solo al
+    // momento del rendering/esportazione, mai su `currentLook` stesso.
+    var editIntensity by remember { mutableStateOf(1f) }
+
     var exportBusy by remember { mutableStateOf(false) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var exportError by remember { mutableStateOf<String?>(null) }
+
+    // Modalità "Develop a schermo intero", in stile Lightroom: nasconde il
+    // confronto affiancato con la foto campione e mostra solo la foto target,
+    // grande, con il pannello Develop accanto — pensata per la fase di
+    // editing fine, dopo un eventuale "Incolla impostazioni". `false` mostra
+    // invece il confronto normale.
+    var fullScreenEditing by remember { mutableStateOf(false) }
 
     // Chiude sempre la sessione precedente prima di sostituirla: la foto
     // decodificata che tiene in memoria lato Rust va liberata esplicitamente
@@ -131,6 +224,7 @@ fun RawForgeApp() {
         sessionError = null
         preview = target?.let { PreviewState(it.previewImageBytes, it.bitmap) }
         currentLook = EditableLook()
+        editIntensity = 1f
         pasteError = null
         renderError = null
         exportMessage = null
@@ -151,7 +245,7 @@ fun RawForgeApp() {
     // più recente, invece di accodarli).
     LaunchedEffect(session) {
         val activeSession = session ?: return@LaunchedEffect
-        snapshotFlow { currentLook }.collectLatest { look ->
+        snapshotFlow { currentLook.scaledBy(editIntensity) }.collectLatest { look ->
             val result = withContext(Dispatchers.Default) { activeSession.renderPreview(look) }
             result.fold(
                 onSuccess = { bytes -> preview = PreviewState(bytes, decodeImageBitmapOrNull(bytes)); renderError = null },
@@ -213,6 +307,28 @@ fun RawForgeApp() {
         onError = { error -> exportError = error; exportMessage = null; exportBusy = false },
     )
 
+    // Esporta a piena risoluzione la foto corrente con il Look attuale.
+    // Condivisa fra il pulsante nel pannello di confronto e quello della
+    // modalità a schermo intero: stessa azione, due punti da cui richiamarla.
+    fun exportCurrentPhoto() {
+        val activeSession = session ?: return
+        exportError = null
+        exportBusy = true
+        // A piena risoluzione, non la copia ridotta usata per l'editing
+        // interattivo: qui la velocità non è più la priorità, la qualità sì.
+        activeSession.renderFullResolution(currentLook.scaledBy(editIntensity)).fold(
+            onSuccess = { bytes ->
+                val suggested = (targetState?.fileName ?: "foto")
+                    .substringBeforeLast('.') + "_rawforge.png"
+                launchExport(bytes, suggested)
+            },
+            onFailure = { error ->
+                exportError = error.message ?: "Errore durante il rendering per l'esportazione"
+                exportBusy = false
+            }
+        )
+    }
+
     MaterialTheme(colors = RawForgeDarkColors) {
         Surface(modifier = Modifier.fillMaxSize(), color = PanelBackground) {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -222,8 +338,27 @@ fun RawForgeApp() {
                     onCheckEngine = { engineInfo = Engine.versionInfo() },
                     onGenerateSampleXmp = { xmpPreview = Engine.generateSampleXmpPreset() },
                 )
-                Divider(color = PanelDivider, thickness = 1.dp)
+                // Sottile filo di colore al posto del solito `Divider` piatto:
+                // è l'unico accento "vivo" nella barra in alto.
+                Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(AccentGradient))
 
+                if (fullScreenEditing && targetState != null && session != null) {
+                    FullScreenDevelopView(
+                        title = targetState?.fileName ?: "Foto",
+                        bitmap = preview?.bitmap,
+                        look = currentLook,
+                        onEdit = { mutate -> currentLook = mutate(currentLook) },
+                        onReset = { currentLook = EditableLook(); editIntensity = 1f },
+                        editIntensity = editIntensity,
+                        onEditIntensityChange = { editIntensity = it },
+                        onExit = { fullScreenEditing = false },
+                        onExport = { exportCurrentPhoto() },
+                        exportBusy = exportBusy,
+                        exportMessage = exportMessage,
+                        exportError = exportError,
+                        renderError = renderError,
+                    )
+                } else {
                 Row(modifier = Modifier.fillMaxSize()) {
                     // Colonna principale: le due foto affiancate + le azioni
                     // di "incolla impostazioni" ed esporta. Niente scroll
@@ -281,30 +416,29 @@ fun RawForgeApp() {
                                 overrideBitmap = preview?.bitmap,
                             ) {
                                 Spacer(Modifier.height(8.dp))
-                                Button(
-                                    onClick = {
-                                        val activeSession = session ?: return@Button
-                                        exportError = null
-                                        exportBusy = true
-                                        // A piena risoluzione, non la copia ridotta
-                                        // usata per l'editing interattivo: qui la
-                                        // velocità non è più la priorità, la qualità sì.
-                                        activeSession.renderFullResolution(currentLook).fold(
-                                            onSuccess = { bytes ->
-                                                val suggested = (targetState?.fileName ?: "foto")
-                                                    .substringBeforeLast('.') + "_rawforge.png"
-                                                launchExport(bytes, suggested)
-                                            },
-                                            onFailure = { error ->
-                                                exportError = error.message ?: "Errore durante il rendering per l'esportazione"
-                                                exportBusy = false
-                                            }
-                                        )
-                                    },
-                                    enabled = session != null && !exportBusy,
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
-                                ) {
-                                    Text(if (exportBusy) "Esportazione…" else "Esporta foto…", style = MaterialTheme.typography.caption)
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = { exportCurrentPhoto() },
+                                        enabled = session != null && !exportBusy,
+                                        shape = PillShape,
+                                        colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
+                                    ) {
+                                        Text(if (exportBusy) "Esportazione…" else "Esporta foto…", style = MaterialTheme.typography.caption)
+                                    }
+                                    // Modalità "Develop" a schermo intero, in stile
+                                    // Lightroom: foto grande + pannello di editing,
+                                    // niente confronto affiancato con il campione —
+                                    // pensata per il fine-tuning dopo un eventuale
+                                    // "Incolla impostazioni" (ma disponibile anche
+                                    // per editare a mano da zero).
+                                    Button(
+                                        onClick = { fullScreenEditing = true },
+                                        enabled = session != null,
+                                        shape = PillShape,
+                                        colors = ButtonDefaults.buttonColors(backgroundColor = AccentBlue),
+                                    ) {
+                                        Text("Modifica a schermo intero", style = MaterialTheme.typography.caption)
+                                    }
                                 }
                                 exportMessage?.let {
                                     Spacer(Modifier.height(4.dp))
@@ -319,10 +453,9 @@ fun RawForgeApp() {
 
                         if (sampleState != null && targetState != null) {
                             Spacer(Modifier.height(12.dp))
+                            PanelCard(modifier = Modifier.fillMaxWidth()) {
                             Column(
-                                modifier = Modifier.fillMaxWidth()
-                                    .background(PanelSurface, RoundedCornerShape(6.dp))
-                                    .padding(12.dp)
+                                modifier = Modifier.padding(16.dp)
                             ) {
                                 Text(
                                     "Intensità adattamento: ${(overrideStrength * 100).roundToInt()}% " +
@@ -337,6 +470,7 @@ fun RawForgeApp() {
                                     modifier = Modifier.fillMaxWidth(),
                                 )
                                 Button(
+                                    shape = PillShape,
                                     onClick = {
                                         val sample = sampleState
                                         val activeSession = session
@@ -350,6 +484,7 @@ fun RawForgeApp() {
                                         ).fold(
                                             onSuccess = { adapted ->
                                                 currentLook = adapted.appliedLook
+                                                editIntensity = 1f
                                                 preview = PreviewState(
                                                     adapted.renderedImageBytes,
                                                     decodeImageBitmapOrNull(adapted.renderedImageBytes),
@@ -371,6 +506,7 @@ fun RawForgeApp() {
                                     Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
                                 }
                             }
+                            }
                         }
                     }
 
@@ -384,11 +520,101 @@ fun RawForgeApp() {
                             modifier = Modifier.width(320.dp).fillMaxHeight(),
                             look = currentLook,
                             onEdit = { mutate -> currentLook = mutate(currentLook) },
-                            onReset = { currentLook = EditableLook() },
+                            onReset = { currentLook = EditableLook(); editIntensity = 1f },
+                            editIntensity = editIntensity,
+                            onEditIntensityChange = { editIntensity = it },
                         )
                     }
                 }
+                }
             }
+        }
+    }
+}
+
+/**
+ * Modalità "Develop" a schermo intero, in stile Lightroom: niente confronto
+ * affiancato con la foto campione, solo la foto target grande al centro con
+ * il pannello di editing manuale accanto — pensata per il fine-tuning dopo
+ * un eventuale "Incolla impostazioni" (ma disponibile anche per editare a
+ * mano da zero, senza aver incollato nulla).
+ */
+@Composable
+private fun FullScreenDevelopView(
+    title: String,
+    bitmap: ImageBitmap?,
+    look: EditableLook,
+    onEdit: ((EditableLook) -> EditableLook) -> Unit,
+    onReset: () -> Unit,
+    editIntensity: Float,
+    onEditIntensityChange: (Float) -> Unit,
+    onExit: () -> Unit,
+    onExport: () -> Unit,
+    exportBusy: Boolean,
+    exportMessage: String?,
+    exportError: String?,
+    renderError: String?,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().background(PanelSurface).padding(horizontal = 20.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = onExit, shape = PillShape) { Text("← Torna al confronto", style = MaterialTheme.typography.caption) }
+            Spacer(Modifier.weight(1f))
+            Text(title, style = MaterialTheme.typography.subtitle2, color = TextPrimary, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = onExport,
+                enabled = !exportBusy,
+                shape = PillShape,
+                colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
+            ) {
+                Text(if (exportBusy) "Esportazione…" else "Esporta foto…", style = MaterialTheme.typography.caption)
+            }
+        }
+        Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(AccentGradient))
+        (exportError ?: exportMessage)?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.caption,
+                color = if (exportError != null) MaterialTheme.colors.error else TextMuted,
+                modifier = Modifier.fillMaxWidth().background(PanelSurface).padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+        Row(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier.weight(1f).fillMaxHeight().background(PanelBackground).padding(16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap,
+                        contentDescription = title,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Text("Rendering in corso…", style = MaterialTheme.typography.caption, color = TextMuted)
+                }
+                renderError?.let {
+                    Text(
+                        "Errore: $it",
+                        color = MaterialTheme.colors.error,
+                        style = MaterialTheme.typography.caption,
+                        modifier = Modifier.align(Alignment.BottomCenter).background(PanelSurface).padding(8.dp),
+                    )
+                }
+            }
+            Box(modifier = Modifier.fillMaxHeight().width(1.dp).background(PanelDivider))
+            DevelopPanel(
+                modifier = Modifier.width(360.dp).fillMaxHeight(),
+                look = look,
+                onEdit = onEdit,
+                onReset = onReset,
+                editIntensity = editIntensity,
+                onEditIntensityChange = onEditIntensityChange,
+            )
         }
     }
 }
@@ -400,9 +626,14 @@ private fun TopBar(
     onCheckEngine: () -> Unit,
     onGenerateSampleXmp: () -> Unit,
 ) {
-    Column(modifier = Modifier.fillMaxWidth().background(PanelSurface).padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(modifier = Modifier.fillMaxWidth().background(PanelSurface).padding(horizontal = 20.dp, vertical = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            // Piccolo marchio: un quadrato arrotondato col gradiente d'accento,
+            // al posto di un'icona vera (nessuna libreria icone in questo
+            // modulo) — comunque un punto di riconoscibilità in più.
+            Box(modifier = Modifier.size(28.dp).clip(RoundedCornerShape(8.dp)).background(AccentGradient))
             Text("RawForge", style = MaterialTheme.typography.h6, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Spacer(Modifier.width(4.dp))
             Text(
                 "Motore RAW ultra-veloce — motore Rust collegato via UniFFI",
                 style = MaterialTheme.typography.caption,
@@ -437,43 +668,53 @@ private fun PhotoPanel(
     actions: @Composable ColumnScope.() -> Unit = {},
 ) {
     val photo = state
-    Column(
-        modifier = modifier.background(PanelSurface, RoundedCornerShape(6.dp)).padding(12.dp),
-    ) {
-        Text(title, style = MaterialTheme.typography.subtitle2, color = TextPrimary, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-        Button(onClick = onImportClick, colors = ButtonDefaults.buttonColors(backgroundColor = AccentBlue)) {
-            Text(importLabel, style = MaterialTheme.typography.caption)
-        }
-        error?.let {
-            Spacer(Modifier.height(4.dp))
-            Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
-        }
-        Box(
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(top = 8.dp)
-                .background(PanelBackground, RoundedCornerShape(4.dp)),
-            contentAlignment = Alignment.Center,
-        ) {
-            val bitmap = overrideBitmap ?: photo?.bitmap
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap,
-                    contentDescription = title,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(4.dp)),
-                )
-            } else if (photo != null) {
-                Text("(anteprima non decodificabile, ma il motore ha letto i metadati)", style = MaterialTheme.typography.caption, color = TextMuted)
-            } else {
-                Text("Nessuna foto importata", style = MaterialTheme.typography.caption, color = TextMuted)
+    PanelCard(modifier = modifier) {
+        // `fillMaxSize()` prima del padding: senza, questa Column si
+        // limiterebbe al contenuto (wrap-content) e il riquadro
+        // dell'anteprima sottostante, che usa `weight(1f)` per prendere lo
+        // spazio verticale restante, non avrebbe nessuno spazio da cui
+        // prenderlo.
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Text(title, style = MaterialTheme.typography.subtitle2, color = TextPrimary, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onImportClick,
+                shape = PillShape,
+                colors = ButtonDefaults.buttonColors(backgroundColor = AccentBlue),
+            ) {
+                Text(importLabel, style = MaterialTheme.typography.caption)
             }
+            error?.let {
+                Spacer(Modifier.height(4.dp))
+                Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+            }
+            Box(
+                modifier = Modifier.weight(1f).fillMaxWidth().padding(top = 10.dp)
+                    .background(PanelBackground, InnerShape)
+                    .border(1.dp, PanelDivider, InnerShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                val bitmap = overrideBitmap ?: photo?.bitmap
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap,
+                        contentDescription = title,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize().clip(InnerShape),
+                    )
+                } else if (photo != null) {
+                    Text("(anteprima non decodificabile, ma il motore ha letto i metadati)", style = MaterialTheme.typography.caption, color = TextMuted)
+                } else {
+                    Text("Nessuna foto importata", style = MaterialTheme.typography.caption, color = TextMuted)
+                }
+            }
+            photo?.let { s ->
+                Spacer(Modifier.height(6.dp))
+                Text(s.fileName, style = MaterialTheme.typography.caption, color = TextPrimary)
+                s.cameraLabel?.let { Text(it, style = MaterialTheme.typography.caption, color = TextMuted) }
+            }
+            actions()
         }
-        photo?.let { s ->
-            Spacer(Modifier.height(4.dp))
-            Text(s.fileName, style = MaterialTheme.typography.caption, color = TextPrimary)
-            s.cameraLabel?.let { Text(it, style = MaterialTheme.typography.caption, color = TextMuted) }
-        }
-        actions()
     }
 }
 
@@ -483,9 +724,15 @@ private fun DevelopPanel(
     look: EditableLook,
     onEdit: ((EditableLook) -> EditableLook) -> Unit,
     onReset: () -> Unit,
+    editIntensity: Float,
+    onEditIntensityChange: (Float) -> Unit,
 ) {
+    // Angoli arrotondati solo sul lato sinistro: il pannello sta comunque
+    // incollato al bordo destro della finestra, arrotondarlo tutto intorno
+    // avrebbe un aspetto strano contro il bordo dello schermo.
+    val sidePanelShape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
     Column(
-        modifier = modifier.background(PanelSurface).verticalScroll(rememberScrollState()).padding(16.dp),
+        modifier = modifier.background(PanelSurface, sidePanelShape).verticalScroll(rememberScrollState()).padding(20.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -493,9 +740,31 @@ private fun DevelopPanel(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Develop", style = MaterialTheme.typography.h6, fontWeight = FontWeight.Bold, color = TextPrimary)
-            TextButton(onClick = onReset) { Text("Reimposta", style = MaterialTheme.typography.caption) }
+            TextButton(onClick = onReset, shape = PillShape) { Text("Reimposta", style = MaterialTheme.typography.caption) }
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(4.dp))
+        Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(AccentGradient, shape = RoundedCornerShape(1.dp)))
+        Spacer(Modifier.height(12.dp))
+
+        // Dial "Intensità edit": scala l'INTERO editing verso lo zero (o lo
+        // esagera oltre il 100%) senza dover toccare ogni singolo slider a
+        // mano — vedi `EditableLook.scaledBy`. Fuori da `DevelopSection`
+        // apposta, per restare visibile in cima e non confondersi con le
+        // singole categorie di regolazione sottostanti.
+        Text(
+            "Intensità edit: ${(editIntensity * 100).roundToInt()}%",
+            style = MaterialTheme.typography.caption,
+            color = TextPrimary,
+        )
+        Slider(
+            value = editIntensity,
+            onValueChange = onEditIntensityChange,
+            valueRange = 0f..1.5f,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(12.dp))
+        Divider(color = PanelDivider, thickness = 1.dp)
+        Spacer(Modifier.height(12.dp))
 
         DevelopSection("Base") {
             FloatSlider("Esposizione (EV)", look.exposureEv, -5f..5f, { onEdit { l -> l.copy(exposureEv = it) } }) { "%.2f".format(it) }
@@ -513,6 +782,14 @@ private fun DevelopPanel(
             IntSlider("Saturazione", look.saturation, -100..100) { onEdit { l -> l.copy(saturation = it) } }
         }
 
+        DevelopSection("Curva tonale") {
+            ToneCurveEditor(look.toneCurve) { updated -> onEdit { l -> l.copy(toneCurve = updated) } }
+        }
+
+        DevelopSection("HSL per banda colore") {
+            HslPanel(look, onEdit)
+        }
+
         DevelopSection("Viraggio (Split Toning)") {
             IntSlider("Tinta ombre (°)", look.shadowHue, 0..360) { onEdit { l -> l.copy(shadowHue = it) } }
             IntSlider("Saturazione ombre", look.shadowSat, 0..100) { onEdit { l -> l.copy(shadowSat = it) } }
@@ -520,14 +797,143 @@ private fun DevelopPanel(
             IntSlider("Saturazione luci", look.highlightSat, 0..100) { onEdit { l -> l.copy(highlightSat = it) } }
             IntSlider("Bilanciamento", look.splitToningBalance, -100..100) { onEdit { l -> l.copy(splitToningBalance = it) } }
         }
+    }
+}
 
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "Curva tonale e HSL per singola banda colore non ancora modificabili a mano da qui — " +
-                "prossimo incremento (il motore li applica già, dalla Sintesi Armonica).",
-            style = MaterialTheme.typography.caption,
-            color = TextMuted,
-        )
+/** Editor grafico semplificato della tone curve, in stile "point curve" di
+ * Lightroom: 5 punti di controllo a X FISSA (0/64/128/192/255 — ombre,
+ * scure, medi, chiare, luci), ognuno trascinabile solo in verticale. Tocca/
+ * trascina in un punto qualsiasi del grafico: sposta il punto di controllo
+ * più vicino in X alla posizione del dito, non serve centrare esattamente
+ * l'handle. `rememberUpdatedState` tiene la callback e i punti sempre
+ * aggiornati SENZA riavviare il rilevatore di trascinamento ad ogni singolo
+ * fotogramma (altrimenti ogni tick interromperebbe il trascinamento in corso
+ * invece di continuarlo). */
+@Composable
+private fun ToneCurveEditor(
+    points: List<TonePoint>,
+    onChange: (List<TonePoint>) -> Unit,
+) {
+    val latestPoints = rememberUpdatedState(points)
+    val latestOnChange = rememberUpdatedState(onChange)
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(160.dp)
+                .background(PanelBackground, InnerShape)
+                .border(1.dp, PanelDivider, InnerShape)
+                .pointerInput(Unit) {
+                    detectDragGestures { change, _ ->
+                        change.consume()
+                        val w = size.width.toFloat()
+                        val h = size.height.toFloat()
+                        if (w <= 0f || h <= 0f) return@detectDragGestures
+                        val px = change.position.x.coerceIn(0f, w)
+                        val py = change.position.y.coerceIn(0f, h)
+                        val pointerXValue = px / w * 255f
+                        val current = latestPoints.value
+                        val nearestIndex = current.indices.minByOrNull { i -> abs(current[i].x - pointerXValue) }
+                            ?: return@detectDragGestures
+                        val newY = (255f - py / h * 255f).roundToInt().coerceIn(0, 255)
+                        val updated = current.mapIndexed { i, p -> if (i == nearestIndex) p.copy(y = newY) else p }
+                        latestOnChange.value(updated)
+                    }
+                },
+        ) {
+            val w = size.width
+            val h = size.height
+            // Diagonale di riferimento (curva identità, nessuna correzione).
+            drawLine(color = PanelDivider, start = Offset(0f, h), end = Offset(w, 0f), strokeWidth = 1f)
+            val path = Path()
+            points.forEachIndexed { i, p ->
+                val x = p.x / 255f * w
+                val y = h - p.y / 255f * h
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            drawPath(path, color = AccentBlue, style = Stroke(width = 3f))
+            points.forEach { p ->
+                val x = p.x / 255f * w
+                val y = h - p.y / 255f * h
+                drawCircle(color = AccentBlue, radius = 6f, center = Offset(x, y))
+            }
+        }
+    }
+}
+
+/** Ordine e nomi delle 8 bande di tonalità, identici a quelli usati dal
+ * motore in estrazione/rendering (`core_types::HslAdjustments`, commento
+ * "Ordine bande: Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta"). */
+private val HslBandNames = listOf("Rosso", "Arancio", "Giallo", "Verde", "Acqua", "Blu", "Viola", "Magenta")
+
+// Colori puramente decorativi per i pallini accanto a ogni slider — aiutano
+// a riconoscere a colpo d'occhio la banda, come le etichette colorate del
+// pannello HSL vero di Lightroom. Non hanno alcun legame con i gradi esatti
+// usati dal motore per definire i confini di banda.
+private val HslBandColors = listOf(
+    Color(0xFFE5484D), // Rosso
+    Color(0xFFF2994A), // Arancio
+    Color(0xFFF2C94C), // Giallo
+    Color(0xFF6FCF97), // Verde
+    Color(0xFF56CCF2), // Acqua
+    Color(0xFF4A90E2), // Blu
+    Color(0xFF9B6BE0), // Viola
+    Color(0xFFE0679B), // Magenta
+)
+
+private enum class HslChannel { HUE, SAT, LUM }
+
+/** Pannello HSL per banda colore, in stile Lightroom: tre "tab" (Tonalità/
+ * Saturazione/Luminanza, non tutte e tre insieme) e sotto uno slider per
+ * ciascuna delle 8 bande del canale selezionato — evita di mostrare 24
+ * slider insieme. */
+@Composable
+private fun HslPanel(
+    look: EditableLook,
+    onEdit: ((EditableLook) -> EditableLook) -> Unit,
+) {
+    var channel by remember { mutableStateOf(HslChannel.HUE) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf(
+                HslChannel.HUE to "Tonalità",
+                HslChannel.SAT to "Saturazione",
+                HslChannel.LUM to "Luminanza",
+            ).forEach { (candidate, label) ->
+                val selected = channel == candidate
+                TextButton(
+                    onClick = { channel = candidate },
+                    shape = PillShape,
+                    colors = ButtonDefaults.textButtonColors(
+                        backgroundColor = if (selected) PanelSurfaceRaised else Color.Transparent,
+                    ),
+                ) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.caption,
+                        color = if (selected) AccentBlue else TextMuted,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        HslBandNames.forEachIndexed { i, name ->
+            val currentValue = when (channel) {
+                HslChannel.HUE -> look.hslHue[i]
+                HslChannel.SAT -> look.hslSat[i]
+                HslChannel.LUM -> look.hslLum[i]
+            }
+            IntSlider(name, currentValue, -100..100, swatchColor = HslBandColors[i]) { newValue ->
+                onEdit { l ->
+                    when (channel) {
+                        HslChannel.HUE -> l.copy(hslHue = l.hslHue.mapIndexed { idx, v -> if (idx == i) newValue else v })
+                        HslChannel.SAT -> l.copy(hslSat = l.hslSat.mapIndexed { idx, v -> if (idx == i) newValue else v })
+                        HslChannel.LUM -> l.copy(hslLum = l.hslLum.mapIndexed { idx, v -> if (idx == i) newValue else v })
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -549,12 +955,24 @@ private fun IntSlider(
     label: String,
     value: Int,
     range: IntRange,
+    swatchColor: Color? = null,
     onChange: (Int) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(label, style = MaterialTheme.typography.caption, color = TextPrimary)
-            Text(value.toString(), style = MaterialTheme.typography.caption, color = TextMuted)
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                swatchColor?.let { Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(it)) }
+                Text(label, style = MaterialTheme.typography.caption, color = TextPrimary)
+            }
+            Text(
+                value.toString(),
+                style = MaterialTheme.typography.caption,
+                color = TextMuted,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(PanelSurfaceRaised)
+                    .padding(horizontal = 6.dp, vertical = 1.dp),
+            )
         }
         Slider(
             value = value.toFloat(),
