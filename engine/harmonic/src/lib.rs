@@ -35,6 +35,28 @@ const BASELINE_CONTRAST_STD: f32 = 20.0;
 /// empirica per il bias di vibrance/saturation.
 const BASELINE_CHROMA: f32 = 18.0;
 
+/// Chroma Lab "tipica" attesa per la zona ombre o luci di una foto QUALUNQUE,
+/// anche senza alcuna intenzione di color grading — stessa logica di
+/// `BASELINE_HSL_SATURATION`, ma in scala Lab chroma (0..~100+) invece che
+/// saturazione HSL (0..1). **Bug reale scoperto e corretto in questo giro**:
+/// a differenza di `hsl_sat`/`vibrance` (entrambi già uno scarto RELATIVO a
+/// una baseline), `split_toning.shadow_sat`/`highlight_sat` usava la chroma
+/// Lab GREZZA della zona, senza sottrarre nulla — quindi anche una foto
+/// campione scattata alla luce del giorno, senza alcuna gradazione voluta
+/// (solo la normale differenza di colore fra cielo/ombra e sole diretto/luce
+/// che ha QUALSIASI scatto), produceva uno split toning non trascurabile.
+/// Con "Incolla impostazioni" questo valore viene copiato per intero sul
+/// target (mai sull'editing manuale, dove split toning parte sempre da 0) —
+/// applicato per giunta su zone tonali ampie (ombre sotto luma 0.4, luci
+/// sopra 0.6: in molte foto reali la maggioranza dei pixel), quindi anche un
+/// valore moderato tinge una porzione ampia del fotogramma. Combinato con
+/// `hsl_sat` (fisso in questo stesso giro), è una seconda causa reale e
+/// distinta della dominante diffusa segnalata dall'utente — presente SOLO
+/// quando si incollano le impostazioni, mai con l'editing manuale, perché lo
+/// split toning manuale parte sempre da 0/0 e questo bug riguarda solo
+/// l'ESTRAZIONE automatica.
+const BASELINE_SPLIT_CHROMA: f32 = 6.0;
+
 /// Accumulatore per banda di tonalità (Red/Orange/Yellow/Green/Aqua/Blue/
 /// Purple/Magenta, stesso schema a 8 bande usato da `look-render` per
 /// applicare l'HSL) — media di saturazione, luminanza e hue dei pixel di
@@ -196,9 +218,15 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
 
     let split_toning = SplitToning {
         shadow_hue: shadow_hue.round() as i32,
-        shadow_sat: shadow_chroma.clamp(0.0, 100.0).round() as i32,
+        // Sottrae la baseline (vedi `BASELINE_SPLIT_CHROMA`) prima di
+        // clampare, e con un range dimezzato (0..50, non 0..100) — stessa
+        // proporzione già applicata a `hsl_sat` in questo giro, per lo stesso
+        // motivo: senza guardrail, la sola chroma "grezza" di una zona tonale
+        // non distingue uno stile di grading intenzionale da una normale
+        // variazione di colore ambientale.
+        shadow_sat: ((shadow_chroma - BASELINE_SPLIT_CHROMA).max(0.0)).clamp(0.0, 50.0).round() as i32,
         highlight_hue: highlight_hue.round() as i32,
-        highlight_sat: highlight_chroma.clamp(0.0, 100.0).round() as i32,
+        highlight_sat: ((highlight_chroma - BASELINE_SPLIT_CHROMA).max(0.0)).clamp(0.0, 50.0).round() as i32,
         balance: 0,
     };
 
@@ -388,6 +416,30 @@ mod tests {
             warm_look.white_balance.temp > cool_look.white_balance.temp,
             "warm={} cool={}", warm_look.white_balance.temp, cool_look.white_balance.temp
         );
+    }
+
+    #[test]
+    fn mild_incidental_color_variation_does_not_produce_split_toning() {
+        // Bug reale corretto in questo giro: prima della baseline
+        // (`BASELINE_SPLIT_CHROMA`), anche una foto SENZA alcuna intenzione
+        // di grading — solo la normale, lieve differenza di colore fra
+        // ombra/cielo e luce diretta che ha qualunque scatto diurno —
+        // produceva uno split toning non trascurabile, copiato per intero su
+        // "Incolla impostazioni". Qui le ombre hanno solo un lievissimo cast
+        // freddo (+5 sul blu) e le luci un lievissimo cast caldo (+5 sul
+        // rosso): una variazione realistica ma non uno stile deliberato.
+        let img = synthetic_image(|_, y| {
+            if y < 20 {
+                [15, 18, 23, 255] // ombra: cast blu appena percettibile
+            } else if y < 44 {
+                [140, 140, 140, 255]
+            } else {
+                [235, 232, 227, 255] // luce: cast caldo appena percettibile
+            }
+        });
+        let look = extract_look_from_reference(&img, "Mild Cast Test");
+        assert_eq!(look.split_toning.shadow_sat, 0, "cast lieve non deve produrre split toning nelle ombre, got {}", look.split_toning.shadow_sat);
+        assert_eq!(look.split_toning.highlight_sat, 0, "cast lieve non deve produrre split toning nelle luci, got {}", look.split_toning.highlight_sat);
     }
 
     #[test]

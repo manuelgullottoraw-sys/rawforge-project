@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 71 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 72 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -435,17 +435,48 @@ segnalato. Anche `smartbatch::apply_deltas` (Smart-Batch Contestuale) è stato e
 il codice per intero: modifica solo esposizione/luci/ombre, mai i campi del bilanciamento del
 bianco a gradiente.
 
-**Onestà su cosa resta incerto**: la dominante magenta/rosa esatta vista nello screenshot
-dell'utente non è stata riprodotta al 100% con gli stessi identici colori partendo dai soli
-valori slider visibili — è plausibile che il `HarmonicLook` reale dell'utente avesse anche valori
-di HSL per banda o split toning diversi da zero (fuori dallo screenshot, es. da un "Incolla
-impostazioni" precedente) che la correzione al punto 1 riduce direttamente. Se il problema
-dovesse ripresentarsi dopo questa consegna, condividere la foto campione e quella target userebbe
-per individuare la causa esatta invece di continuare a ipotizzare da uno screenshot.
+## Corretto: la dominante restava, ma SOLO su "Incolla impostazioni" — mai con l'editing manuale
+
+L'utente ha confermato, dopo la consegna qui sopra, che il problema si presenta **esclusivamente**
+quando si incollano le impostazioni dalla foto campione — mai modificando gli slider a mano. Un
+indizio prezioso: confina la causa alla sola estrazione automatica (`harmonic`), esclude
+definitivamente il bilanciamento del bianco a gradiente e ogni altro slider manuale (già peraltro
+verificati sopra), e ha portato a un terzo bug reale, distinto dal primo:
+
+**3. `split_toning.shadow_sat`/`highlight_sat` non aveva ALCUNA baseline, a differenza dei suoi
+"fratelli".** A differenza di `hsl_sat` e `vibrance` (entrambi già uno SCARTO relativo a una
+soglia tipica), lo split toning usava la chroma Lab GREZZA della zona ombre/luci, limitata solo a
+`0..100` — nessun confronto con "quanto sia tipicamente colorata" quella zona in una foto
+qualunque. Risultato verificato con uno script di debug dedicato: perfino una foto campione
+scattata alla luce del giorno, SENZA alcuna intenzione di grading (solo la normale, lieve
+differenza di colore fra cielo/ombra e sole diretto che ha qualunque scatto), produceva uno split
+toning non trascurabile — copiato per intero sul target con "Incolla impostazioni" (mai
+sull'editing manuale, dove lo split toning parte sempre da 0/0), e applicato per giunta su zone
+tonali ampie (ombre sotto luma 0.4, luci sopra 0.6 — in molte foto la maggioranza dei pixel).
+Questo spiega esattamente perché il problema fosse confinato al solo "Incolla impostazioni".
+**Corretto**: sottratta una baseline di chroma tipica (`BASELINE_SPLIT_CHROMA = 6.0`) prima del
+clamp, e range dimezzato a `0..50` (stessa proporzione già applicata a `hsl_sat`). Verificato con
+uno script di debug end-to-end (estrazione + Smart-Batch + rendering) su una scena con contenuto
+vario (cielo, fogliame, carrozzeria, asfalto — non bande piatte di test) che il risultato dopo
+"Incolla impostazioni" resta un'interpretazione moderata dello stile, non una dominante estrema:
+cielo ancora bluastro, fogliame ancora verdastro, carrozzeria e asfalto restano pressoché neutri.
+
+Nuovo test in `harmonic` (`mild_incidental_color_variation_does_not_produce_split_toning`) verifica
+che un cast lieve e non intenzionale non produca più split toning, mantenendo intatto il test
+esistente che verifica il caso opposto (uno split "teal & orange" vero, con colori genuinamente
+saturi, deve continuare a essere copiato).
+
+**Onestà su cosa resta**: con queste tre correzioni (hsl_sat, whites/blacks, split_toning) tutti i
+meccanismi di estrazione automatica che potevano produrre una dominante sproporzionata rispetto
+allo stile reale della foto campione sono stati individuati nel codice, corretti e verificati con
+test mirati e con ricostruzioni end-to-end del flusso "Incolla impostazioni" — non solo con lo
+screenshot originale, che da solo non permette di isolare la causa esatta con certezza assoluta.
+Se dovesse ripresentarsi un problema simile, condividere la foto campione e quella target
+userebbe a individuare la causa esatta invece di continuare a ipotizzare da uno screenshot.
 
 Due nuovi test in `look-render` (`positive_blacks_lifts_near_black_pixels_more_than_midtones`,
 `negative_whites_pulls_near_white_pixels_down_more_than_midtones`) verificano il punto 2, sul
-modello dell'analogo test già esistente per ombre/luci. Workspace completo: 71 test, tutti verdi.
+modello dell'analogo test già esistente per ombre/luci. Workspace completo: 72 test, tutti verdi.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

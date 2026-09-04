@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (71 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 9, `look_render` 24, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
+Crate reali, compilati e testati (72 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 10, `look_render` 24, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -253,10 +253,10 @@ lavoro sostanzialmente più grande per lo stesso caso d'uso reale (cielo freddo 
 caldo in basso); "slider sicuri" mostra solo il clipping del valore ATTUALE, non un'anteprima
 dipinta sull'intero binario dello slider.
 
-## Corretto (questo giro): due bug reali di dominanti/blocchi di colore segnalati dall'utente
+## Corretto (questo giro): quattro bug reali di dominanti/blocchi di colore segnalati dall'utente
 
-Due segnalazioni consecutive dell'utente, ciascuna con uno screenshot, hanno portato a tre
-correzioni reali nel motore (non semplici ritocchi estetici):
+Tre segnalazioni consecutive dell'utente hanno portato a quattro correzioni reali nel motore (non
+semplici ritocchi estetici):
 
 **1. Confine netto ogni 45° nell'applicazione HSL per banda (`look-render`).**
 `render_preview_with_look` applicava gli 8 aggiustamenti HSL per banda
@@ -316,12 +316,38 @@ ragionevole, non una dominante innaturale. Anche `smartbatch::apply_deltas` è s
 leggendone il codice per intero: modifica solo `exposure_ev`/`highlights`/`shadows`, mai i campi
 del bilanciamento del bianco (singolo o a gradiente).
 
+**4. `split_toning.shadow_sat`/`highlight_sat` senza alcuna baseline (`harmonic`).** Dopo la
+consegna dei primi tre punti, l'utente ha confermato un indizio decisivo: il problema si
+presentava SOLO usando "Incolla impostazioni", mai con l'editing manuale. Questo confina la causa
+alla sola estrazione automatica — split toning manuale parte sempre da 0/0, quindi il difetto non
+può essere lì. A differenza di `hsl_sat`/`vibrance` (entrambi già uno scarto RELATIVO a una
+baseline), lo split toning usava la chroma Lab GREZZA della zona ombre/luci (`shadow_chroma`/
+`highlight_chroma` da `lab_ab_to_hue_chroma`), limitata solo a `.clamp(0.0, 100.0)` — nessun
+confronto con quanto sia "tipicamente colorata" quella zona in una foto qualunque. Verificato con
+uno script di debug dedicato: anche una foto campione scattata alla luce del giorno, SENZA alcuna
+intenzione di grading (solo la normale, lieve differenza di colore fra cielo/ombra e sole diretto
+che ha qualunque scatto — non un test pattern estremo), produceva `shadow_sat`/`highlight_sat` non
+trascurabili (es. 3-4 su una scala 0-100), copiati per intero sul target con "Incolla
+impostazioni" e applicati su zone tonali ampie (ombre sotto luma 0.4, luci sopra 0.6 — in molte
+foto la maggioranza dei pixel). **Corretto**: sottratta `BASELINE_SPLIT_CHROMA = 6.0` prima del
+clamp (`.max(0.0)` per restare comunque non-negativo, poi `.clamp(0.0, 50.0)` — range dimezzato,
+stessa proporzione già applicata al punto 2), lasciando intatto lo split toning genuinamente
+graduato (es. "teal & orange" deliberato — verificato che il test esistente
+`teal_and_orange_split_produces_distinct_shadow_and_highlight_hues` continui a passare). Nuovo
+test: `mild_incidental_color_variation_does_not_produce_split_toning`. Verificato anche
+end-to-end (estrazione + Smart-Batch + rendering, non solo la sola estrazione isolata) su una
+scena sintetica con contenuto vario — cielo, fogliame, carrozzeria, asfalto, non bande piatte —
+che il risultato dopo "Incolla impostazioni" resti un'interpretazione moderata dello stile: ogni
+zona mantiene la propria tinta caratteristica (cielo bluastro, fogliame verdastro) senza
+dominante estranea sovrapposta.
+
 Non è stato possibile riprodurre al 100% l'esatta dominante magenta/rosa dello screenshot
-dell'utente partendo dai soli valori slider visibili in foto — è plausibile che il suo
-`HarmonicLook` reale avesse anche valori HSL per banda o split toning diversi da zero, fuori
-inquadratura nello screenshot, che la correzione al punto 2 riduce direttamente alla radice. Se
-il problema dovesse ripresentarsi, condividere la foto campione e quella target permetterebbe di
-individuare la causa esatta invece di continuare a ipotizzare da uno screenshot.
+originale dell'utente partendo dai soli valori slider visibili in foto — ma con questi quattro
+punti corretti, ogni meccanismo di estrazione automatica individuato nel codice che poteva
+produrre una dominante sproporzionata rispetto allo stile reale della foto campione è stato
+guardrailato e verificato, sia isolatamente sia end-to-end. Se il problema dovesse ripresentarsi,
+condividere la foto campione e quella target permetterebbe di individuare la causa esatta invece
+di continuare a ipotizzare da uno screenshot.
 
 ## Comandi
 
