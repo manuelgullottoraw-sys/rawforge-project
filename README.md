@@ -24,10 +24,11 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   `color-science`, `harmonic` (Sintesi Armonica), `smartbatch` (Smart-Batch Contestuale),
   `metadata` (sidecar non distruttivo), `xmp` (export preset Lightroom), `gpu-pipe` (shader
   WGSL validati con `naga`), `raw-decode` (decodifica RAW vera), **`look-render`** (applica un
-  Look ai pixel su CPU — bilanciamento del bianco, esposizione, tone curve, contrasto,
-  highlights/shadows, HSL per banda, split toning) e **`ffi`** (la superficie UniFFI che collega
-  tutto quanto sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` per il rendering dal
-  vivo, vedi sotto). 56 test, tutti verdi, eseguiti in locale prima di ogni consegna. Dettagli in
+  Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
+  contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
+  **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 69 test, tutti verdi,
+  eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
   1. `rust-tests` — compila e testa l'intero workspace Rust.
@@ -221,12 +222,16 @@ tecnici completi in [`engine/README.md`](engine/README.md).
 ## Cosa ho potuto verificare qui e cosa no
 
 Verificato **per davvero**, in locale, prima di questa consegna: build e test dell'intero
-workspace Rust (56 test, tutti verdi — inclusi i nuovi test su `PhotoEditSession`, sul
-bilanciamento del bianco reso nel renderer, e sull'estrazione HSL per banda). Rigenerati e
-ispezionati i binding Kotlin generati da UniFFI per il nuovo oggetto `PhotoEditSession`
-(confermata la forma esatta: costruttore, `renderPreview`/`renderFullResolution`/
-`pasteLookFromSample`, lifecycle `Disposable`/`AutoCloseable`/`close()`) prima di scrivere a mano
-il codice Kotlin che lo richiama.
+workspace Rust (69 test, tutti verdi — inclusi i nuovi test su texture a bande di frequenza
+(separazione di frequenza gaussiana), bilanciamento del bianco a gradiente per pixel, le
+frazioni di clipping ombre/luci di "slider sicuri", e i cinque nuovi test sulla correzione del bug
+di posterizzazione ai confini delle bande HSL — vedi la sezione "Corretto" più sotto). Rigenerati e ispezionati i binding Kotlin
+generati da UniFFI dopo ogni cambio di forma dei dati passati al motore — sia per il nuovo oggetto
+`PhotoEditSession` (costruttore, `renderPreview`/`renderFullResolution`/`pasteLookFromSample`,
+lifecycle `Disposable`/`AutoCloseable`/`close()`) sia, in questo giro, per i nuovi campi di
+`HarmonicLookFfi` (texture, WB zona B e parametri del gradiente) e per il nuovo tipo di ritorno di
+`renderPreview` (`RenderedPreviewFfi`, che ora porta anche le due frazioni di clipping) — prima di
+scrivere a mano il codice Kotlin che li richiama.
 
 **Non verificabile da qui** (l'ambiente di sviluppo non ha un Android NDK né un PC Windows, e non
 può scaricare un NDK per una verifica autonoma — la rete di questo ambiente blocca `dl.google.com`
@@ -234,14 +239,16 @@ per policy, verificato anche provando a scaricare direttamente i sorgenti di Com
 controllo extra sulle API usate): l'intera build Gradle, in particolare le modifiche più estese
 lato Kotlin — il nuovo `PhotoEditSession` in `Engine.kt`/`Engine.android.kt`/`Engine.desktop.kt`, la
 riscrittura di `App.kt` per il rendering dal vivo (`LaunchedEffect`/`snapshotFlow`/`collectLatest`),
-e in questo giro anche la modalità a schermo intero, l'editor grafico della tone curve (un
-`Canvas` con trascinamento via `pointerInput`/`detectDragGestures`) e il pannello HSL a tab. Riletto
-con attenzione più volte cercando gli errori tipici di Compose che non si vedono senza compilare
-(riferimenti residui a funzioni/parametri rimossi, chiavi ed effetti collaterali degli `Effect`,
-bilanciamento delle graffe nel nuovo ramo `if`/`else`, firme delle API di disegno su `Canvas`) senza
-trovarne, ma resta tutto da compilare per la prima volta su CI, come sempre in questo ambiente: se
-GitHub Actions segnala un errore Kotlin/Gradle, mandami il log e lo sistemiamo, esattamente come
-fatto finora.
+la modalità a schermo intero, l'editor grafico della tone curve, il pannello HSL a tab, e in questo
+giro anche i tre nuovi controlli (sezione "Dettaglio (Texture)", la colorazione ambra "slider
+sicuri" su Esposizione/Alte luci/Ombre/Bianchi/Neri, e la sezione "Bilanciamento del bianco a
+gradiente" con `Switch`/selettore d'asse). Riletto con attenzione più volte cercando gli errori
+tipici di Compose che non si vedono senza compilare (riferimenti residui a funzioni/parametri
+rimossi, chiavi ed effetti collaterali degli `Effect`, bilanciamento delle graffe, firme delle API
+di disegno su `Canvas`, firme di `SliderDefaults.colors`/`SwitchDefaults.colors`) senza trovarne, ma
+resta tutto da compilare per la prima volta su CI, come sempre in questo ambiente: se GitHub
+Actions segnala un errore Kotlin/Gradle, mandami il log e lo sistemiamo, esattamente come fatto
+finora.
 
 ## Cosa manca ancora (prossimo incremento)
 
@@ -266,20 +273,17 @@ fatto finora.
   impostazioni" (cieco alla scena) e da un "match color" foto-per-foto (non garantisce coerenza
   collettiva sull'intero set).
 - **Quattro idee sui valori personalizzabili in editing**, discusse e approvate con l'utente,
-  ordinate per rapporto valore/sforzo:
+  ordinate per rapporto valore/sforzo — **tutte e quattro fatte**, a questo giro:
   1. ~~Dial "Intensità edit" che scala l'intero editing verso lo zero (o lo esagera oltre il
-     100%)~~ — **fatto in questo giro**, vedi sotto.
-  2. **Texture a bande di frequenza** (fine/media/grossa invece di un solo slider "Texture") — la
-     Texture di Lightroom tratta grana della pelle e trama di un muro come la stessa cosa perché è
-     un solo slider su un'unica banda; tre slider per bande di frequenza diverse (differenze tra
-     l'immagine e versioni sfocate a raggi diversi, pesate per banda) darebbero un controllo reale
-     in stile "frequency separation" da ritocco, oggi possibile solo uscendo su Photoshop.
-  3. **Slider "sicuri"**: colorare il binario dello slider (esposizione/bianchi/neri) nella zona
-     dove il valore corrente produce clipping di alte luci/ombre, invece di dover guardare
-     l'istogramma a parte.
-  4. **Bilanciamento del bianco a più punti/a gradiente**, per scene con luce mista (finestra +
-     lampada in tungsteno nella stessa inquadratura) che oggi richiedono maschere manuali pazienti
-     — la più ambiziosa delle quattro, da programmare per dopo.
+     100%)~~ — vedi sotto.
+  2. ~~**Texture a bande di frequenza** (fine/media/grossa invece di un solo slider
+     "Texture")~~ — vedi sotto: separazione di frequenza gaussiana reale (`image::imageops::blur`
+     a tre raggi), non un semplice contrasto locale.
+  3. ~~**Slider "sicuri"**: colorare il binario dello slider quando il valore corrente produce
+     clipping~~ — vedi sotto.
+  4. ~~**Bilanciamento del bianco a più punti/a gradiente**~~ — vedi sotto: due zone (non punti
+     liberi), sfumate linearmente lungo un asse verticale/orizzontale — la versione più semplice
+     che risolve comunque il caso reale (cielo freddo/terreno caldo nella stessa inquadratura).
 
 ## Nuovo: dial "Intensità edit" (prima delle quattro idee sui valori personalizzabili)
 
@@ -299,6 +303,85 @@ esattamente come prima (nessuna complicazione nel back-solving dei valori mentre
 posizione diversa da 100%). La tinta del viraggio (`shadowHue`/`highlightHue`, gradi assoluti senza
 un "neutro" naturale) resta apposta invariata dal dial; conta solo quando la sua saturazione
 (quella sì scalata) è diversa da zero.
+
+## Nuovo: texture a bande di frequenza, slider "sicuri", bilanciamento del bianco a gradiente
+
+Le altre tre idee approvate sui valori personalizzabili (§ sopra), tutte e tre in questo giro.
+
+**Texture a bande di frequenza** (sezione "Dettaglio (Texture)", tre slider Fine/Media/Grossa,
+-100..100 ciascuno). Vera separazione di frequenza, non un contrasto locale mascherato da un altro
+nome: `look-render` sfoca l'immagine già color-gradata a tre raggi crescenti
+(`image::imageops::blur`, sigma 1.2/4/10), ricava le bande di dettaglio per differenza tra sfocature
+successive (quella più sfocata di tutte è il "residuo" a bassa frequenza — colore e tono di base,
+mai toccato), poi ricompone scalando ogni banda di `1 + amount/100`. Con tutti gli amount a 0 la
+ricostruzione è esatta (residuo + somma delle differenze = l'immagine originale): un'immagine a
+tinta piatta resta quindi invariata qualunque sia l'amount, e solo il *dettaglio* locale cambia
+ampiezza — non la luminosità media, a differenza di "Chiarezza"/contrasto. È un passo separato dal
+loop per-pixel principale (un'operazione spaziale, non può vivere dentro un ciclo che processa un
+pixel alla volta), eseguito solo se almeno uno dei tre amount è diverso da 0.
+
+**Slider "sicuri"** (colorazione ambra su Esposizione/Alte luci/Ombre/Bianchi/Neri quando il
+valore corrente produce clipping). `PhotoEditSession::render_preview` ora calcola, sull'anteprima
+appena renderizzata, la frazione di pixel vicini al nero puro (luma ≤ 2) e al bianco puro (luma ≥
+253) e le restituisce insieme ai bytes PNG (`RenderedPreviewFfi`/`RenderedPreview` lato Kotlin). La
+UI confronta queste due frazioni con una soglia (2% dei pixel, scelta dichiarata: non un singolo
+pixel isolato, ma clipping già percepibile) e colora in ambra badge e binario dello slider
+interessato, più un avviso testuale sotto la sezione "Base". **Scelta di design dichiarata**: il
+segnale riguarda solo il valore ATTUALE, non un'anteprima dell'intero range possibile dello
+slider — dipingere l'intero binario richiederebbe ri-renderizzare l'immagine una volta per ogni
+posizione possibile, troppo costoso per un feedback dal vivo mentre si trascina.
+
+**Bilanciamento del bianco a gradiente** (nuova sezione "Bilanciamento del bianco a gradiente",
+sotto "Colore"). Una `Switch` per attivarlo, un selettore verticale/orizzontale, due slider
+posizione/ampiezza della transizione (0-100) e una seconda coppia temperatura/tinta per la "zona
+B". Nel renderer, il loop per-pixel principale ora traccia la posizione `(x, y)` di ogni pixel
+(prima assente — serviva solo per far girare rayon su righe/pixel senza sapere dove fossero) e, se
+il gradiente è attivo, sfuma linearmente il guadagno WB tra la zona A e la zona B lungo l'asse
+scelto, centrato sulla posizione configurata e largo quanto l'ampiezza configurata (0 = bordo
+netto, 100 = sfumatura sull'intero fotogramma). **Scelta di design dichiarata**: due zone lungo un
+asse, non punti liberi piazzabili a piacere sulla foto (quello richiederebbe una UI di
+posizionamento 2D e un'interpolazione multi-punto molto più complessa) — la versione più semplice
+che risolve comunque il caso reale discusso (cielo freddo in alto, terreno caldo in basso nella
+stessa inquadratura).
+
+## Corretto: immagine "a blocchi"/posterizzata su foto con tonalità che varia con continuità
+
+Bug reale segnalato dall'utente con uno screenshot: su una foto con un fogliame ampio (tanti verdi
+diversi, dal giallastro all'azzurrato), il rendering mostrava macchie di colore/luminosità nette a
+forma di blocco, che seguivano i contorni della scena invece di una transizione morbida —
+un'immagine "rovinata", non un ritocco.
+
+**Causa reale**: `render_preview_with_look` (in `look-render`) applica gli aggiustamenti HSL per
+banda colore (`HarmonicLook.hsl`, 8 bande — Rosso/Arancio/Giallo/Verde/Acqua/Blu/Viola/Magenta,
+45° ciascuna) assegnando ogni pixel a un'UNICA banda in base alla sua tonalità
+(`floor(hue / 45) % 8`) e applicandone l'aggiustamento per intero — un confine di banda NETTO ogni
+45°, senza alcuna transizione. Su una tinta piatta questo non si vede mai (tutta l'immagine è nella
+stessa banda); su una foto reale, dove la tonalità varia con continuità pixel per pixel (un cielo,
+un prato, un incarnato), due pixel visivamente quasi identici possono finire in bande diverse se la
+loro tonalità cade appena ai due lati di un confine — e se quella banda ha un aggiustamento diverso
+(hue/saturazione/luminanza), il salto è visibile come un bordo artificiale netto. Con "Incolla
+impostazioni" (che estrae aggiustamenti per banda reali e spesso diversi da una foto campione) o con
+un editing manuale della sezione HSL, questo produce esattamente l'effetto "a blocchi" dello
+screenshot: la scena non ha mai avuto quei bordi, li ha creati il rendering.
+
+**Corretto**: `look-render` ora interpola linearmente e circolarmente (con wrap a 360°) tra i valori
+delle DUE bande più vicine alla tonalità di ogni pixel (`interpolate_hsl_band`), invece di
+applicare in blocco quello di un'unica banda. Ogni banda ha il suo pieno effetto solo al centro del
+proprio intervallo di 45°; ai bordi fra due bande l'effetto sfuma linearmente 50/50 (la somma dei
+pesi resta sempre 1 — nessun salto, nessuna banda "invisibile" durante la transizione). Il resto
+della pipeline (bilanciamento del bianco, esposizione, tone curve, contrasto, split toning,
+texture) non era interessato da questo bug ed è rimasto invariato.
+
+Quattro nuovi test in `look-render` isolano il comportamento della sola interpolazione
+(`hsl_band_interpolation_returns_exact_value_at_band_center`,
+`hsl_band_interpolation_blends_evenly_exactly_at_a_boundary`,
+`hsl_band_interpolation_wraps_around_360_degrees`,
+`hsl_band_interpolation_has_no_hard_jump_across_a_boundary`), più un quinto end-to-end
+(`render_preview_hsl_saturation_has_no_hard_jump_across_a_hue_band_boundary`) che riproduce lo
+scenario reale: due tinte unite a tonalità quasi identica (134°/136°, appena ai due lati di un
+confine banda), con un Look che alza molto la saturazione di una sola delle due bande — con il
+vecchio bucket netto le due immagini finivano con saturazioni radicalmente diverse pur partendo da
+tonalità quasi identiche, con l'interpolazione la differenza resta piccola.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

@@ -84,6 +84,37 @@ fn sample_lut(lut: &[f32; 256], v: f32) -> f32 {
     a + (b - a) * frac
 }
 
+/// Interpola linearmente e circolarmente (wrap a 360°) tra i due valori di
+/// banda più vicini alla tonalità `hue` (0..360) del pixel, invece di
+/// applicare in blocco il valore dell'UNICA banda a cui il pixel
+/// "appartiene". **Bug corretto in questo giro**: la versione precedente
+/// assegnava ogni pixel a una sola delle 8 bande (`floor(hue / 45) % 8`) e ne
+/// applicava l'aggiustamento per intero — un confine NETTO ogni 45°. Su
+/// un'immagine con tonalità che varia con continuità (fogliame, cielo) questo
+/// produceva bordi artificiali visibili ovunque la tonalità attraversasse un
+/// confine, anche fra pixel visivamente quasi identici da una parte e
+/// dall'altra — il "posterizzato a blocchi" segnalato dall'utente, tanto più
+/// evidente quante più le 8 bande hanno valori diversi fra loro (es. dopo
+/// "Incolla impostazioni" su una foto con una gamma di verdi ampia). Qui ogni
+/// banda ha il suo pieno effetto solo al CENTRO del proprio intervallo di
+/// 45°; ai bordi fra due bande l'effetto sfuma linearmente 50/50, e la somma
+/// dei pesi resta sempre 1 — nessun salto, nessuna banda "invisibile" nella
+/// transizione.
+fn interpolate_hsl_band(values: &[i32; 8], hue: f32) -> f32 {
+    let band_width = 360.0 / HUE_BANDS as f32; // 45°
+    // Coordinata "spostata" di mezza banda: il CENTRO della banda i cade
+    // esattamente sull'intero i in questo sistema di coordinate, così
+    // `floor` trova sempre il centro-banda immediatamente precedente.
+    let shifted = hue.rem_euclid(360.0) / band_width - 0.5;
+    let low = shifted.floor();
+    let frac = shifted - low;
+    let low_idx = (low.rem_euclid(HUE_BANDS as f32)) as usize % HUE_BANDS;
+    let high_idx = (low_idx + 1) % HUE_BANDS;
+    let low_v = values[low_idx] as f32;
+    let high_v = values[high_idx] as f32;
+    low_v + (high_v - low_v) * frac
+}
+
 /// Peso (0..1) di quanto un pixel di luminanza `luma` (0..1, spazio sRGB)
 /// appartiene alla zona "ombre": pieno sotto 0.0, zero da 0.4 in su.
 fn shadow_mask(luma: f32) -> f32 {
@@ -95,6 +126,122 @@ fn highlight_mask(luma: f32) -> f32 {
     ((luma - 0.6) * 2.5).clamp(0.0, 1.0)
 }
 
+/// Frazione (0.0..1.0) di pixel "vicini al nero puro" (luma <= 2) e "vicini al
+/// bianco puro" (luma >= 253) in `image` — pensato per essere chiamato
+/// sull'immagine GIÀ RENDERIZZATA (non sull'originale), così la UI può
+/// segnalare in tempo reale quando il valore ATTUALE di uno slider sta
+/// bruciando le luci o schiacciando le ombre ("slider sicuri"). Deliberatamente
+/// non calcola questo per l'intero range di uno slider (richiederebbe
+/// ri-renderizzare l'immagine una volta per ogni valore possibile, troppo
+/// costoso per un feedback dal vivo) — solo per il valore corrente.
+pub fn clipping_fractions(image: &DynamicImage) -> (f32, f32) {
+    let rgba = image.to_rgba8();
+    let mut shadow_clipped = 0u64;
+    let mut highlight_clipped = 0u64;
+    let mut total = 0u64;
+    for pixel in rgba.pixels() {
+        let luma = 0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        if luma <= 2.0 {
+            shadow_clipped += 1;
+        }
+        if luma >= 253.0 {
+            highlight_clipped += 1;
+        }
+        total += 1;
+    }
+    if total == 0 {
+        return (0.0, 0.0);
+    }
+    (shadow_clipped as f32 / total as f32, highlight_clipped as f32 / total as f32)
+}
+
+/// Guadagno per canale (R, G, B) in spazio lineare per un dato bilanciamento
+/// del bianco — vedi la nota nel commento di modulo su questa approssimazione
+/// deliberata. Estratto in funzione a parte perché il bilanciamento del
+/// bianco a gradiente ne calcola DUE (zona A e zona B) invece di uno solo.
+fn compute_wb_gain(wb: &core_types::WhiteBalance) -> [f32; 3] {
+    const WB_STRENGTH: f32 = 0.35;
+    let temp_shift = ((wb.temp as f32 - 5500.0) / 5000.0).clamp(-1.0, 1.0);
+    let tint_shift = (wb.tint as f32 / 100.0).clamp(-1.0, 1.0);
+    [
+        1.0 + temp_shift * WB_STRENGTH,
+        1.0 - tint_shift * (WB_STRENGTH * 0.6),
+        1.0 - temp_shift * WB_STRENGTH,
+    ]
+}
+
+/// Fattore di miscela (0.0 = zona A pura, 1.0 = zona B pura) per il pixel in
+/// posizione `(x, y)` di un'immagine `width` x `height`, secondo l'asse
+/// (`wb_gradient_vertical`), la posizione del centro della transizione
+/// (`wb_gradient_position`, 0..100) e la sua ampiezza (`wb_gradient_spread`,
+/// 0..100: 0 = bordo netto, 100 = sfumatura sull'intero fotogramma) del Look.
+fn gradient_blend_factor(x: u32, y: u32, width: u32, height: u32, look: &HarmonicLook) -> f32 {
+    let axis_len = if look.wb_gradient_vertical { height } else { width };
+    let coord = if look.wb_gradient_vertical { y } else { x };
+    if axis_len <= 1 {
+        return 0.0;
+    }
+    let normalized = coord as f32 / (axis_len - 1) as f32;
+    let position = (look.wb_gradient_position as f32 / 100.0).clamp(0.0, 1.0);
+    let spread = ((look.wb_gradient_spread as f32 / 100.0).clamp(0.0, 1.0)).max(0.01);
+    let t = (normalized - position) / spread + 0.5;
+    t.clamp(0.0, 1.0)
+}
+
+/// Applica i tre controlli di "texture" (fine/media/grossa, -100..100) via
+/// separazione di frequenza gaussiana: sfoca `base` a tre raggi crescenti,
+/// ricava le bande di dettaglio per differenza tra sfocature successive
+/// (quella più sfocata di tutte è il "residuo" a bassa frequenza — colore e
+/// tono di base, mai toccato), poi ricompone scalando ogni banda di
+/// `1 + amount/100`. Con tutti gli amount a 0 la ricostruzione è esatta
+/// (residuo + somma delle differenze = l'immagine originale), quindi
+/// un'immagine a tinta unita (senza dettaglio da nessuna banda) resta
+/// invariata qualunque sia l'amount — solo il DETTAGLIO locale cambia
+/// ampiezza, non la luminosità media, a differenza di "Chiarezza"/contrasto.
+fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::RgbaImage {
+    if look.texture_fine == 0 && look.texture_medium == 0 && look.texture_coarse == 0 {
+        return base.clone();
+    }
+    const SIGMA_FINE: f32 = 1.2;
+    const SIGMA_MEDIUM: f32 = 4.0;
+    const SIGMA_COARSE: f32 = 10.0;
+
+    let blur_fine = image::imageops::blur(base, SIGMA_FINE);
+    let blur_medium = image::imageops::blur(base, SIGMA_MEDIUM);
+    let blur_coarse = image::imageops::blur(base, SIGMA_COARSE);
+
+    let fine_mul = 1.0 + look.texture_fine as f32 / 100.0;
+    let medium_mul = 1.0 + look.texture_medium as f32 / 100.0;
+    let coarse_mul = 1.0 + look.texture_coarse as f32 / 100.0;
+
+    let (width, _height) = base.dimensions();
+    let row_stride = 4 * width as usize;
+    let mut out = base.clone();
+    out.par_chunks_mut(row_stride)
+        .zip(base.par_chunks(row_stride))
+        .zip(blur_fine.par_chunks(row_stride))
+        .zip(blur_medium.par_chunks(row_stride))
+        .zip(blur_coarse.par_chunks(row_stride))
+        .for_each(|((((out_row, base_row), bf_row), bm_row), bc_row)| {
+            for i in 0..width as usize {
+                let px = i * 4;
+                for c in 0..3 {
+                    let base_v = base_row[px + c] as f32;
+                    let bf = bf_row[px + c] as f32;
+                    let bm = bm_row[px + c] as f32;
+                    let bc = bc_row[px + c] as f32;
+                    let f_detail = base_v - bf;
+                    let m_detail = bf - bm;
+                    let c_detail = bm - bc;
+                    let reconstructed = bc + f_detail * fine_mul + m_detail * medium_mul + c_detail * coarse_mul;
+                    out_row[px + c] = reconstructed.round().clamp(0.0, 255.0) as u8;
+                }
+                out_row[px + 3] = base_row[px + 3];
+            }
+        });
+    out
+}
+
 /// Applica un `HarmonicLook` ai pixel di `image`, restituendo una nuova
 /// immagine della stessa dimensione. Ordine degli stage (docs/ARCHITECTURE.md
 /// §3.2, sezione "Detail"/NR esclusa): bilanciamento del bianco + esposizione
@@ -102,7 +249,7 @@ fn highlight_mask(luma: f32) -> f32 {
 /// toning -> vibrance/saturazione globale.
 pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> DynamicImage {
     let rgba = image.to_rgba8();
-    let (width, _height) = rgba.dimensions();
+    let (width, height) = rgba.dimensions();
     let row_stride = 4 * width as usize;
 
     let exposure_mul = 2f32.powf(look.exposure_ev);
@@ -118,16 +265,12 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     // trasferire lo STILE caldo/freddo di un look (non una resa colorimetrica
     // assoluta): `temp` (convenzione Lightroom, valori più alti = più caldo)
     // e `tint` (positivo = magenta) diventano guadagni simmetrici su R/B e G.
-    // `WB_STRENGTH` tiene l'effetto visibile ma non estremo anche ai bordi
-    // dell'intervallo (temp 2000..12000).
-    const WB_STRENGTH: f32 = 0.35;
-    let temp_shift = ((look.white_balance.temp as f32 - 5500.0) / 5000.0).clamp(-1.0, 1.0);
-    let tint_shift = (look.white_balance.tint as f32 / 100.0).clamp(-1.0, 1.0);
-    let wb_gain = [
-        1.0 + temp_shift * WB_STRENGTH,
-        1.0 - tint_shift * (WB_STRENGTH * 0.6),
-        1.0 - temp_shift * WB_STRENGTH,
-    ];
+    // Se `wb_gradient_enabled` è attivo, il guadagno effettivo di ogni pixel
+    // sfuma tra la zona A (`wb_gain_a`) e la zona B (`wb_gain_b`) secondo
+    // `gradient_blend_factor` — altrimenti resta sempre la zona A, identico
+    // al comportamento pre-esistente a guadagno singolo.
+    let wb_gain_a = compute_wb_gain(&look.white_balance);
+    let wb_gain_b = compute_wb_gain(&look.white_balance_b);
     // Guardrail: anche se `saturation`/`vibrance` in teoria arrivano da
     // `HarmonicLook` già limitati a +-100, mai spingere il moltiplicatore di
     // saturazione globale a un estremo che desaturi (quasi) completamente o
@@ -140,11 +283,23 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     let mut out = rgba.clone();
     out.par_chunks_mut(row_stride)
         .zip(rgba.par_chunks(row_stride))
-        .for_each(|(out_row, in_row)| {
-            for (out_px, in_px) in out_row.chunks_exact_mut(4).zip(in_row.chunks_exact(4)) {
+        .enumerate()
+        .for_each(|(y, (out_row, in_row))| {
+            for (x, (out_px, in_px)) in out_row.chunks_exact_mut(4).zip(in_row.chunks_exact(4)).enumerate() {
                 // Bilanciamento del bianco + esposizione: guadagni scalari (uno
                 // per canale per il WB, uno unico per l'esposizione) in spazio
-                // lineare.
+                // lineare. Il guadagno WB dipende dalla posizione del pixel
+                // solo quando il gradiente è attivo (vedi `gradient_blend_factor`).
+                let wb_gain = if look.wb_gradient_enabled {
+                    let t = gradient_blend_factor(x as u32, y as u32, width, height, look);
+                    [
+                        wb_gain_a[0] + (wb_gain_b[0] - wb_gain_a[0]) * t,
+                        wb_gain_a[1] + (wb_gain_b[1] - wb_gain_a[1]) * t,
+                        wb_gain_a[2] + (wb_gain_b[2] - wb_gain_a[2]) * t,
+                    ]
+                } else {
+                    wb_gain_a
+                };
                 let mut linear = [
                     srgb_to_linear(in_px[0] as f32 / 255.0),
                     srgb_to_linear(in_px[1] as f32 / 255.0),
@@ -183,11 +338,15 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                 }
 
                 // HSL per banda + split toning + saturazione/vibrance globale.
+                // Interpolazione circolare fra bande adiacenti (vedi
+                // `interpolate_hsl_band`): niente più confine netto ogni 45°.
                 let mut hsl = rgb_to_hsl(srgb);
-                let band = (((hsl[0] / 45.0) as usize) % HUE_BANDS).min(HUE_BANDS - 1);
-                hsl[0] = (hsl[0] + look.hsl.hue[band] as f32).rem_euclid(360.0);
-                hsl[1] = (hsl[1] * (1.0 + look.hsl.sat[band] as f32 / 100.0) * global_sat_mul).clamp(0.0, 1.0);
-                hsl[2] = (hsl[2] + look.hsl.lum[band] as f32 / 200.0).clamp(0.0, 1.0);
+                let hue_adjust = interpolate_hsl_band(&look.hsl.hue, hsl[0]);
+                let sat_adjust = interpolate_hsl_band(&look.hsl.sat, hsl[0]);
+                let lum_adjust = interpolate_hsl_band(&look.hsl.lum, hsl[0]);
+                hsl[0] = (hsl[0] + hue_adjust).rem_euclid(360.0);
+                hsl[1] = (hsl[1] * (1.0 + sat_adjust / 100.0) * global_sat_mul).clamp(0.0, 1.0);
+                hsl[2] = (hsl[2] + lum_adjust / 200.0).clamp(0.0, 1.0);
 
                 let shadow_weight = shadow_mask(hsl[2]);
                 let highlight_weight = highlight_mask(hsl[2]);
@@ -215,6 +374,11 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                 out_px[3] = in_px[3];
             }
         });
+
+    // Texture (separazione di frequenza) è un'operazione spaziale, non
+    // per-pixel: va applicata come passata separata sull'immagine già
+    // color-gradata dal loop qui sopra, non dentro di esso.
+    let out = apply_texture_bands(&out, look);
 
     DynamicImage::ImageRgba8(out)
 }
@@ -347,5 +511,195 @@ mod tests {
         let hist = luminance_histogram(&img);
         let total: u64 = hist.iter().map(|&c| c as u64).sum();
         assert_eq!(total, 70);
+    }
+
+    #[test]
+    fn clipping_fractions_detects_pure_black_and_white_images() {
+        let black = solid_image(4, 4, [0, 0, 0]);
+        let (shadow, highlight) = clipping_fractions(&black);
+        assert!((shadow - 1.0).abs() < 0.001, "shadow={shadow}");
+        assert!(highlight < 0.001, "highlight={highlight}");
+
+        let white = solid_image(4, 4, [255, 255, 255]);
+        let (shadow2, highlight2) = clipping_fractions(&white);
+        assert!(shadow2 < 0.001, "shadow2={shadow2}");
+        assert!((highlight2 - 1.0).abs() < 0.001, "highlight2={highlight2}");
+    }
+
+    #[test]
+    fn clipping_fractions_reports_zero_for_a_midtone_image() {
+        let mid = solid_image(4, 4, [128, 128, 128]);
+        let (shadow, highlight) = clipping_fractions(&mid);
+        assert_eq!(shadow, 0.0);
+        assert_eq!(highlight, 0.0);
+    }
+
+    /// Immagine di test per la texture: un solo pixel chiaro isolato in uno
+    /// sfondo scuro uniforme — la separazione di frequenza ha un dettaglio
+    /// concreto su cui agire solo se c'è un bordo, non su una tinta piatta.
+    fn single_bright_point(size: u32) -> DynamicImage {
+        let center = size / 2;
+        let img = ImageBuffer::from_fn(size, size, |x, y| {
+            if x == center && y == center {
+                Rgba([255, 255, 255, 255])
+            } else {
+                Rgba([50, 50, 50, 255])
+            }
+        });
+        DynamicImage::ImageRgba8(img)
+    }
+
+    #[test]
+    fn zero_texture_amounts_leave_a_solid_color_image_unchanged() {
+        // Su una tinta piatta ogni banda di dettaglio è zero ovunque, quindi la
+        // ricostruzione deve restare identica indipendentemente dagli amount:
+        // qui verifichiamo il caso di default (tutti a zero).
+        let img = solid_image(10, 10, [90, 140, 30]);
+        let look = HarmonicLook::default();
+        let rendered = render_preview_with_look(&img, &look);
+        let before = mean_luma(&img);
+        let after = mean_luma(&rendered);
+        assert!((before - after).abs() < 2.0, "before={before} after={after}");
+    }
+
+    #[test]
+    fn fully_negative_texture_smooths_an_isolated_bright_point_toward_its_surroundings() {
+        let img = single_bright_point(16);
+        let mut look = HarmonicLook::default();
+        look.texture_fine = -100;
+        look.texture_medium = -100;
+        look.texture_coarse = -100;
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+
+        let center = 8u32;
+        let after = rendered.get_pixel(center, center)[0];
+        let before = baseline.get_pixel(center, center)[0];
+        assert!(
+            after < before,
+            "texture negativa al massimo deve smussare il punto isolato verso lo sfondo: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn texture_pass_preserves_image_dimensions() {
+        let img = single_bright_point(20);
+        let mut look = HarmonicLook::default();
+        look.texture_fine = 60;
+        look.texture_coarse = -40;
+        let rendered = render_preview_with_look(&img, &look);
+        assert_eq!(rendered.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn gradient_white_balance_differs_between_left_and_right_zones_when_enabled() {
+        let img = solid_image(30, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.wb_gradient_enabled = true;
+        look.wb_gradient_vertical = false;
+        look.wb_gradient_position = 50;
+        look.wb_gradient_spread = 10;
+        look.white_balance.temp = 9000; // zona A (sinistra): molto calda
+        look.white_balance_b.temp = 2500; // zona B (destra): molto fredda
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let left = rendered.get_pixel(0, 0).0;
+        let right = rendered.get_pixel(29, 0).0;
+        assert!(left[0] > left[2], "zona sinistra deve restare calda: R={} B={}", left[0], left[2]);
+        assert!(right[2] > right[0], "zona destra deve essere fredda: R={} B={}", right[2], right[0]);
+    }
+
+    #[test]
+    fn hsl_band_interpolation_returns_exact_value_at_band_center() {
+        // Banda "Verde" (indice 3, ordine Red/Orange/Yellow/Green/Aqua/Blue/
+        // Purple/Magenta): il suo centro è a (3+0.5)*45 = 157.5°.
+        let values = [0, 0, 0, 100, 0, 0, 0, 0];
+        let at_center = interpolate_hsl_band(&values, 157.5);
+        assert!((at_center - 100.0).abs() < 0.01, "at_center={at_center}");
+    }
+
+    #[test]
+    fn hsl_band_interpolation_blends_evenly_exactly_at_a_boundary() {
+        // Confine fra banda "Giallo" (indice 2, valore 0) e "Verde" (indice
+        // 3, valore 100): a hue=135° (il confine esatto) l'atteso è la media.
+        let values = [0, 0, 0, 100, 0, 0, 0, 0];
+        let at_boundary = interpolate_hsl_band(&values, 135.0);
+        assert!((at_boundary - 50.0).abs() < 0.01, "at_boundary={at_boundary}");
+    }
+
+    #[test]
+    fn hsl_band_interpolation_wraps_around_360_degrees() {
+        // Confine fra banda "Magenta" (indice 7, valore 10) e "Rosso"
+        // (indice 0, valore 50), che cade a hue=0/360.
+        let values = [50, 0, 0, 0, 0, 0, 0, 10];
+        let at_wrap = interpolate_hsl_band(&values, 0.0);
+        assert!((at_wrap - 30.0).abs() < 0.01, "at_wrap={at_wrap}");
+    }
+
+    #[test]
+    fn hsl_band_interpolation_has_no_hard_jump_across_a_boundary() {
+        // Il bug corretto in questo giro: con la vecchia implementazione a
+        // bucket netto, due tonalità a un solo grado di distanza attorno al
+        // confine (134° e 136°) avrebbero prodotto una differenza di 100
+        // (l'intero salto di banda); con l'interpolazione devono restare
+        // vicine.
+        let values = [0, 0, 0, 100, 0, 0, 0, 0];
+        let just_below = interpolate_hsl_band(&values, 134.0);
+        let just_above = interpolate_hsl_band(&values, 136.0);
+        assert!(
+            (just_above - just_below).abs() < 10.0,
+            "salto troppo grande attorno al confine: below={just_below} above={just_above}"
+        );
+    }
+
+    #[test]
+    fn render_preview_hsl_saturation_has_no_hard_jump_across_a_hue_band_boundary() {
+        // Regressione end-to-end del bug segnalato dall'utente ("immagine
+        // posterizzata a blocchi"): due tinte unite a tonalità quasi identica
+        // (134° e 136°, appena ai due lati del confine banda Giallo/Verde),
+        // con un Look che alza MOLTO la saturazione della sola banda "Verde"
+        // (indice 3, +100) e lascia invariata quella "Giallo" (indice 2, 0).
+        // Con il vecchio bucket netto le due immagini sarebbero finite con
+        // saturazioni radicalmente diverse pur partendo da tonalità quasi
+        // identiche; con l'interpolazione la differenza deve restare piccola.
+        let mut look = HarmonicLook::default();
+        look.hsl.sat[3] = 100;
+
+        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let below_rgb = hsl_to_rgb([134.0, 0.5, 0.5]);
+        let above_rgb = hsl_to_rgb([136.0, 0.5, 0.5]);
+        let img_below = solid_image(4, 4, [to_u8(below_rgb[0]), to_u8(below_rgb[1]), to_u8(below_rgb[2])]);
+        let img_above = solid_image(4, 4, [to_u8(above_rgb[0]), to_u8(above_rgb[1]), to_u8(above_rgb[2])]);
+
+        let rendered_below = render_preview_with_look(&img_below, &look).to_rgba8();
+        let rendered_above = render_preview_with_look(&img_above, &look).to_rgba8();
+
+        let px_to_hsl = |px: image::Rgba<u8>| {
+            rgb_to_hsl([px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0])
+        };
+        let hsl_below = px_to_hsl(*rendered_below.get_pixel(0, 0));
+        let hsl_above = px_to_hsl(*rendered_above.get_pixel(0, 0));
+
+        assert!(
+            (hsl_above[1] - hsl_below[1]).abs() < 0.15,
+            "salto di saturazione troppo grande attorno al confine banda: below={} above={}",
+            hsl_below[1],
+            hsl_above[1]
+        );
+    }
+
+    #[test]
+    fn gradient_white_balance_is_ignored_when_disabled() {
+        // white_balance_b da solo, senza wb_gradient_enabled, non deve avere
+        // alcun effetto: comportamento identico al singolo WB pre-esistente.
+        let img = solid_image(4, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.white_balance_b.temp = 2500;
+        assert!(!look.wb_gradient_enabled);
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        assert_eq!(rendered.get_pixel(0, 0), baseline.get_pixel(0, 0));
     }
 }

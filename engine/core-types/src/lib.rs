@@ -42,6 +42,30 @@ pub struct HarmonicLook {
     pub tone_curve: Vec<(u8, u8)>,
     pub hsl: HslAdjustments,
     pub split_toning: SplitToning,
+    /// Texture per banda di frequenza (-100..100, 0 = nessun effetto):
+    /// separazione di frequenza gaussiana in tre bande (fine/media/grossa),
+    /// vedi `look-render` per l'implementazione. A differenza di "Chiarezza"
+    /// (non ancora esposta) questi controlli non toccano la luminosità media
+    /// dell'immagine, solo l'ampiezza del dettaglio locale a quella scala.
+    pub texture_fine: i32,
+    pub texture_medium: i32,
+    pub texture_coarse: i32,
+    /// Seconda zona di bilanciamento del bianco per il "bilanciamento del
+    /// bianco a gradiente": quando `wb_gradient_enabled` è vero, il motore
+    /// sfuma linearmente tra `white_balance` (zona A) e `white_balance_b`
+    /// (zona B) lungo l'asse scelto — utile per cieli freddi/terreno caldo
+    /// nello stesso scatto, un caso che un singolo WB globale non può
+    /// risolvere.
+    pub white_balance_b: WhiteBalance,
+    pub wb_gradient_enabled: bool,
+    /// true = il gradiente va dall'alto (zona A) al basso (zona B); false =
+    /// da sinistra (zona A) a destra (zona B).
+    pub wb_gradient_vertical: bool,
+    /// Posizione del centro della transizione lungo l'asse, 0..100 (percentuale).
+    pub wb_gradient_position: i32,
+    /// Ampiezza della transizione, 0..100: 0 = bordo netto, 100 = sfumatura
+    /// distribuita sull'intero fotogramma.
+    pub wb_gradient_spread: i32,
 }
 
 impl Default for HarmonicLook {
@@ -61,6 +85,14 @@ impl Default for HarmonicLook {
             tone_curve: vec![(0, 0), (64, 64), (128, 128), (192, 192), (255, 255)],
             hsl: HslAdjustments::default(),
             split_toning: SplitToning::default(),
+            texture_fine: 0,
+            texture_medium: 0,
+            texture_coarse: 0,
+            white_balance_b: WhiteBalance { temp: 5500, tint: 0 },
+            wb_gradient_enabled: false,
+            wb_gradient_vertical: true,
+            wb_gradient_position: 50,
+            wb_gradient_spread: 50,
         }
     }
 }

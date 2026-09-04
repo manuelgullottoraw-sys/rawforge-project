@@ -39,6 +39,15 @@ private fun EditableLook.toFfi(): HarmonicLookFfi = HarmonicLookFfi(
     highlightHue = highlightHue,
     highlightSat = highlightSat,
     splitToningBalance = splitToningBalance,
+    textureFine = textureFine,
+    textureMedium = textureMedium,
+    textureCoarse = textureCoarse,
+    whiteBalanceBTemp = whiteBalanceBTemp.toUInt(),
+    whiteBalanceBTint = whiteBalanceBTint,
+    wbGradientEnabled = wbGradientEnabled,
+    wbGradientVertical = wbGradientVertical,
+    wbGradientPosition = wbGradientPosition,
+    wbGradientSpread = wbGradientSpread,
 )
 
 private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
@@ -62,6 +71,15 @@ private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
     highlightHue = highlightHue,
     highlightSat = highlightSat,
     splitToningBalance = splitToningBalance,
+    textureFine = textureFine,
+    textureMedium = textureMedium,
+    textureCoarse = textureCoarse,
+    whiteBalanceBTemp = whiteBalanceBTemp.toInt(),
+    whiteBalanceBTint = whiteBalanceBTint,
+    wbGradientEnabled = wbGradientEnabled,
+    wbGradientVertical = wbGradientVertical,
+    wbGradientPosition = wbGradientPosition,
+    wbGradientSpread = wbGradientSpread,
 )
 
 actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
@@ -78,8 +96,13 @@ actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
         )
     }
 
-    actual fun renderPreview(look: EditableLook): Result<ByteArray> = runCatching {
-        inner.renderPreview(look.toFfi())
+    actual fun renderPreview(look: EditableLook): Result<RenderedPreview> = runCatching {
+        val result = inner.renderPreview(look.toFfi())
+        RenderedPreview(
+            imageBytes = result.previewPngBytes,
+            shadowClipFraction = result.shadowClipFraction,
+            highlightClipFraction = result.highlightClipFraction,
+        )
     }
 
     actual fun renderFullResolution(look: EditableLook): Result<ByteArray> = runCatching {
@@ -120,6 +143,15 @@ actual object Engine {
             highlightHue = 45,
             highlightSat = 10,
             splitToningBalance = 0,
+            textureFine = 0,
+            textureMedium = 0,
+            textureCoarse = 0,
+            whiteBalanceBTemp = 5600u,
+            whiteBalanceBTint = 0,
+            wbGradientEnabled = false,
+            wbGradientVertical = true,
+            wbGradientPosition = 50,
+            wbGradientSpread = 50,
         )
         return generateLightroomPresetXmp(look)
     }

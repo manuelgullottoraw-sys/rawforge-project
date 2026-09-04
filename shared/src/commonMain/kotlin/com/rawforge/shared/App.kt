@@ -52,8 +52,17 @@ private data class ImportState(
  * correnti (originale, incollato da Smart-Batch, o ri-renderizzato dopo una
  * modifica manuale — sempre la copia RIDOTTA per l'editing interattivo, non
  * quella a piena risoluzione, per restare veloce) e il relativo bitmap già
- * decodificato. */
-private data class PreviewState(val bytes: ByteArray, val bitmap: ImageBitmap?)
+ * decodificato. `shadowClipFraction`/`highlightClipFraction` (0f..1f, `null`
+ * finché non è ancora arrivato un rendering dal motore — es. subito dopo
+ * l'importazione) sono il segnale per "slider sicuri": la frazione di pixel
+ * ai limiti dinamici dell'ULTIMO rendering, non dell'intero range possibile
+ * di uno slider (vedi `RenderedPreview`). */
+private data class PreviewState(
+    val bytes: ByteArray,
+    val bitmap: ImageBitmap?,
+    val shadowClipFraction: Float? = null,
+    val highlightClipFraction: Float? = null,
+)
 
 // Palette scura in stile "camera oscura" da software di editing fotografico
 // professionale (pannelli grigio molto scuro, testo quasi bianco, un solo
@@ -148,6 +157,17 @@ private fun EditableLook.scaledBy(intensity: Float): EditableLook {
         shadowSat = scaleInt(shadowSat, 0..100),
         highlightSat = scaleInt(highlightSat, 0..100),
         splitToningBalance = scaleInt(splitToningBalance, -100..100),
+        textureFine = scaleInt(textureFine, -100..100),
+        textureMedium = scaleInt(textureMedium, -100..100),
+        textureCoarse = scaleInt(textureCoarse, -100..100),
+        // Zona B del WB a gradiente: stessa logica della zona A. `wbGradientEnabled`/
+        // `wbGradientVertical`/`wbGradientPosition`/`wbGradientSpread` restano
+        // INVARIATI (non passati a `copy`, quindi mantenuti automaticamente) —
+        // sono parametri di GEOMETRIA del gradiente (dove/quanto è ampia la
+        // transizione), non un'intensità di correzione: scalarli verso un
+        // "neutro" non avrebbe un significato analogo a scalare un colore.
+        whiteBalanceBTemp = lerp(5500f, whiteBalanceBTemp.toFloat(), intensity).roundToInt().coerceIn(2000, 12000),
+        whiteBalanceBTint = scaleInt(whiteBalanceBTint, -100..100),
     )
 }
 
@@ -248,7 +268,15 @@ fun RawForgeApp() {
         snapshotFlow { currentLook.scaledBy(editIntensity) }.collectLatest { look ->
             val result = withContext(Dispatchers.Default) { activeSession.renderPreview(look) }
             result.fold(
-                onSuccess = { bytes -> preview = PreviewState(bytes, decodeImageBitmapOrNull(bytes)); renderError = null },
+                onSuccess = { rendered ->
+                    preview = PreviewState(
+                        rendered.imageBytes,
+                        decodeImageBitmapOrNull(rendered.imageBytes),
+                        rendered.shadowClipFraction,
+                        rendered.highlightClipFraction,
+                    )
+                    renderError = null
+                },
                 onFailure = { error -> renderError = error.message ?: "Errore sconosciuto durante il rendering" }
             )
         }
@@ -357,6 +385,8 @@ fun RawForgeApp() {
                         exportMessage = exportMessage,
                         exportError = exportError,
                         renderError = renderError,
+                        shadowClipFraction = preview?.shadowClipFraction,
+                        highlightClipFraction = preview?.highlightClipFraction,
                     )
                 } else {
                 Row(modifier = Modifier.fillMaxSize()) {
@@ -523,6 +553,8 @@ fun RawForgeApp() {
                             onReset = { currentLook = EditableLook(); editIntensity = 1f },
                             editIntensity = editIntensity,
                             onEditIntensityChange = { editIntensity = it },
+                            shadowClipFraction = preview?.shadowClipFraction,
+                            highlightClipFraction = preview?.highlightClipFraction,
                         )
                     }
                 }
@@ -554,6 +586,8 @@ private fun FullScreenDevelopView(
     exportMessage: String?,
     exportError: String?,
     renderError: String?,
+    shadowClipFraction: Float?,
+    highlightClipFraction: Float?,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -614,6 +648,8 @@ private fun FullScreenDevelopView(
                 onReset = onReset,
                 editIntensity = editIntensity,
                 onEditIntensityChange = onEditIntensityChange,
+                shadowClipFraction = shadowClipFraction,
+                highlightClipFraction = highlightClipFraction,
             )
         }
     }
@@ -718,6 +754,13 @@ private fun PhotoPanel(
     }
 }
 
+/** Soglia (frazione di pixel, 0f..1f) oltre la quale "slider sicuri" segnala
+ * clipping su uno slider — scelta arbitraria ma dichiarata: il 2% dei pixel
+ * dell'anteprima è già percepibile come luci bruciate/ombre schiacciate
+ * evidenti, non un singolo pixel isolato che non vale la pena segnalare. */
+private const val CLIP_WARNING_THRESHOLD = 0.02f
+private val ClipWarningColor = Color(0xFFFFB300)
+
 @Composable
 private fun DevelopPanel(
     modifier: Modifier,
@@ -726,7 +769,15 @@ private fun DevelopPanel(
     onReset: () -> Unit,
     editIntensity: Float,
     onEditIntensityChange: (Float) -> Unit,
+    shadowClipFraction: Float? = null,
+    highlightClipFraction: Float? = null,
 ) {
+    // "Slider sicuri" (idea approvata, vedi README.md): solo un avviso sul
+    // valore CORRENTE — quanto di QUESTO rendering sta bruciando le luci o
+    // schiacciando le ombre — non una previsione per l'intero range dello
+    // slider (richiederebbe ri-renderizzare per ogni posizione possibile).
+    val highlightsClipping = (highlightClipFraction ?: 0f) > CLIP_WARNING_THRESHOLD
+    val shadowsClipping = (shadowClipFraction ?: 0f) > CLIP_WARNING_THRESHOLD
     // Angoli arrotondati solo sul lato sinistro: il pannello sta comunque
     // incollato al bordo destro della finestra, arrotondarlo tutto intorno
     // avrebbe un aspetto strano contro il bordo dello schermo.
@@ -767,12 +818,27 @@ private fun DevelopPanel(
         Spacer(Modifier.height(12.dp))
 
         DevelopSection("Base") {
-            FloatSlider("Esposizione (EV)", look.exposureEv, -5f..5f, { onEdit { l -> l.copy(exposureEv = it) } }) { "%.2f".format(it) }
+            FloatSlider(
+                "Esposizione (EV)", look.exposureEv, -5f..5f,
+                warning = highlightsClipping || shadowsClipping,
+                onChange = { onEdit { l -> l.copy(exposureEv = it) } },
+            ) { "%.2f".format(it) }
             IntSlider("Contrasto", look.contrast, -100..100) { onEdit { l -> l.copy(contrast = it) } }
-            IntSlider("Alte luci", look.highlights, -100..100) { onEdit { l -> l.copy(highlights = it) } }
-            IntSlider("Ombre", look.shadows, -100..100) { onEdit { l -> l.copy(shadows = it) } }
-            IntSlider("Bianchi", look.whites, -100..100) { onEdit { l -> l.copy(whites = it) } }
-            IntSlider("Neri", look.blacks, -100..100) { onEdit { l -> l.copy(blacks = it) } }
+            IntSlider("Alte luci", look.highlights, -100..100, warning = highlightsClipping) { onEdit { l -> l.copy(highlights = it) } }
+            IntSlider("Ombre", look.shadows, -100..100, warning = shadowsClipping) { onEdit { l -> l.copy(shadows = it) } }
+            IntSlider("Bianchi", look.whites, -100..100, warning = highlightsClipping) { onEdit { l -> l.copy(whites = it) } }
+            IntSlider("Neri", look.blacks, -100..100, warning = shadowsClipping) { onEdit { l -> l.copy(blacks = it) } }
+            if (highlightsClipping || shadowsClipping) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    listOfNotNull(
+                        "luci bruciate".takeIf { highlightsClipping },
+                        "ombre schiacciate".takeIf { shadowsClipping },
+                    ).joinToString(prefix = "Attenzione: ", separator = " e "),
+                    style = MaterialTheme.typography.caption,
+                    color = ClipWarningColor,
+                )
+            }
         }
 
         DevelopSection("Colore") {
@@ -782,12 +848,62 @@ private fun DevelopPanel(
             IntSlider("Saturazione", look.saturation, -100..100) { onEdit { l -> l.copy(saturation = it) } }
         }
 
+        DevelopSection("Bilanciamento del bianco a gradiente") {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Switch(
+                    checked = look.wbGradientEnabled,
+                    onCheckedChange = { onEdit { l -> l.copy(wbGradientEnabled = it) } },
+                    colors = SwitchDefaults.colors(checkedThumbColor = AccentBlue, checkedTrackColor = AccentBlue),
+                )
+                Text(
+                    if (look.wbGradientEnabled) "Attivo — due zone di WB sfumate" else "Disattivo (un solo WB, sopra)",
+                    style = MaterialTheme.typography.caption,
+                    color = TextPrimary,
+                )
+            }
+            if (look.wbGradientEnabled) {
+                Spacer(Modifier.height(8.dp))
+                Text("Asse della transizione", style = MaterialTheme.typography.caption, color = TextMuted)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    listOf(true to "Verticale (alto → basso)", false to "Orizzontale (sinistra → destra)").forEach { (vertical, label) ->
+                        val selected = look.wbGradientVertical == vertical
+                        TextButton(
+                            onClick = { onEdit { l -> l.copy(wbGradientVertical = vertical) } },
+                            shape = PillShape,
+                            colors = ButtonDefaults.textButtonColors(
+                                backgroundColor = if (selected) PanelSurfaceRaised else Color.Transparent,
+                            ),
+                        ) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.caption,
+                                color = if (selected) AccentBlue else TextMuted,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            )
+                        }
+                    }
+                }
+                IntSlider("Posizione transizione", look.wbGradientPosition, 0..100) { onEdit { l -> l.copy(wbGradientPosition = it) } }
+                IntSlider("Ampiezza transizione", look.wbGradientSpread, 0..100) { onEdit { l -> l.copy(wbGradientSpread = it) } }
+                Spacer(Modifier.height(4.dp))
+                Text("Zona B (l'altra estremità del gradiente)", style = MaterialTheme.typography.caption, color = TextMuted, fontWeight = FontWeight.Bold)
+                IntSlider("Temperatura zona B (K)", look.whiteBalanceBTemp, 2000..12000) { onEdit { l -> l.copy(whiteBalanceBTemp = it) } }
+                IntSlider("Tinta zona B", look.whiteBalanceBTint, -100..100) { onEdit { l -> l.copy(whiteBalanceBTint = it) } }
+            }
+        }
+
         DevelopSection("Curva tonale") {
             ToneCurveEditor(look.toneCurve) { updated -> onEdit { l -> l.copy(toneCurve = updated) } }
         }
 
         DevelopSection("HSL per banda colore") {
             HslPanel(look, onEdit)
+        }
+
+        DevelopSection("Dettaglio (Texture)") {
+            IntSlider("Fine", look.textureFine, -100..100) { onEdit { l -> l.copy(textureFine = it) } }
+            IntSlider("Media", look.textureMedium, -100..100) { onEdit { l -> l.copy(textureMedium = it) } }
+            IntSlider("Grossa", look.textureCoarse, -100..100) { onEdit { l -> l.copy(textureCoarse = it) } }
         }
 
         DevelopSection("Viraggio (Split Toning)") {
@@ -949,13 +1065,18 @@ private fun DevelopSection(title: String, content: @Composable ColumnScope.() ->
 
 /** Slider intero: aggiorna lo stato ad ogni tick di trascinamento
  * (`onValueChange`), non solo al rilascio — il rendering dal vivo che ne
- * consegue è gestito centralmente dal `LaunchedEffect` in `RawForgeApp`. */
+ * consegue è gestito centralmente dal `LaunchedEffect` in `RawForgeApp`.
+ * `warning = true` ("slider sicuri") colora il badge del valore e lo slider
+ * stesso in ambra: segnala che il valore ATTUALE di QUESTO slider corrisponde
+ * a un rendering con luci bruciate/ombre schiacciate oltre soglia — non una
+ * previsione sull'intero range possibile dello slider. */
 @Composable
 private fun IntSlider(
     label: String,
     value: Int,
     range: IntRange,
     swatchColor: Color? = null,
+    warning: Boolean = false,
     onChange: (Int) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -967,7 +1088,7 @@ private fun IntSlider(
             Text(
                 value.toString(),
                 style = MaterialTheme.typography.caption,
-                color = TextMuted,
+                color = if (warning) ClipWarningColor else TextMuted,
                 modifier = Modifier
                     .clip(RoundedCornerShape(6.dp))
                     .background(PanelSurfaceRaised)
@@ -978,6 +1099,11 @@ private fun IntSlider(
             value = value.toFloat(),
             onValueChange = { onChange(it.roundToInt()) },
             valueRange = range.first.toFloat()..range.last.toFloat(),
+            colors = if (warning) {
+                SliderDefaults.colors(thumbColor = ClipWarningColor, activeTrackColor = ClipWarningColor)
+            } else {
+                SliderDefaults.colors()
+            },
             modifier = Modifier.fillMaxWidth(),
         )
     }
@@ -988,18 +1114,24 @@ private fun FloatSlider(
     label: String,
     value: Float,
     range: ClosedFloatingPointRange<Float>,
+    warning: Boolean = false,
     onChange: (Float) -> Unit,
     format: (Float) -> String,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, style = MaterialTheme.typography.caption, color = TextPrimary)
-            Text(format(value), style = MaterialTheme.typography.caption, color = TextMuted)
+            Text(format(value), style = MaterialTheme.typography.caption, color = if (warning) ClipWarningColor else TextMuted)
         }
         Slider(
             value = value,
             onValueChange = onChange,
             valueRange = range,
+            colors = if (warning) {
+                SliderDefaults.colors(thumbColor = ClipWarningColor, activeTrackColor = ClipWarningColor)
+            } else {
+                SliderDefaults.colors()
+            },
             modifier = Modifier.fillMaxWidth(),
         )
     }

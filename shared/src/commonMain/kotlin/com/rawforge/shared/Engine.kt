@@ -92,9 +92,11 @@ expect class PhotoEditSession {
      * veloce apposta (niente ri-decodifica, niente pixel a piena
      * risoluzione): è il passo richiamato ad ogni singola modifica di uno
      * slider del pannello "Develop", pensato per un feedback dal vivo mentre
-     * si trascina, non solo al rilascio.
+     * si trascina, non solo al rilascio. Il risultato include anche le
+     * frazioni di clipping ombre/luci di QUESTA anteprima (vedi
+     * `RenderedPreview`), per il feedback "slider sicuri".
      */
-    fun renderPreview(look: EditableLook): Result<ByteArray>
+    fun renderPreview(look: EditableLook): Result<RenderedPreview>
 
     /**
      * Renderizza `look` sulla foto a piena risoluzione (l'anteprima
@@ -130,6 +132,23 @@ data class ImportedPhoto(
 data class AdaptedPreview(
     val renderedImageBytes: ByteArray,
     val appliedLook: EditableLook,
+)
+
+/**
+ * Esito di un rendering interattivo (`PhotoEditSession.renderPreview`):
+ * l'anteprima renderizzata più due frazioni (0f..1f) di pixel ai limiti
+ * dinamici di QUESTA anteprima — "slider sicuri" (una delle idee discusse e
+ * approvate, vedi `README.md`): `highlightClipFraction` alta segnala luci
+ * bruciate (rilevante per Esposizione/Alte luci/Bianchi),
+ * `shadowClipFraction` alta segnala ombre schiacciate (Ombre/Neri). Calcolato
+ * solo sul valore CORRENTE dello slider, non sull'intero range possibile —
+ * ricalcolare per ogni valore richiederebbe ri-renderizzare l'immagine una
+ * volta per posizione, troppo costoso per un feedback dal vivo.
+ */
+data class RenderedPreview(
+    val imageBytes: ByteArray,
+    val shadowClipFraction: Float,
+    val highlightClipFraction: Float,
 )
 
 /**
@@ -179,4 +198,15 @@ data class EditableLook(
     val highlightHue: Int = 45,
     val highlightSat: Int = 0,
     val splitToningBalance: Int = 0,
+    /** Texture per banda di frequenza (-100..100, 0 = nessun effetto). */
+    val textureFine: Int = 0,
+    val textureMedium: Int = 0,
+    val textureCoarse: Int = 0,
+    /** Zona B e parametri del bilanciamento del bianco a gradiente. */
+    val whiteBalanceBTemp: Int = 5500,
+    val whiteBalanceBTint: Int = 0,
+    val wbGradientEnabled: Boolean = false,
+    val wbGradientVertical: Boolean = true,
+    val wbGradientPosition: Int = 50,
+    val wbGradientSpread: Int = 50,
 )

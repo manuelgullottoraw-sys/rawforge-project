@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (56 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 9, `look_render` 10, `metadata` 3, `raw_decode` 4, `ffi` 14, `smartbatch`
+Crate reali, compilati e testati (69 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 9, `look_render` 22, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -18,7 +18,7 @@ Crate reali, compilati e testati (56 test, tutti verdi — `color_science` 6, `c
 | `xmp` | Generatore di preset Lightroom `.xmp` dal `HarmonicLook` | §5 |
 | `gpu-pipe` | Sorgenti WGSL degli stage di color grading, validati con `naga` (nessuna GPU richiesta per i test) | §3.2, §6.2 |
 | `raw-decode` | Decodifica RAW vera (`rawler`, Rust puro): anteprima incorporata dalla fotocamera + metadati base | §2, §9 |
-| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning) — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
+| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
 | `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` (vedi sotto) — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
 
 **Novità di questo giro**: lo Smart-Batch Contestuale (`smartbatch`) era già scritto e testato ma
@@ -201,6 +201,57 @@ Insieme, bilanciamento del bianco e HSL per banda sono le due leve principali ri
 migliorare la fedeltà della copia di stile dalla foto di riferimento: prima di questo giro
 venivano estratte/applicate solo esposizione, contrasto, tone curve, highlights/shadows e split
 toning.
+
+## Nuovo (questo giro): texture a bande di frequenza, clipping per "slider sicuri", WB a gradiente
+
+Tre aggiunte a `core_types::HarmonicLook` (e al suo specchio `HarmonicLookFfi` in `ffi`, con
+entrambi i `From` aggiornati e testati dal round-trip in `harmonic_look_ffi_round_trip_preserves_all_fields`),
+tutte e tre nuovi campi di `look-render`:
+
+- **`texture_fine`/`texture_medium`/`texture_coarse`** (-100..100 ciascuno). Separazione di
+  frequenza gaussiana vera: `apply_texture_bands` sfoca l'immagine già color-gradata a tre raggi
+  crescenti (`image::imageops::blur`, sigma 1.2/4/10), ricava le bande di dettaglio per differenza
+  tra sfocature successive (la più sfocata di tutte è il "residuo" a bassa frequenza, mai toccato:
+  colore e tono di base), poi ricompone scalando ogni banda di `1 + amount/100`. Con amount a 0 la
+  ricostruzione è esatta (residuo + somma delle differenze = l'originale), quindi un'immagine a
+  tinta piatta resta invariata qualunque sia l'amount — verificato da
+  `zero_texture_amounts_leave_a_solid_color_image_unchanged` e, più a fondo, da
+  `fully_negative_texture_smooths_an_isolated_bright_point_toward_its_surroundings` (un singolo
+  pixel chiaro isolato, texture -100 su tutte e tre le bande, il pixel centrale deve avvicinarsi
+  allo sfondo). È un passo SEPARATO dal loop per-pixel principale di
+  `render_preview_with_look` (un'operazione spaziale — serve leggere pixel vicini — non può vivere
+  in un ciclo che processa un pixel alla volta), eseguito solo se almeno un amount è diverso da 0.
+- **`clipping_fractions(image) -> (f32, f32)`** (shadow, highlight): frazione di pixel con luma
+  ≤ 2 e ≥ 253 nell'immagine GIÀ RENDERIZZATA — non un'analisi dell'originale. `ffi::render_preview`
+  la calcola subito dopo il rendering e la restituisce in un nuovo record, `RenderedPreviewFfi
+  { preview_png_bytes, shadow_clip_fraction, highlight_clip_fraction }`, sostituendo il precedente
+  `Vec<u8>` semplice come tipo di ritorno (tutti i call site Rust aggiornati, inclusi i test
+  esistenti che ora leggono `.preview_png_bytes`). Deliberatamente calcolato solo per il rendering
+  CORRENTE, non per l'intero range di uno slider — vedi il README di primo livello per il
+  ragionamento sul costo. `render_full_resolution` resta `Vec<u8>` semplice: l'esportazione finale
+  non ha bisogno del feedback dal vivo. Test: `clipping_fractions_detects_pure_black_and_white_images`,
+  `clipping_fractions_reports_zero_for_a_midtone_image`,
+  `render_preview_reports_high_shadow_clip_fraction_for_a_crushed_black_image` (quest'ultimo in
+  `ffi`, end-to-end attraverso `PhotoEditSession`).
+- **Bilanciamento del bianco a gradiente**: `white_balance_b: WhiteBalance` (seconda zona) più
+  `wb_gradient_enabled`, `wb_gradient_vertical`, `wb_gradient_position` (0..100),
+  `wb_gradient_spread` (0..100). Il loop per-pixel principale ora traccia la posizione `(x, y)` di
+  ogni pixel (prima assente: bastava scorrere righe/pixel senza sapere dove fossero — aggiunto un
+  `.enumerate()` sulle righe e uno sui pixel di ogni riga) e, quando il gradiente è attivo,
+  interpola il guadagno WB fra `compute_wb_gain(&white_balance)` (zona A) e
+  `compute_wb_gain(&white_balance_b)` (zona B) tramite `gradient_blend_factor`: una transizione
+  lineare lungo l'asse scelto, centrata su `wb_gradient_position` (percentuale lungo l'asse) e
+  larga `wb_gradient_spread` (0 = bordo netto, 100 = sfumatura sull'intero fotogramma). Con
+  `wb_gradient_enabled = false` (il default) il comportamento è identico a prima — un solo
+  guadagno globale — verificato da `gradient_white_balance_is_ignored_when_disabled`. Test:
+  `gradient_white_balance_differs_between_left_and_right_zones_when_enabled`.
+
+**Scelte di design dichiarate** (le stesse discusse con l'utente prima di implementare): il
+bilanciamento del bianco a gradiente usa due zone lungo un asse, non punti liberi piazzabili a
+piacere sulla foto — una UI di posizionamento 2D e un'interpolazione multi-punto sarebbero un
+lavoro sostanzialmente più grande per lo stesso caso d'uso reale (cielo freddo in alto, terreno
+caldo in basso); "slider sicuri" mostra solo il clipping del valore ATTUALE, non un'anteprima
+dipinta sull'intero binario dello slider.
 
 ## Comandi
 

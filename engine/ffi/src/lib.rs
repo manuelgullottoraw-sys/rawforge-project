@@ -56,6 +56,19 @@ pub struct HarmonicLookFfi {
     pub highlight_hue: i32,
     pub highlight_sat: i32,
     pub split_toning_balance: i32,
+    /// Texture per banda di frequenza (-100..100) — vedi
+    /// `core_types::HarmonicLook` per la spiegazione completa.
+    pub texture_fine: i32,
+    pub texture_medium: i32,
+    pub texture_coarse: i32,
+    /// Bilanciamento del bianco a gradiente — zona B più i quattro parametri
+    /// del gradiente stesso, vedi `core_types::HarmonicLook`.
+    pub white_balance_b_temp: u32,
+    pub white_balance_b_tint: i32,
+    pub wb_gradient_enabled: bool,
+    pub wb_gradient_vertical: bool,
+    pub wb_gradient_position: i32,
+    pub wb_gradient_spread: i32,
 }
 
 /// Adatta un `Vec<i32>` di lunghezza arbitraria a un array fisso di 8 elementi
@@ -96,6 +109,15 @@ impl From<core_types::HarmonicLook> for HarmonicLookFfi {
             highlight_hue: look.split_toning.highlight_hue,
             highlight_sat: look.split_toning.highlight_sat,
             split_toning_balance: look.split_toning.balance,
+            texture_fine: look.texture_fine,
+            texture_medium: look.texture_medium,
+            texture_coarse: look.texture_coarse,
+            white_balance_b_temp: look.white_balance_b.temp,
+            white_balance_b_tint: look.white_balance_b.tint,
+            wb_gradient_enabled: look.wb_gradient_enabled,
+            wb_gradient_vertical: look.wb_gradient_vertical,
+            wb_gradient_position: look.wb_gradient_position,
+            wb_gradient_spread: look.wb_gradient_spread,
         }
     }
 }
@@ -130,6 +152,17 @@ impl From<HarmonicLookFfi> for core_types::HarmonicLook {
                 highlight_sat: look.highlight_sat,
                 balance: look.split_toning_balance,
             },
+            texture_fine: look.texture_fine,
+            texture_medium: look.texture_medium,
+            texture_coarse: look.texture_coarse,
+            white_balance_b: core_types::WhiteBalance {
+                temp: look.white_balance_b_temp,
+                tint: look.white_balance_b_tint,
+            },
+            wb_gradient_enabled: look.wb_gradient_enabled,
+            wb_gradient_vertical: look.wb_gradient_vertical,
+            wb_gradient_position: look.wb_gradient_position,
+            wb_gradient_spread: look.wb_gradient_spread,
         }
     }
 }
@@ -296,6 +329,20 @@ fn downscale_for_interactive_preview(image: &image::DynamicImage) -> image::Dyna
     }
 }
 
+/// Esito del rendering interattivo: l'anteprima PNG più due frazioni (0.0..1.0)
+/// di pixel ai limiti dinamici — "slider sicuri", pensata perché la UI possa
+/// colorare lo slider corrente (esposizione/alte luci/bianchi per
+/// `highlight_clip_fraction`, ombre/neri per `shadow_clip_fraction`) quando il
+/// valore ATTUALE sta bruciando le luci o schiacciando le ombre. Calcolato
+/// solo sul rendering appena prodotto, non su ogni possibile valore dello
+/// slider (vedi `look_render::clipping_fractions`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct RenderedPreviewFfi {
+    pub preview_png_bytes: Vec<u8>,
+    pub shadow_clip_fraction: f32,
+    pub highlight_clip_fraction: f32,
+}
+
 /// Una foto "da modificare" aperta per l'editing, con la sua decodifica già
 /// fatta e cacheiata in memoria (RAW-aware, via [`decode_any_photo`]) —
 /// un oggetto UniFFI vero e proprio (non solo funzioni), perché a differenza
@@ -337,10 +384,16 @@ impl PhotoEditSession {
     /// cacheiata all'apertura, non ri-decodifica nulla. È il metodo chiamato
     /// ad ogni singolo tick di trascinamento di uno slider del pannello
     /// "Develop" — deve restare economico.
-    pub fn render_preview(&self, look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError> {
+    pub fn render_preview(&self, look: HarmonicLookFfi) -> Result<RenderedPreviewFfi, EngineError> {
         let core_look: core_types::HarmonicLook = look.into();
         let rendered = look_render::render_preview_with_look(&self.interactive_preview, &core_look);
-        encode_preview_as_png(&rendered)
+        let (shadow_clip_fraction, highlight_clip_fraction) = look_render::clipping_fractions(&rendered);
+        let preview_png_bytes = encode_preview_as_png(&rendered)?;
+        Ok(RenderedPreviewFfi {
+            preview_png_bytes,
+            shadow_clip_fraction,
+            highlight_clip_fraction,
+        })
     }
 
     /// Rendering a piena risoluzione (dell'anteprima incorporata originale,
@@ -489,6 +542,14 @@ mod tests {
         original.hsl.lum[3] = 2;
         original.split_toning.balance = 15;
         original.white_balance.tint = -8;
+        original.texture_fine = 40;
+        original.texture_medium = -25;
+        original.texture_coarse = 10;
+        original.white_balance_b = core_types::WhiteBalance { temp: 3200, tint: 12 };
+        original.wb_gradient_enabled = true;
+        original.wb_gradient_vertical = false;
+        original.wb_gradient_position = 65;
+        original.wb_gradient_spread = 20;
 
         let ffi: HarmonicLookFfi = original.clone().into();
         let round_tripped: core_types::HarmonicLook = ffi.into();
@@ -504,6 +565,15 @@ mod tests {
         assert_eq!(round_tripped.split_toning.balance, original.split_toning.balance);
         assert_eq!(round_tripped.white_balance.tint, original.white_balance.tint);
         assert_eq!(round_tripped.tone_curve, original.tone_curve);
+        assert_eq!(round_tripped.texture_fine, original.texture_fine);
+        assert_eq!(round_tripped.texture_medium, original.texture_medium);
+        assert_eq!(round_tripped.texture_coarse, original.texture_coarse);
+        assert_eq!(round_tripped.white_balance_b.temp, original.white_balance_b.temp);
+        assert_eq!(round_tripped.white_balance_b.tint, original.white_balance_b.tint);
+        assert_eq!(round_tripped.wb_gradient_enabled, original.wb_gradient_enabled);
+        assert_eq!(round_tripped.wb_gradient_vertical, original.wb_gradient_vertical);
+        assert_eq!(round_tripped.wb_gradient_position, original.wb_gradient_position);
+        assert_eq!(round_tripped.wb_gradient_spread, original.wb_gradient_spread);
     }
 
     fn png_bytes_of_solid_color(size: u32, rgb: [u8; 3]) -> Vec<u8> {
@@ -596,11 +666,11 @@ mod tests {
         let mut look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
         look.exposure_ev = 1.0;
 
-        let rendered_bytes = session.render_preview(look).unwrap();
-        assert!(!rendered_bytes.is_empty());
+        let rendered = session.render_preview(look).unwrap();
+        assert!(!rendered.preview_png_bytes.is_empty());
 
         let before = image::load_from_memory(&target_bytes).unwrap().to_rgba8();
-        let after = image::load_from_memory(&rendered_bytes).unwrap().to_rgba8();
+        let after = image::load_from_memory(&rendered.preview_png_bytes).unwrap().to_rgba8();
         assert!(
             after.pixels().next().unwrap()[0] > before.pixels().next().unwrap()[0],
             "un'esposizione positiva manuale deve schiarire il pixel"
@@ -622,11 +692,33 @@ mod tests {
         assert_eq!(full_dims, (big_size, big_size), "il rendering a piena risoluzione deve preservare le dimensioni originali");
 
         let preview = session.render_preview(look).unwrap();
-        let preview_dims = image::load_from_memory(&preview).unwrap().dimensions();
+        let preview_dims = image::load_from_memory(&preview.preview_png_bytes).unwrap().dimensions();
         assert!(
             preview_dims.0 <= INTERACTIVE_PREVIEW_MAX_DIM && preview_dims.1 <= INTERACTIVE_PREVIEW_MAX_DIM,
             "l'anteprima interattiva deve restare entro il limite di downscale, got {:?}",
             preview_dims
+        );
+    }
+
+    #[test]
+    fn render_preview_reports_high_shadow_clip_fraction_for_a_crushed_black_image() {
+        // "Slider sicuri": un'immagine quasi tutta nera, renderizzata con il
+        // Look di default, deve riportare una shadow_clip_fraction alta e una
+        // highlight_clip_fraction quasi nulla.
+        let target_bytes = png_bytes_of_solid_color(6, [1, 1, 1]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+
+        let result = session.render_preview(look).unwrap();
+        assert!(
+            result.shadow_clip_fraction > 0.9,
+            "atteso shadow_clip_fraction alto, got {}",
+            result.shadow_clip_fraction
+        );
+        assert!(
+            result.highlight_clip_fraction < 0.1,
+            "atteso highlight_clip_fraction basso, got {}",
+            result.highlight_clip_fraction
         );
     }
 }
