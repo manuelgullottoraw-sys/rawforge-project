@@ -9,6 +9,61 @@ import uniffi.rawforge_ffi.extractLookFromReferenceImage
 import uniffi.rawforge_ffi.generateLightroomPresetXmp
 import uniffi.rawforge_ffi.isKnownRawFileName
 import uniffi.rawforge_ffi.pasteLookOntoTargetPhoto
+import uniffi.rawforge_ffi.renderLookOnPhoto
+
+/**
+ * Converte da/verso `HarmonicLookFfi` (generato da UniFFI, esiste solo qui
+ * dentro `desktopMain`) e `EditableLook` (comune, solo tipi primitivi — vedi
+ * la nota su `EditableLook` in `Engine.kt`). Nessuna delle due funzioni
+ * attraversa mai il confine `expect`/`actual` con un tipo UniFFI: `toFfi()` è
+ * chiamata solo qui, subito prima di una chiamata al motore; `toEditable()`
+ * solo qui, subito dopo.
+ */
+private fun EditableLook.toFfi(): HarmonicLookFfi = HarmonicLookFfi(
+    name = name,
+    whiteBalanceTemp = whiteBalanceTemp.toUInt(),
+    whiteBalanceTint = whiteBalanceTint,
+    exposureEv = exposureEv,
+    contrast = contrast,
+    highlights = highlights,
+    shadows = shadows,
+    whites = whites,
+    blacks = blacks,
+    vibrance = vibrance,
+    saturation = saturation,
+    toneCurve = toneCurve.map { TonePointFfi(it.x.toUByte(), it.y.toUByte()) },
+    hslHue = hslHue,
+    hslSat = hslSat,
+    hslLum = hslLum,
+    shadowHue = shadowHue,
+    shadowSat = shadowSat,
+    highlightHue = highlightHue,
+    highlightSat = highlightSat,
+    splitToningBalance = splitToningBalance,
+)
+
+private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
+    name = name,
+    whiteBalanceTemp = whiteBalanceTemp.toInt(),
+    whiteBalanceTint = whiteBalanceTint,
+    exposureEv = exposureEv,
+    contrast = contrast,
+    highlights = highlights,
+    shadows = shadows,
+    whites = whites,
+    blacks = blacks,
+    vibrance = vibrance,
+    saturation = saturation,
+    toneCurve = toneCurve.map { TonePoint(it.x.toInt(), it.y.toInt()) },
+    hslHue = hslHue,
+    hslSat = hslSat,
+    hslLum = hslLum,
+    shadowHue = shadowHue,
+    shadowSat = shadowSat,
+    highlightHue = highlightHue,
+    highlightSat = highlightSat,
+    splitToningBalance = splitToningBalance,
+)
 
 actual object Engine {
     actual fun versionInfo(): String = engineVersion()
@@ -96,9 +151,12 @@ actual object Engine {
         )
         AdaptedPreview(
             renderedImageBytes = result.renderedPreviewPngBytes,
-            appliedExposureEv = result.appliedExposureEv,
-            appliedHighlights = result.appliedHighlights,
-            appliedShadows = result.appliedShadows,
+            appliedLook = result.appliedLook.toEditable(),
         )
     }
+
+    actual fun renderLookOnTarget(targetBytes: ByteArray, targetFileName: String, look: EditableLook): Result<ByteArray> =
+        runCatching {
+            renderLookOnPhoto(targetBytes, targetFileName, look.toFfi())
+        }
 }

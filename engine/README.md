@@ -4,7 +4,7 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (48 test, tutti verdi):
+Crate reali, compilati e testati (50 test, tutti verdi):
 
 | Crate | Cosa fa | Rif. architettura |
 |---|---|---|
@@ -112,6 +112,29 @@ Non ancora presente:
 - `gpu-pipe` collegato alla UI per il rendering a piena risoluzione in tempo reale.
 - `cache`, `catalog`, `job-scheduler` — non bloccanti per il flusso attuale (una foto campione +
   una foto target per volta, non un batch di centinaia di foto insieme).
+
+## Nuovo: pannello di editing manuale ("Develop") lato motore
+
+Per il pannello di editing manuale della UI (sliders su esposizione, contrasto,
+highlights/shadows/whites/blacks, bilanciamento del bianco, vibrance/saturazione, split toning),
+serviva un modo di renderizzare un `HarmonicLook` qualunque su una foto SENZA rifare
+l'estrazione dalla foto campione né l'adattamento Smart-Batch — è il passo veloce richiamato a
+ogni movimento di uno slider. Aggiunta `render_look_on_photo(target_bytes, target_file_name,
+look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError>`: decodifica il target (RAW-aware, come le
+altre funzioni) e chiama direttamente `look_render::render_preview_with_look`. A differenza di
+`paste_look_onto_target_photo`, qui `HarmonicLookFfi` è accettato come parametro perché questa
+funzione viene chiamata SOLO dal codice Kotlin platform-specific (`Engine.android.kt` /
+`Engine.desktop.kt`), mai da `commonMain` direttamente — la UI comune tiene lo stato dello slider
+come `EditableLook` (nuovo tipo comune, solo primitive, in `Engine.kt`), e le implementazioni
+Android/Desktop lo convertono in `HarmonicLookFfi` solo internamente prima di questa chiamata.
+
+Esteso anche `AdaptedRenderFfi` (il risultato di "incolla impostazioni"): portava solo
+`applied_exposure_ev`/`applied_highlights`/`applied_shadows`, ora porta `applied_look:
+HarmonicLookFfi` per intero — serve come punto di partenza del pannello di editing manuale (dopo
+aver incollato le impostazioni, l'utente deve poter continuare a correggerle a mano da lì, non
+solo vedere i tre valori che Smart-Batch ha deciso di toccare). Due nuovi test:
+`render_look_on_photo_applies_manual_exposure_without_reextraction`,
+`render_look_on_photo_reports_error_on_bad_target_bytes`.
 
 ## Comandi
 

@@ -264,15 +264,15 @@ fn decode_any_photo(bytes: &[u8], file_name: &str) -> Result<image::DynamicImage
 }
 
 /// Esito di "incolla impostazioni": l'anteprima della foto target già
-/// renderizzata con il Look adattato, più i valori di esposizione/highlights/
-/// shadows effettivamente applicati (dopo l'adattamento intelligente) — utili
-/// alla UI per mostrare "cosa ha deciso" lo Smart-Batch, non solo il risultato.
+/// renderizzata con il Look adattato, più il Look completo così come è stato
+/// applicato (dopo l'adattamento intelligente) — non solo esposizione/
+/// highlights/shadows: la UI lo usa anche come punto di partenza per il
+/// pannello di editing manuale (§ "Develop"), che deve poter correggere
+/// qualunque campo, non solo i tre toccati da Smart-Batch.
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct AdaptedRenderFfi {
     pub rendered_preview_png_bytes: Vec<u8>,
-    pub applied_exposure_ev: f32,
-    pub applied_highlights: i32,
-    pub applied_shadows: i32,
+    pub applied_look: HarmonicLookFfi,
 }
 
 /// Incolla sulla foto da modificare (`target`) le impostazioni copiate dalla
@@ -345,10 +345,31 @@ pub fn paste_look_onto_target_photo(
 
     Ok(AdaptedRenderFfi {
         rendered_preview_png_bytes,
-        applied_exposure_ev: adapted_look.exposure_ev,
-        applied_highlights: adapted_look.highlights,
-        applied_shadows: adapted_look.shadows,
+        applied_look: adapted_look.into(),
     })
+}
+
+/// Renderizza `look` (qualunque sia la sua origine — estratto dalla Sintesi
+/// Armonica, adattato da Smart-Batch, o modificato a mano dall'utente nel
+/// pannello di editing manuale) sulla foto `target`, senza rifare estrazione
+/// né adattamento: è il passo veloce richiamato a ogni modifica di uno slider
+/// del pannello "Develop" della UI, che tiene già il Look corrente lato
+/// Kotlin (come `EditableLook`, solo tipi primitivi in `commonMain`) e qui
+/// deve solo vederne l'effetto sui pixel. Stesso identico stadio di rendering
+/// di `paste_look_onto_target_photo` (`look_render::render_preview_with_look`),
+/// isolato in una funzione a sé per evitare di ripetere ogni volta la
+/// (ri)estrazione del Look dalla foto campione, che non serve più una volta
+/// che l'utente sta correggendo a mano i valori.
+#[uniffi::export]
+pub fn render_look_on_photo(
+    target_bytes: Vec<u8>,
+    target_file_name: String,
+    look: HarmonicLookFfi,
+) -> Result<Vec<u8>, EngineError> {
+    let target_image = decode_any_photo(&target_bytes, &target_file_name)?;
+    let core_look: core_types::HarmonicLook = look.into();
+    let rendered = look_render::render_preview_with_look(&target_image, &core_look);
+    encode_preview_as_png(&rendered)
 }
 
 #[cfg(test)]
@@ -481,14 +502,14 @@ mod tests {
         // Il target è molto più scuro del campione: ci aspettiamo un recupero
         // di esposizione positivo, entro i guardrail testati in `smartbatch`.
         assert!(
-            result.applied_exposure_ev > 0.0,
+            result.applied_look.exposure_ev > 0.0,
             "atteso recupero positivo, got {}",
-            result.applied_exposure_ev
+            result.applied_look.exposure_ev
         );
         assert!(
-            result.applied_exposure_ev <= 0.5 + f32::EPSILON,
+            result.applied_look.exposure_ev <= 0.5 + f32::EPSILON,
             "esposizione applicata fuori dal guardrail Smart-Batch (max 0.5 EV): {}",
-            result.applied_exposure_ev
+            result.applied_look.exposure_ev
         );
     }
 
@@ -521,10 +542,37 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.applied_exposure_ev.abs() <= 0.5 + f32::EPSILON,
+            result.applied_look.exposure_ev.abs() <= 0.5 + f32::EPSILON,
             "esposizione applicata fuori dal guardrail Smart-Batch (max 0.5 EV): {}",
-            result.applied_exposure_ev
+            result.applied_look.exposure_ev
         );
+    }
+
+    #[test]
+    fn render_look_on_photo_applies_manual_exposure_without_reextraction() {
+        // Il pannello di editing manuale non ripassa mai dalla foto campione:
+        // prende il Look corrente (qui costruito a mano, come farebbe uno
+        // slider) e lo renderizza direttamente sul target.
+        let target_bytes = png_bytes_of_solid_color(6, [100, 100, 100]);
+        let mut look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+        look.exposure_ev = 1.0;
+
+        let rendered_bytes = render_look_on_photo(target_bytes.clone(), "target.png".to_string(), look).unwrap();
+        assert!(!rendered_bytes.is_empty());
+
+        let before = image::load_from_memory(&target_bytes).unwrap().to_rgba8();
+        let after = image::load_from_memory(&rendered_bytes).unwrap().to_rgba8();
+        assert!(
+            after.pixels().next().unwrap()[0] > before.pixels().next().unwrap()[0],
+            "un'esposizione positiva manuale deve schiarire il pixel"
+        );
+    }
+
+    #[test]
+    fn render_look_on_photo_reports_error_on_bad_target_bytes() {
+        let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+        let result = render_look_on_photo(vec![9, 9, 9], "x.png".to_string(), look);
+        assert!(result.is_err());
     }
 
     #[test]

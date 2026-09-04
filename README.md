@@ -25,7 +25,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   `metadata` (sidecar non distruttivo), `xmp` (export preset Lightroom), `gpu-pipe` (shader
   WGSL validati con `naga`), `raw-decode` (decodifica RAW vera), **`look-render`** (applica un
   Look ai pixel su CPU, per l'anteprima "incolla impostazioni", vedi sotto) e **`ffi`** (la
-  superficie UniFFI che collega tutto quanto sopra a Kotlin). 48 test, tutti verdi, eseguiti in
+  superficie UniFFI che collega tutto quanto sopra a Kotlin). 50 test, tutti verdi, eseguiti in
   locale prima di ogni consegna. Dettagli in [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
   1. `rust-tests` — compila e testa l'intero workspace Rust.
@@ -81,6 +81,45 @@ silenziosamente azzerati ad ogni giro Kotlin→Rust→Kotlin, **compreso l'expor
 (bug pre-esistente, non introdotto ora — solo scoperto e corretto costruendo questa funzionalità).
 Ora `HarmonicLookFfi` porta tutti i campi; un test dedicato (`harmonic_look_ffi_round_trip_preserves_all_fields`)
 verifica che il giro di andata e ritorno non perda più nulla.
+
+## Nuova UI: tema scuro, foto affiancate, editing manuale, esportazione
+
+Su richiesta esplicita, la UI (identica su Android e Windows, `shared/src/commonMain/kotlin/com/rawforge/shared/App.kt`)
+è stata riscritta quasi per intero, in stile "modulo Develop" di un software di editing
+fotografico professionale:
+
+- **Tema scuro**: pannelli grigio molto scuro, testo quasi bianco, un solo accento blu per i
+  controlli — non più il Material chiaro di default.
+- **Foto campione e foto target affiancate** in una riga (non più impilate una sopra l'altra):
+  si vedono entrambe senza dover scorrere, e si ridimensionano insieme alla finestra.
+- **Pannello "Develop" a destra**, con slider veri per esposizione, contrasto, luci/ombre,
+  bianchi/neri, bilanciamento del bianco, vibrance/saturazione e viraggio (split toning) — legati
+  in tempo reale al motore Rust: ogni volta che si rilascia uno slider, la foto target viene
+  ri-renderizzata subito con i nuovi valori (nuova funzione `render_look_on_photo` nel motore, che
+  non rifà l'estrazione dalla foto campione né l'adattamento — solo il rendering, per restare
+  veloce). Dopo "Incolla impostazioni", il pannello parte già dai valori decisi da Smart-Batch, e
+  l'utente può correggerli a mano da lì.
+- **Pulsante "Esporta foto…"**: salva l'anteprima corrente (originale, incollata, o corretta a
+  mano) su un file scelto dall'utente — finestra di salvataggio nativa su Windows, selettore di
+  destinazione di sistema su Android (nessun permesso runtime richiesto).
+
+**Cosa NON c'è ancora in questo giro** (dichiarato, non nascosto): editor grafico della tone curve
+(trascinare i punti a mano) e slider HSL per singola banda colore — il motore li supporta già
+(`HarmonicLook`/`HarmonicLookFfi` li portano per intero da tempo), manca solo l'interfaccia; le
+maschere locali (pennello/gradiente/radiale) copiabili nei preset, la libreria/catalogo delle foto
+già modificate, e il batch reale su tante foto insieme — tutti pianificati per gli incrementi
+successivi, come discusso.
+
+**Onestà sulla verifica**: questo è, per distacco, il cambiamento Kotlin più esteso consegnato in
+un colpo solo finora — quasi tutto `App.kt`, più due file nuovi (`FileSaverLauncher.kt` e le sue
+implementazioni Android/Desktop) e le modifiche a `Engine.kt`/`Engine.android.kt`/`Engine.desktop.kt`
+per il nuovo tipo `EditableLook`. L'ho riletto con attenzione più volte cercando proprio gli errori
+tipici di Compose che non si vedono senza compilare (un bug concreto l'ho trovato e corretto così:
+stavo usando il componente `Divider` per un separatore verticale, ma quel componente forza al suo
+interno `.fillMaxWidth().height(...)`, quindi avrebbe ignorato la larghezza fissa richiesta — ora
+uso una `Box` semplice). Ma resta tutto da compilare per la prima volta su CI, come sempre in
+questo ambiente: se GitHub Actions segnala un errore Kotlin/Gradle, mandami il log e lo sistemiamo,
+esattamente come fatto finora.
 
 ## Corretto: esposizione/tonalità troppo aggressive su "incolla impostazioni"
 
