@@ -22,6 +22,9 @@ kotlin {
                 // Il motore Rust è caricato via JNA dai binding generati da UniFFI
                 // (docs/ARCHITECTURE.md, §1/§7). Variante @aar: build JNA compatibile Android.
                 implementation("net.java.dev.jna:jna:5.14.0@aar")
+                // Serve a rememberLauncherForActivityResult (selezione file reale
+                // per l'import di foto/RAW), usato in ImportPicker.android.kt.
+                implementation("androidx.activity:activity-compose:1.9.0")
             }
         }
         val desktopMain by getting {

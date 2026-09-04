@@ -8,8 +8,13 @@ members = [
     "smartbatch",
     "metadata",
     "gpu-pipe",
+    "raw-decode",
     "ffi",
 ]
 
+# raw-decode usa `rawler` (puro Rust) invece di LibRaw (C++): vedi il
+# commento di testa in raw-decode/src/lib.rs per il perché di questa scelta
+# rispetto a quanto originariamente descritto in docs/ARCHITECTURE.md §1.1.
+#
 # Prossimi crate (Fase 1 della roadmap, vedi docs/ARCHITECTURE.md):
-# "raw-decode" (LibRaw FFI), "cache", "catalog", "job-scheduler"
+# "cache", "catalog", "job-scheduler"

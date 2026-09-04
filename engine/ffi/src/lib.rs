@@ -70,6 +70,12 @@ pub enum EngineError {
     // message"). Soluzione: rinominare il campo, qui "reason".
     #[error("impossibile decodificare l'immagine di riferimento: {reason}")]
     DecodeError { reason: String },
+
+    /// Errore nella decodifica di un file RAW vero (crate `raw-decode`, che
+    /// avvolge `rawler`) — formato non riconosciuto, file corrotto, o nessuna
+    /// anteprima incorporata disponibile.
+    #[error("impossibile leggere il file RAW: {reason}")]
+    RawFileError { reason: String },
 }
 
 /// Stringa di stato del motore — usata dalla UI (pulsante "Stato motore") per
@@ -101,6 +107,68 @@ pub fn extract_look_from_reference_image(
 pub fn generate_lightroom_preset_xmp(look: HarmonicLookFfi) -> String {
     let full_look: core_types::HarmonicLook = look.into();
     xmp::generate_lightroom_xmp(&full_look)
+}
+
+/// Esito della decodifica "veloce" (nessun demosaic) di un file RAW vero: i
+/// metadati base della fotocamera più l'anteprima incorporata, già ri-codificata
+/// come PNG in modo che la UI Kotlin possa decodificarla con qualunque
+/// libreria immagine standard, senza legare la UI al tipo `DynamicImage` di Rust.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct RawPreviewFfi {
+    pub camera_make: String,
+    pub camera_model: String,
+    pub preview_png_bytes: Vec<u8>,
+}
+
+fn encode_preview_as_png(image: &image::DynamicImage) -> Result<Vec<u8>, EngineError> {
+    let mut png_bytes = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .map_err(|e| EngineError::RawFileError {
+            reason: e.to_string(),
+        })?;
+    Ok(png_bytes)
+}
+
+/// Decodifica un file RAW vero (bytes in memoria — niente path di filesystem,
+/// per funzionare sia da file picker Desktop sia da content:// URI Android) ed
+/// estrae l'anteprima incorporata dalla fotocamera più i metadati base.
+/// Vedi `raw-decode/src/lib.rs` per cosa fa e cosa NON fa ancora (demosaic
+/// completo escluso, primo incremento deliberatamente limitato all'anteprima).
+#[uniffi::export]
+pub fn decode_raw_file_preview(raw_bytes: Vec<u8>) -> Result<RawPreviewFfi, EngineError> {
+    let preview = raw_decode::decode_raw_preview(&raw_bytes).map_err(|e| EngineError::RawFileError {
+        reason: e.to_string(),
+    })?;
+    let preview_png_bytes = encode_preview_as_png(&preview.image)?;
+    Ok(RawPreviewFfi {
+        camera_make: preview.info.camera_make,
+        camera_model: preview.info.camera_model,
+        preview_png_bytes,
+    })
+}
+
+/// Come `extract_look_from_reference_image`, ma partendo direttamente da un
+/// file RAW vero invece che da un JPEG/PNG già sviluppato: usa l'anteprima
+/// incorporata (via `raw-decode`) come immagine di riferimento per la Sintesi
+/// Armonica, senza un giro a vuoto di ri-codifica.
+#[uniffi::export]
+pub fn extract_look_from_raw_reference(
+    raw_bytes: Vec<u8>,
+    look_name: String,
+) -> Result<HarmonicLookFfi, EngineError> {
+    let preview = raw_decode::decode_raw_preview(&raw_bytes).map_err(|e| EngineError::RawFileError {
+        reason: e.to_string(),
+    })?;
+    let look = harmonic::extract_look_from_reference(&preview.image, &look_name);
+    Ok(look.into())
+}
+
+/// Filtro rapido "è un file RAW noto?" da un nome file, usato dalla UI per
+/// popolare la grid d'importazione senza tentare di decodificare ogni file.
+#[uniffi::export]
+pub fn is_known_raw_file_name(file_name: String) -> bool {
+    raw_decode::has_known_raw_extension(&file_name)
 }
 
 #[cfg(test)]
@@ -138,5 +206,35 @@ mod tests {
     fn invalid_bytes_yield_decode_error() {
         let result = extract_look_from_reference_image(vec![0, 1, 2, 3], "Bad".to_string());
         assert!(result.is_err());
+    }
+
+    // NB: nessun file RAW reale è disponibile in questo ambiente (nessuna
+    // fotocamera, nessun campione scaricabile qui) — questi test coprono solo
+    // i percorsi di errore su input non validi, non un vero round-trip di
+    // decodifica. La decodifica di un file RAW reale va verificata a mano una
+    // volta disponibile un file di esempio (es. caricandolo dalla UI).
+
+    #[test]
+    fn garbage_bytes_yield_raw_file_error_not_panic() {
+        let result = decode_raw_file_preview(vec![9, 9, 9, 9, 9, 9, 9, 9]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_raw_bytes_yield_raw_file_error() {
+        let result = decode_raw_file_preview(vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_look_from_raw_reference_reports_error_on_bad_input() {
+        let result = extract_look_from_raw_reference(vec![1, 2, 3], "Test".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn known_raw_file_names_are_recognized() {
+        assert!(is_known_raw_file_name("IMG_1234.CR3".to_string()));
+        assert!(!is_known_raw_file_name("foto.jpg".to_string()));
     }
 }

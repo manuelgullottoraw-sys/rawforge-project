@@ -20,4 +20,5 @@ harmonic = { path = "../harmonic" }
 smartbatch = { path = "../smartbatch" }
 metadata = { path = "../metadata" }
 xmp = { path = "../xmp" }
+raw-decode = { path = "../raw-decode" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

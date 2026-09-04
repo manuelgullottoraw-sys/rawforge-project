@@ -1,0 +1,15 @@
+[package]
+name = "raw-decode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# rawler: decodifica RAW pura Rust (no C/C++), vedi commento di licenza/scelta
+# architetturale in src/lib.rs. Disabilitiamo le feature non necessarie qui
+# (CLI, inspector web, rawdb online) per tenere leggero l'albero di build,
+# specialmente in vista della cross-compilazione Android via cargo-ndk.
+rawler = { version = "0.8", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+thiserror = "1"
+
+[dev-dependencies]
