@@ -1,0 +1,10 @@
+[package]
+name = "gpu-pipe"
+version = "0.1.0"
+edition = "2021"
+description = "Definizione degli stage della pipeline GPU (WGSL) di RawForge (docs/ARCHITECTURE.md, §3.2 e §6.2)"
+
+[dependencies]
+
+[dev-dependencies]
+naga = { version = "0.19", features = ["wgsl-in"] }

@@ -1,0 +1,8 @@
+[package]
+name = "smartbatch"
+version = "0.1.0"
+edition = "2021"
+description = "Smart-Batch Contestuale: analisi scena e adattamento dinamico dei parametri (docs/ARCHITECTURE.md, §4.2)"
+
+[dependencies]
+core-types = { path = "../core-types" }

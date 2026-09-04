@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "core-types",
+    "color-science",
+    "xmp",
+    "harmonic",
+    "smartbatch",
+    "metadata",
+    "gpu-pipe",
+    "ffi",
+]
+
+# Prossimi crate (Fase 1 della roadmap, vedi docs/ARCHITECTURE.md):
+# "raw-decode" (LibRaw FFI), "cache", "catalog", "job-scheduler"

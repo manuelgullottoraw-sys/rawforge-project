@@ -1,0 +1,7 @@
+[package]
+name = "color-science"
+version = "0.1.0"
+edition = "2021"
+description = "Conversioni di spazio colore (sRGB<->lineare, RGB<->Lab, RGB<->HSL) usate dal motore RawForge"
+
+[dependencies]

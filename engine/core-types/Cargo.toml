@@ -1,0 +1,8 @@
+[package]
+name = "core-types"
+version = "0.1.0"
+edition = "2021"
+description = "Strutture dati condivise dal motore RawForge (HarmonicLook e affini)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

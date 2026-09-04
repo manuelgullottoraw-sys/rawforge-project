@@ -1,0 +1,10 @@
+[package]
+name = "harmonic"
+version = "0.1.0"
+edition = "2021"
+description = "Sintesi Armonica Automatica: estrazione di tone curve, palette e contrasto da un'immagine di riferimento (docs/ARCHITECTURE.md, §4.1)"
+
+[dependencies]
+core-types = { path = "../core-types" }
+color-science = { path = "../color-science" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

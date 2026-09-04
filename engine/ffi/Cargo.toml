@@ -1,0 +1,23 @@
+[package]
+name = "rawforge-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Superficie UniFFI del motore RawForge esposta a Kotlin (Android + Windows Desktop)"
+
+[lib]
+name = "rawforge_ffi"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "1"
+core-types = { path = "../core-types" }
+harmonic = { path = "../harmonic" }
+smartbatch = { path = "../smartbatch" }
+metadata = { path = "../metadata" }
+xmp = { path = "../xmp" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

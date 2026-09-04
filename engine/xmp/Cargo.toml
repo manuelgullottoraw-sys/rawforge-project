@@ -1,0 +1,8 @@
+[package]
+name = "xmp"
+version = "0.1.0"
+edition = "2021"
+description = "Generatore di preset Lightroom (.xmp) a partire dai parametri della Sintesi Armonica di RawForge"
+
+[dependencies]
+core-types = { path = "../core-types" }

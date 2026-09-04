@@ -1,0 +1,238 @@
+name: Build RawForge
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  rust-tests:
+    name: Test Rust engine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --manifest-path engine/Cargo.toml
+
+  generate-bindings:
+    name: Generate Kotlin bindings (UniFFI)
+    needs: rust-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Build rawforge-ffi (host) per estrarre i metadati UniFFI
+        working-directory: engine
+        run: cargo build -p rawforge-ffi
+
+      - name: Genera i binding Kotlin
+        # uniffi-bindgen invoca "cargo metadata" internamente usando la cwd del
+        # processo (non rispetta --manifest-path passato al comando esterno),
+        # quindi va eseguito da dentro engine/ — verificato in locale.
+        working-directory: engine
+        run: |
+          cargo run --bin uniffi-bindgen -- \
+            generate --library target/debug/librawforge_ffi.so \
+            --language kotlin --out-dir ../kotlin-bindings
+
+      - name: Upload binding artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: kotlin-bindings
+
+  android:
+    name: Build Android APK
+    needs: generate-bindings
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Locate Android NDK
+        shell: bash
+        run: |
+          NDK_PATH="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            echo "NDK non trovato tramite variabili d'ambiente pre-esistenti, lo installo con sdkmanager..."
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SDKMANAGER" --install "ndk;26.1.10909125"
+            NDK_PATH="$ANDROID_HOME/ndk/26.1.10909125"
+          fi
+          echo "Uso NDK: $NDK_PATH"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+
+      - name: Cross-compila il motore Rust per Android (arm64, armv7, x86_64)
+        run: |
+          cd engine
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -o ../androidApp/src/main/jniLibs \
+            build --release --lib -p rawforge-ffi
+
+      - name: Download binding Kotlin generati
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: shared/src/androidMain/kotlin
+
+      - name: Build debug APK
+        run: gradle :androidApp:assembleDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: androidApp/build/outputs/apk/debug/*.apk
+
+  windows:
+    name: Build Windows EXE
+    needs: generate-bindings
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Install WiX Toolset (necessario per creare l'installer .exe)
+        run: choco install wixtoolset -y
+
+      - name: Add WiX to PATH
+        shell: pwsh
+        run: |
+          $wixPath = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $wixPath
+
+      - name: Compila il motore Rust nativo per Windows (rawforge_ffi.dll)
+        run: cargo build --release --lib -p rawforge-ffi --manifest-path engine/Cargo.toml
+
+      - name: Copia la dll dove JNA la trova a runtime
+        shell: pwsh
+        run: |
+          $dest = "desktopApp/src/main/resources/win32-x86-64"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "engine/target/release/rawforge_ffi.dll" -Destination "$dest/rawforge_ffi.dll"
+
+      - name: Download binding Kotlin generati
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: shared/src/desktopMain/kotlin
+
+      - name: Build Windows EXE installer
+        run: gradle :desktopApp:packageExe --stacktrace
+
+      - name: Collect EXE artifact
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "desktopApp/build/compose/binaries" -Recurse -Filter *.exe | Select-Object -First 1
+          Copy-Item $exe.FullName -Destination "RawForge-Setup.exe"
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: RawForge-Setup.exe
+
+  release:
+    name: Publish GitHub Release
+    needs: [ android, windows ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: dist
+
+      - name: Download EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: dist
+
+      - name: Rename files for clarity
+        shell: bash
+        run: |
+          mkdir -p release
+          find dist -iname '*.apk' -exec cp {} release/RawForge.apk \;
+          find dist -iname '*.exe' -exec cp {} release/RawForge-Setup.exe \;
+          ls -la release
+
+      - name: Publish/aggiorna la Release "latest-build"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: "RawForge — Ultima build"
+          body: |
+            Build generata automaticamente dal commit ${{ github.sha }}.
+            Scarica `RawForge.apk` per Android e `RawForge-Setup.exe` per Windows.
+          make_latest: true
+          files: |
+            release/RawForge.apk
+            release/RawForge-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
