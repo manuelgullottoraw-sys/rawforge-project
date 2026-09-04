@@ -17,6 +17,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.withContext
 
 /**
  * Stato di una foto importata dall'utente. Tiene sia i bytes ORIGINALI del
@@ -35,9 +38,11 @@ private data class ImportState(
     val bitmap: ImageBitmap?,
 )
 
-/** Cosa mostra/esporta in un dato momento il riquadro della foto target: i
- * bytes PNG correnti (originale, incollato da Smart-Batch, o ri-renderizzato
- * dopo una modifica manuale) e il relativo bitmap già decodificato. */
+/** Cosa mostra in un dato momento il riquadro della foto target: i bytes PNG
+ * correnti (originale, incollato da Smart-Batch, o ri-renderizzato dopo una
+ * modifica manuale — sempre la copia RIDOTTA per l'editing interattivo, non
+ * quella a piena risoluzione, per restare veloce) e il relativo bitmap già
+ * decodificato. */
 private data class PreviewState(val bytes: ByteArray, val bitmap: ImageBitmap?)
 
 // Palette scura in stile "camera oscura" da software di editing fotografico
@@ -69,10 +74,22 @@ private val RawForgeDarkColors = darkColors(
  * UI condivisa (identica su Android e Windows), in stile "Develop module" di
  * Lightroom: tema scuro, le due foto (campione/target) affiancate in modo che
  * si vedano entrambe senza dover scorrere, un pannello di editing manuale a
- * destra con gli slider legati in tempo reale al rendering del motore, e un
- * pulsante per esportare il risultato. La libreria a griglia, le maschere
- * locali e il batch su centinaia di foto restano da costruire sopra questa
- * base (vedi `docs/ARCHITECTURE.md`).
+ * destra con gli slider che ri-renderizzano la foto DAL VIVO mentre si
+ * trascina (non solo al rilascio), e un pulsante per esportare il risultato
+ * a piena risoluzione. La libreria a griglia, le maschere locali e il batch
+ * su centinaia di foto restano da costruire sopra questa base (vedi
+ * `docs/ARCHITECTURE.md`).
+ *
+ * Il feedback dal vivo è possibile perché la foto da modificare viene aperta
+ * UNA VOLTA (`Engine.openPhotoForEditing`) in una `PhotoEditSession` che la
+ * tiene decodificata e già ridotta in memoria lato Rust: ogni modifica di
+ * uno slider aggiorna solo `currentLook` (uno stato leggero), e un
+ * `LaunchedEffect` osserva quello stato e richiama il rendering veloce
+ * (`renderPreview`) in background, scartando automaticamente i risultati
+ * di rendering ormai superati da una modifica più recente
+ * (`collectLatest`) — così il rendering insegue sempre l'ultima posizione
+ * dello slider invece di accodarsi in ritardo dietro ogni tick di
+ * trascinamento.
  */
 @Composable
 fun RawForgeApp() {
@@ -90,31 +107,64 @@ fun RawForgeApp() {
     var pasteError by remember { mutableStateOf<String?>(null) }
     var renderError by remember { mutableStateOf<String?>(null) }
 
+    // La sessione di editing per la foto target corrente (vedi il commento
+    // sopra `RawForgeApp`): apre/decodifica una sola volta, non ad ogni
+    // modifica. `null` finché nessuna foto target è aperta, o se l'apertura
+    // è fallita (`sessionError`).
+    var session by remember { mutableStateOf<PhotoEditSession?>(null) }
+    var sessionError by remember { mutableStateOf<String?>(null) }
+
     var preview by remember { mutableStateOf<PreviewState?>(null) }
     var currentLook by remember { mutableStateOf(EditableLook()) }
 
+    var exportBusy by remember { mutableStateOf(false) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var exportError by remember { mutableStateOf<String?>(null) }
 
+    // Chiude sempre la sessione precedente prima di sostituirla: la foto
+    // decodificata che tiene in memoria lato Rust va liberata esplicitamente
+    // (non c'è un finalizer automatico), altrimenti ogni cambio di foto
+    // target perderebbe quella memoria per tutta la durata dell'app.
     fun resetEditingStateFor(target: ImportState?) {
+        session?.close()
+        session = null
+        sessionError = null
         preview = target?.let { PreviewState(it.previewImageBytes, it.bitmap) }
         currentLook = EditableLook()
         pasteError = null
         renderError = null
         exportMessage = null
         exportError = null
+        if (target != null) {
+            Engine.openPhotoForEditing(target.rawBytes, target.fileName).fold(
+                onSuccess = { opened -> session = opened },
+                onFailure = { error -> sessionError = error.message ?: "Errore sconosciuto durante l'apertura della foto" }
+            )
+        }
     }
 
-    fun rerender(look: EditableLook) {
-        val target = targetState ?: return
-        Engine.renderLookOnTarget(target.rawBytes, target.fileName, look).fold(
-            onSuccess = { bytes -> preview = PreviewState(bytes, decodeImageBitmapOrNull(bytes)); renderError = null },
-            onFailure = { error -> renderError = error.message ?: "Errore sconosciuto durante il rendering" }
-        )
+    // Rendering dal vivo: ad ogni modifica di `currentLook` (uno slider
+    // spostato) richiama `renderPreview` sulla sessione corrente, in
+    // background (`Dispatchers.Default`, il rendering CPU non deve bloccare
+    // il thread della UI) e sempre sull'ULTIMO valore (`collectLatest`
+    // annulla il rendering di un valore superato non appena ne arriva uno
+    // più recente, invece di accodarli).
+    LaunchedEffect(session) {
+        val activeSession = session ?: return@LaunchedEffect
+        snapshotFlow { currentLook }.collectLatest { look ->
+            val result = withContext(Dispatchers.Default) { activeSession.renderPreview(look) }
+            result.fold(
+                onSuccess = { bytes -> preview = PreviewState(bytes, decodeImageBitmapOrNull(bytes)); renderError = null },
+                onFailure = { error -> renderError = error.message ?: "Errore sconosciuto durante il rendering" }
+            )
+        }
     }
 
-    fun editLook(mutate: (EditableLook) -> EditableLook) {
-        currentLook = mutate(currentLook)
+    // Se l'app viene chiusa (o questo composable smonta) con una sessione
+    // ancora aperta, liberala comunque — legge lo stato corrente al momento
+    // della dismissione, non quello catturato qui.
+    DisposableEffect(Unit) {
+        onDispose { session?.close() }
     }
 
     fun importInto(bytes: ByteArray, fileName: String, onDone: (ImportState) -> Unit, onError: (String) -> Unit) {
@@ -159,8 +209,8 @@ fun RawForgeApp() {
     }
 
     val launchExport = rememberFileSaverLauncher(
-        onSaved = { destination -> exportMessage = "Foto esportata: $destination"; exportError = null },
-        onError = { error -> exportError = error; exportMessage = null },
+        onSaved = { destination -> exportMessage = "Foto esportata: $destination"; exportError = null; exportBusy = false },
+        onError = { error -> exportError = error; exportMessage = null; exportBusy = false },
     )
 
     MaterialTheme(colors = RawForgeDarkColors) {
@@ -225,7 +275,7 @@ fun RawForgeApp() {
                                 modifier = Modifier.weight(1f).fillMaxHeight().padding(start = 8.dp),
                                 title = "Foto da modificare",
                                 state = targetState,
-                                error = targetError,
+                                error = targetError ?: sessionError,
                                 onImportClick = { launchTargetPicker() },
                                 importLabel = "Apri foto da modificare…",
                                 overrideBitmap = preview?.bitmap,
@@ -233,15 +283,28 @@ fun RawForgeApp() {
                                 Spacer(Modifier.height(8.dp))
                                 Button(
                                     onClick = {
-                                        val bytes = preview?.bytes ?: return@Button
-                                        val suggested = (targetState?.fileName ?: "foto")
-                                            .substringBeforeLast('.') + "_rawforge.png"
-                                        launchExport(bytes, suggested)
+                                        val activeSession = session ?: return@Button
+                                        exportError = null
+                                        exportBusy = true
+                                        // A piena risoluzione, non la copia ridotta
+                                        // usata per l'editing interattivo: qui la
+                                        // velocità non è più la priorità, la qualità sì.
+                                        activeSession.renderFullResolution(currentLook).fold(
+                                            onSuccess = { bytes ->
+                                                val suggested = (targetState?.fileName ?: "foto")
+                                                    .substringBeforeLast('.') + "_rawforge.png"
+                                                launchExport(bytes, suggested)
+                                            },
+                                            onFailure = { error ->
+                                                exportError = error.message ?: "Errore durante il rendering per l'esportazione"
+                                                exportBusy = false
+                                            }
+                                        )
                                     },
-                                    enabled = preview != null,
+                                    enabled = session != null && !exportBusy,
                                     colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
                                 ) {
-                                    Text("Esporta foto…", style = MaterialTheme.typography.caption)
+                                    Text(if (exportBusy) "Esportazione…" else "Esporta foto…", style = MaterialTheme.typography.caption)
                                 }
                                 exportMessage?.let {
                                     Spacer(Modifier.height(4.dp))
@@ -273,29 +336,30 @@ fun RawForgeApp() {
                                     onValueChange = { overrideStrength = it },
                                     modifier = Modifier.fillMaxWidth(),
                                 )
-                                Button(onClick = {
-                                    val sample = sampleState
-                                    val target = targetState
-                                    if (sample == null || target == null) return@Button
-                                    pasteError = null
-                                    Engine.pasteLookOntoTarget(
-                                        sampleBytes = sample.rawBytes,
-                                        sampleFileName = sample.fileName,
-                                        lookName = "Look da ${sample.fileName}",
-                                        targetBytes = target.rawBytes,
-                                        targetFileName = target.fileName,
-                                        overrideStrength = overrideStrength,
-                                    ).fold(
-                                        onSuccess = { adapted ->
-                                            currentLook = adapted.appliedLook
-                                            preview = PreviewState(
-                                                adapted.renderedImageBytes,
-                                                decodeImageBitmapOrNull(adapted.renderedImageBytes),
-                                            )
-                                        },
-                                        onFailure = { error -> pasteError = error.message ?: "Errore sconosciuto" }
-                                    )
-                                }) {
+                                Button(
+                                    onClick = {
+                                        val sample = sampleState
+                                        val activeSession = session
+                                        if (sample == null || activeSession == null) return@Button
+                                        pasteError = null
+                                        activeSession.pasteLookFromSample(
+                                            sampleBytes = sample.rawBytes,
+                                            sampleFileName = sample.fileName,
+                                            lookName = "Look da ${sample.fileName}",
+                                            overrideStrength = overrideStrength,
+                                        ).fold(
+                                            onSuccess = { adapted ->
+                                                currentLook = adapted.appliedLook
+                                                preview = PreviewState(
+                                                    adapted.renderedImageBytes,
+                                                    decodeImageBitmapOrNull(adapted.renderedImageBytes),
+                                                )
+                                            },
+                                            onFailure = { error -> pasteError = error.message ?: "Errore sconosciuto" }
+                                        )
+                                    },
+                                    enabled = session != null,
+                                ) {
                                     Text("Incolla impostazioni (adattamento intelligente)")
                                 }
                                 pasteError?.let {
@@ -319,9 +383,8 @@ fun RawForgeApp() {
                         DevelopPanel(
                             modifier = Modifier.width(320.dp).fillMaxHeight(),
                             look = currentLook,
-                            onEdit = ::editLook,
-                            onCommit = { rerender(currentLook) },
-                            onReset = { currentLook = EditableLook(); rerender(EditableLook()) },
+                            onEdit = { mutate -> currentLook = mutate(currentLook) },
+                            onReset = { currentLook = EditableLook() },
                         )
                     }
                 }
@@ -419,7 +482,6 @@ private fun DevelopPanel(
     modifier: Modifier,
     look: EditableLook,
     onEdit: ((EditableLook) -> EditableLook) -> Unit,
-    onCommit: () -> Unit,
     onReset: () -> Unit,
 ) {
     Column(
@@ -436,33 +498,33 @@ private fun DevelopPanel(
         Spacer(Modifier.height(8.dp))
 
         DevelopSection("Base") {
-            FloatSlider("Esposizione (EV)", look.exposureEv, -5f..5f, { onEdit { l -> l.copy(exposureEv = it) } }, onCommit) { "%.2f".format(it) }
-            IntSlider("Contrasto", look.contrast, -100..100, { onEdit { l -> l.copy(contrast = it) } }, onCommit)
-            IntSlider("Alte luci", look.highlights, -100..100, { onEdit { l -> l.copy(highlights = it) } }, onCommit)
-            IntSlider("Ombre", look.shadows, -100..100, { onEdit { l -> l.copy(shadows = it) } }, onCommit)
-            IntSlider("Bianchi", look.whites, -100..100, { onEdit { l -> l.copy(whites = it) } }, onCommit)
-            IntSlider("Neri", look.blacks, -100..100, { onEdit { l -> l.copy(blacks = it) } }, onCommit)
+            FloatSlider("Esposizione (EV)", look.exposureEv, -5f..5f, { onEdit { l -> l.copy(exposureEv = it) } }) { "%.2f".format(it) }
+            IntSlider("Contrasto", look.contrast, -100..100) { onEdit { l -> l.copy(contrast = it) } }
+            IntSlider("Alte luci", look.highlights, -100..100) { onEdit { l -> l.copy(highlights = it) } }
+            IntSlider("Ombre", look.shadows, -100..100) { onEdit { l -> l.copy(shadows = it) } }
+            IntSlider("Bianchi", look.whites, -100..100) { onEdit { l -> l.copy(whites = it) } }
+            IntSlider("Neri", look.blacks, -100..100) { onEdit { l -> l.copy(blacks = it) } }
         }
 
         DevelopSection("Colore") {
-            IntSlider("Temperatura (K)", look.whiteBalanceTemp, 2000..12000, { onEdit { l -> l.copy(whiteBalanceTemp = it) } }, onCommit)
-            IntSlider("Tinta", look.whiteBalanceTint, -100..100, { onEdit { l -> l.copy(whiteBalanceTint = it) } }, onCommit)
-            IntSlider("Vivacità", look.vibrance, -100..100, { onEdit { l -> l.copy(vibrance = it) } }, onCommit)
-            IntSlider("Saturazione", look.saturation, -100..100, { onEdit { l -> l.copy(saturation = it) } }, onCommit)
+            IntSlider("Temperatura (K)", look.whiteBalanceTemp, 2000..12000) { onEdit { l -> l.copy(whiteBalanceTemp = it) } }
+            IntSlider("Tinta", look.whiteBalanceTint, -100..100) { onEdit { l -> l.copy(whiteBalanceTint = it) } }
+            IntSlider("Vivacità", look.vibrance, -100..100) { onEdit { l -> l.copy(vibrance = it) } }
+            IntSlider("Saturazione", look.saturation, -100..100) { onEdit { l -> l.copy(saturation = it) } }
         }
 
         DevelopSection("Viraggio (Split Toning)") {
-            IntSlider("Tinta ombre (°)", look.shadowHue, 0..360, { onEdit { l -> l.copy(shadowHue = it) } }, onCommit)
-            IntSlider("Saturazione ombre", look.shadowSat, 0..100, { onEdit { l -> l.copy(shadowSat = it) } }, onCommit)
-            IntSlider("Tinta luci (°)", look.highlightHue, 0..360, { onEdit { l -> l.copy(highlightHue = it) } }, onCommit)
-            IntSlider("Saturazione luci", look.highlightSat, 0..100, { onEdit { l -> l.copy(highlightSat = it) } }, onCommit)
-            IntSlider("Bilanciamento", look.splitToningBalance, -100..100, { onEdit { l -> l.copy(splitToningBalance = it) } }, onCommit)
+            IntSlider("Tinta ombre (°)", look.shadowHue, 0..360) { onEdit { l -> l.copy(shadowHue = it) } }
+            IntSlider("Saturazione ombre", look.shadowSat, 0..100) { onEdit { l -> l.copy(shadowSat = it) } }
+            IntSlider("Tinta luci (°)", look.highlightHue, 0..360) { onEdit { l -> l.copy(highlightHue = it) } }
+            IntSlider("Saturazione luci", look.highlightSat, 0..100) { onEdit { l -> l.copy(highlightSat = it) } }
+            IntSlider("Bilanciamento", look.splitToningBalance, -100..100) { onEdit { l -> l.copy(splitToningBalance = it) } }
         }
 
         Spacer(Modifier.height(8.dp))
         Text(
             "Curva tonale e HSL per singola banda colore non ancora modificabili a mano da qui — " +
-                "prossimo incremento.",
+                "prossimo incremento (il motore li applica già, dalla Sintesi Armonica).",
             style = MaterialTheme.typography.caption,
             color = TextMuted,
         )
@@ -479,13 +541,15 @@ private fun DevelopSection(title: String, content: @Composable ColumnScope.() ->
     Spacer(Modifier.height(12.dp))
 }
 
+/** Slider intero: aggiorna lo stato ad ogni tick di trascinamento
+ * (`onValueChange`), non solo al rilascio — il rendering dal vivo che ne
+ * consegue è gestito centralmente dal `LaunchedEffect` in `RawForgeApp`. */
 @Composable
 private fun IntSlider(
     label: String,
     value: Int,
     range: IntRange,
     onChange: (Int) -> Unit,
-    onCommit: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -495,8 +559,8 @@ private fun IntSlider(
         Slider(
             value = value.toFloat(),
             onValueChange = { onChange(it.roundToInt()) },
-            onValueChangeFinished = onCommit,
             valueRange = range.first.toFloat()..range.last.toFloat(),
+            modifier = Modifier.fillMaxWidth(),
         )
     }
 }
@@ -507,7 +571,6 @@ private fun FloatSlider(
     value: Float,
     range: ClosedFloatingPointRange<Float>,
     onChange: (Float) -> Unit,
-    onCommit: () -> Unit,
     format: (Float) -> String,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -518,8 +581,8 @@ private fun FloatSlider(
         Slider(
             value = value,
             onValueChange = onChange,
-            onValueChangeFinished = onCommit,
             valueRange = range,
+            modifier = Modifier.fillMaxWidth(),
         )
     }
 }

@@ -4,20 +4,22 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (50 test, tutti verdi):
+Crate reali, compilati e testati (56 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 9, `look_render` 10, `metadata` 3, `raw_decode` 4, `ffi` 14, `smartbatch`
+5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
 |---|---|---|
 | `core-types` | Strutture dati condivise (`HarmonicLook` e affini) | §5.1 |
 | `color-science` | Conversioni sRGB↔lineare, RGB↔Lab, RGB↔HSL | §3.2 |
-| `harmonic` | Sintesi Armonica: estrae tone curve, palette (split toning), contrasto e WB da un'immagine di riferimento | §4.1 |
+| `harmonic` | Sintesi Armonica: estrae tone curve, palette (split toning), contrasto, WB e ora anche HSL per banda da un'immagine di riferimento | §4.1 |
 | `smartbatch` | Smart-Batch Contestuale: descrittori di scena da istogramma + calcolo dei delta adattivi con guardrail | §4.2 |
 | `metadata` | Sidecar JSON non distruttivo (schema versionato, history di operazioni) | §3.1 |
 | `xmp` | Generatore di preset Lightroom `.xmp` dal `HarmonicLook` | §5 |
 | `gpu-pipe` | Sorgenti WGSL degli stage di color grading, validati con `naga` (nessuna GPU richiesta per i test) | §3.2, §6.2 |
 | `raw-decode` | Decodifica RAW vera (`rawler`, Rust puro): anteprima incorporata dalla fotocamera + metadati base | §2, §9 |
-| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (esposizione, tone curve, contrasto, highlights/shadows, HSL, split toning) — l'anteprima "incolla impostazioni" | §3.2 |
-| `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
+| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning) — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
+| `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` (vedi sotto) — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
 
 **Novità di questo giro**: lo Smart-Batch Contestuale (`smartbatch`) era già scritto e testato ma
 irraggiungibile dalla UI — l'unico modo di "usare" un Look era esportarlo come `.xmp`. Il nuovo
@@ -108,7 +110,6 @@ Non ancora presente:
 - **Demosaic completo**: `raw-decode` estrae solo l'anteprima incorporata dalla fotocamera
   (istantanea, nessun calcolo pesante), non l'immagine RAW "sviluppata" pixel per pixel a piena
   risoluzione (§3.2) — `look-render` lavora quindi sull'anteprima, non sul RAW pieno.
-- Bilanciamento del bianco assoluto nel rendering (richiede un profilo colore camera).
 - `gpu-pipe` collegato alla UI per il rendering a piena risoluzione in tempo reale.
 - `cache`, `catalog`, `job-scheduler` — non bloccanti per il flusso attuale (una foto campione +
   una foto target per volta, non un batch di centinaia di foto insieme).
@@ -119,22 +120,87 @@ Per il pannello di editing manuale della UI (sliders su esposizione, contrasto,
 highlights/shadows/whites/blacks, bilanciamento del bianco, vibrance/saturazione, split toning),
 serviva un modo di renderizzare un `HarmonicLook` qualunque su una foto SENZA rifare
 l'estrazione dalla foto campione né l'adattamento Smart-Batch — è il passo veloce richiamato a
-ogni movimento di uno slider. Aggiunta `render_look_on_photo(target_bytes, target_file_name,
-look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError>`: decodifica il target (RAW-aware, come le
-altre funzioni) e chiama direttamente `look_render::render_preview_with_look`. A differenza di
-`paste_look_onto_target_photo`, qui `HarmonicLookFfi` è accettato come parametro perché questa
-funzione viene chiamata SOLO dal codice Kotlin platform-specific (`Engine.android.kt` /
-`Engine.desktop.kt`), mai da `commonMain` direttamente — la UI comune tiene lo stato dello slider
-come `EditableLook` (nuovo tipo comune, solo primitive, in `Engine.kt`), e le implementazioni
-Android/Desktop lo convertono in `HarmonicLookFfi` solo internamente prima di questa chiamata.
+ogni movimento di uno slider. Questo passo esiste oggi come metodo di `PhotoEditSession` (vedi la
+sezione successiva, che ha sostituito la versione originaria a funzione libera descritta più sotto
+nello storico di questo file).
 
-Esteso anche `AdaptedRenderFfi` (il risultato di "incolla impostazioni"): portava solo
-`applied_exposure_ev`/`applied_highlights`/`applied_shadows`, ora porta `applied_look:
-HarmonicLookFfi` per intero — serve come punto di partenza del pannello di editing manuale (dopo
-aver incollato le impostazioni, l'utente deve poter continuare a correggerle a mano da lì, non
-solo vedere i tre valori che Smart-Batch ha deciso di toccare). Due nuovi test:
-`render_look_on_photo_applies_manual_exposure_without_reextraction`,
-`render_look_on_photo_reports_error_on_bad_target_bytes`.
+## Nuovo (questo giro): `PhotoEditSession` — decodifica una sola volta, rendering dal vivo
+
+Richiesta dell'utente dopo un uso reale: "far corrispondere le modifiche degli slider in tempo
+reale sulla foto, perché così è veramente difficile da utilizzare". Causa: ogni singola chiamata
+di rendering (una per ogni tick di uno slider trascinato) ripartiva da zero — ri-decodificava
+l'intera foto target dai bytes originali (RAW compreso) e renderizzava a piena risoluzione
+originale (potenzialmente 24+ megapixel), ritrasmettendo anche l'intera foto attraverso il confine
+Kotlin/JNI ad ogni chiamata. Con quel costo per singolo tick, seguire uno slider mentre si
+trascina non era praticabile.
+
+Sostituito il vecchio schema a funzioni libere (`paste_look_onto_target_photo`,
+`render_look_on_photo`, prese rispettivamente da bytes grezzi ogni volta) con un nuovo oggetto
+UniFFI **stateful**, `PhotoEditSession` (`#[derive(uniffi::Object)]`, esposto a Kotlin come classe
+vera con lifecycle `Disposable`/`AutoCloseable`):
+
+- **`PhotoEditSession::new(target_bytes, target_file_name)`** — decodifica il target UNA SOLA
+  VOLTA (RAW-aware come prima) e la mantiene cacheiata in memoria in due copie: `full_res` (la
+  decodifica originale) e `interactive_preview`, una copia ridotta apposta (lato più lungo max
+  `INTERACTIVE_PREVIEW_MAX_DIM = 1024` px, `image::FilterType::Triangle`) pensata per essere
+  veloce da renderizzare e leggera da ritrasmettere.
+- **`render_preview(look)`** — renderizza SOLO sulla copia ridotta cacheiata: è il metodo
+  richiamato ad ogni singolo movimento di uno slider. Niente ri-decodifica, niente pixel a piena
+  risoluzione, niente ri-trasmissione della foto (solo i parametri leggeri del Look).
+- **`render_full_resolution(look)`** — renderizza sulla copia a piena risoluzione: più lento apposta,
+  usato solo dal pulsante "Esporta foto…", non ad ogni modifica.
+- **`paste_look_from_sample(sample_bytes, sample_file_name, look_name, override_strength)`** —
+  stesso algoritmo di "incolla impostazioni" di prima (estrazione dal campione, descrittori di
+  scena, delta Smart-Batch guardrailati, interpolazione dell'esposizione assoluta descritta più
+  sotto), ma renderizza sulla copia ridotta già cacheiata invece di ri-decodificare il target.
+
+La sessione va aperta una volta quando l'utente sceglie/cambia la foto da modificare
+(`Engine.openPhotoForEditing`, lato Kotlin) e chiusa esplicitamente (`close()`/`destroy()`) quando
+non serve più, per liberare la memoria allocata lato Rust — non c'è un finalizer automatico.
+Nuovi test dedicati in `ffi`: `photo_edit_session_open_reports_error_on_bad_bytes`,
+`paste_look_from_sample_renders_and_reports_positive_recovery_on_darker_target`,
+`paste_look_from_sample_does_not_force_large_exposure_shift_when_target_matches_reference_scene`
+(la stessa regressione del bug storico di -1.09 EV, ora verificata passando dalla sessione),
+`paste_look_from_sample_reports_error_on_bad_sample_bytes`,
+`render_preview_applies_manual_exposure_without_reextraction`,
+`render_full_resolution_uses_the_uncropped_original_size` (verifica che l'export usi davvero le
+dimensioni originali mentre l'anteprima interattiva resta entro `INTERACTIVE_PREVIEW_MAX_DIM`).
+
+## Nuovo (questo giro): bilanciamento del bianco reso davvero nel renderer
+
+Prima il bilanciamento del bianco (temp/tint) era dichiarato esplicitamente come non implementato
+nel rendering ("servirebbe un profilo colore camera"). Ora `look-render` applica temp/tint come un
+guadagno per canale in spazio lineare RGB (`WB_STRENGTH = 0.35`, temp più alta = più caldo/giallo,
+stessa convenzione dello slider di Lightroom) — un'approssimazione dichiarata da color grading,
+non colorimetricamente accurata (non deriva da un vero profilo camera), ma sufficiente a far
+corrispondere meglio la temperatura colore quando si copia lo stile da una foto di riferimento.
+Il default (temp 5500K, tint 0) produce guadagni tutti 1.0, quindi non introduce nessuna regressione
+sul comportamento "look neutro = immagine invariata" già testato. Nuovi test:
+`warm_white_balance_raises_red_relative_to_blue`, `cool_white_balance_raises_blue_relative_to_red`,
+`magenta_tint_lowers_green_relative_to_neutral`.
+
+## Nuovo (questo giro): estrazione HSL per banda nella Sintesi Armonica
+
+`HarmonicLook.hsl` (le regolazioni hue/saturazione/luminanza per 8 bande di colore, già supportate
+dal renderer da tempo) restava sempre a zero: la Sintesi Armonica non le calcolava mai in
+estrazione. Ora `harmonic::extract_look_from_reference` accumula, per ogni pixel non
+quasi-neutro (saturazione HSL > 0.02), un bucket per una delle 8 bande di tonalità (stesso schema
+a 8 bande già usato in applicazione da `look-render`), con una soglia minima di popolazione per
+banda (`MIN_BAND_PIXELS = 40`) per evitare che bande poco rappresentate producano regolazioni
+rumorose. Le tre grandezze sono calcolate con attenzione a restare nello spazio colore corretto
+(confrontando statistiche in spazio HSL con basi/medie anch'esse in spazio HSL, non mescolando con
+i valori Lab già usati altrove nella stessa funzione) e sempre relative alla scena stessa (mai un
+pivot assoluto fisso che potrebbe dominare in modo imprevedibile — stesso principio già applicato
+correggendo il bug storico dell'esposizione): la saturazione di banda è relativa a una baseline
+dichiarata (`BASELINE_HSL_SATURATION = 0.35`), la luminanza di banda è relativa alla luminanza HSL
+media dell'intera immagine, la tonalità di banda è relativa al centro nominale della banda stessa.
+Nuovi test: `saturated_band_gets_a_positive_saturation_bias_others_stay_at_zero`,
+`near_neutral_gray_leaves_all_hsl_bands_at_zero`.
+
+Insieme, bilanciamento del bianco e HSL per banda sono le due leve principali rimaste per
+migliorare la fedeltà della copia di stile dalla foto di riferimento: prima di questo giro
+venivano estratte/applicate solo esposizione, contrasto, tone curve, highlights/shadows e split
+toning.
 
 ## Comandi
 

@@ -7,11 +7,21 @@
 //! empiricamente, non misure fotometriche assolute — sono commentate come tali
 //! ovunque compaiono, così è chiaro cosa va tarato con un vero corpus di foto.
 
-use color_science::{lab_ab_to_hue_chroma, linear_rgb_to_lab, srgb_to_linear};
-use core_types::{HarmonicLook, SplitToning};
+use color_science::{lab_ab_to_hue_chroma, linear_rgb_to_lab, rgb_to_hsl, srgb_to_linear};
+use core_types::{HarmonicLook, HslAdjustments, SplitToning};
 use image::DynamicImage;
 
 const ANALYSIS_MAX_DIM: u32 = 512;
+const HUE_BANDS: usize = 8;
+/// Sotto questa popolazione di pixel una banda HSL viene lasciata a zero: la
+/// media di pochi pixel è rumore, non uno stile da copiare (stesso principio
+/// del guardrail su `min_band_pixels` più sotto).
+const MIN_BAND_PIXELS: u64 = 40;
+/// Saturazione HSL "tipica" attesa per una scena fotografica media (scala
+/// 0..1, NON la chroma Lab di [`BASELINE_CHROMA`] — spazi colore diversi):
+/// baseline empirica per il bias di saturazione per banda, da ricalibrare su
+/// un corpus reale come le altre baseline di questo file.
+const BASELINE_HSL_SATURATION: f32 = 0.35;
 
 /// Luminanza Lab "tipica" per un grigio medio (18%), usata come pivot per la
 /// stima (euristica) dell'esposizione relativa.
@@ -24,6 +34,23 @@ const BASELINE_CONTRAST_STD: f32 = 20.0;
 /// Chroma Lab media attesa per una scena fotografica "normale": baseline
 /// empirica per il bias di vibrance/saturation.
 const BASELINE_CHROMA: f32 = 18.0;
+
+/// Accumulatore per banda di tonalità (Red/Orange/Yellow/Green/Aqua/Blue/
+/// Purple/Magenta, stesso schema a 8 bande usato da `look-render` per
+/// applicare l'HSL) — media di saturazione, luminanza e hue dei pixel di
+/// quella banda nella foto campione.
+struct HueBandBucket {
+    sum_sat: f64,
+    sum_lum: f64,
+    sum_hue: f64,
+    count: u64,
+}
+
+impl HueBandBucket {
+    fn new() -> Self {
+        Self { sum_sat: 0.0, sum_lum: 0.0, sum_hue: 0.0, count: 0 }
+    }
+}
 
 struct LumaBucket {
     sum_a: f64,
@@ -69,13 +96,14 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
 
     let mut sum_lin = [0f64; 3];
     let mut sum_chroma = 0f64;
+    let mut hue_bands: [HueBandBucket; HUE_BANDS] = std::array::from_fn(|_| HueBandBucket::new());
+    let mut sum_hsl_lum = 0f64;
 
     for px in rgba.pixels() {
-        let lin = [
-            srgb_to_linear(px[0] as f32 / 255.0),
-            srgb_to_linear(px[1] as f32 / 255.0),
-            srgb_to_linear(px[2] as f32 / 255.0),
-        ];
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let lin = [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)];
         sum_lin[0] += lin[0] as f64;
         sum_lin[1] += lin[1] as f64;
         sum_lin[2] += lin[2] as f64;
@@ -86,9 +114,30 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
 
         let (_, chroma) = lab_ab_to_hue_chroma(lab[1], lab[2]);
         sum_chroma += chroma as f64;
+
+        // HSL per banda (per il bias di saturazione/luminanza/hue più sotto):
+        // calcolata dallo stesso pixel sRGB, non da Lab — deve corrispondere
+        // esattamente allo spazio in cui `look-render` applica l'HSL per
+        // banda, altrimenti un pixel finirebbe extratto in una banda e
+        // renderizzato in un'altra.
+        let hsl_px = rgb_to_hsl([r, g, b]);
+        sum_hsl_lum += hsl_px[2] as f64;
+        if hsl_px[1] > 0.02 {
+            // Pixel quasi acromatici esclusi dalle bande: il loro hue non è
+            // affidabile (rumore numerico attorno a un colore grigio), e
+            // includerli sposterebbe la media di una banda scelta quasi a
+            // caso verso quel rumore.
+            let band = (((hsl_px[0] / 45.0) as usize) % HUE_BANDS).min(HUE_BANDS - 1);
+            let bucket = &mut hue_bands[band];
+            bucket.sum_hue += hsl_px[0] as f64;
+            bucket.sum_sat += hsl_px[1] as f64;
+            bucket.sum_lum += hsl_px[2] as f64;
+            bucket.count += 1;
+        }
     }
 
     let n = l_values.len().max(1) as f64;
+    let overall_hsl_lum = (sum_hsl_lum / n) as f32;
 
     // --- Tone curve: percentili della luminanza come control point ---
     let mut sorted_l = l_values.clone();
@@ -165,6 +214,38 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
     let temp_delta = ((avg_r - avg_b) * 2000.0).clamp(-1500.0, 1500.0);
     let temp = (5500.0 + temp_delta).clamp(2000.0, 12000.0) as u32;
 
+    // --- HSL per banda colore: finora `HarmonicLook.hsl` restava sempre a
+    // zero (mai popolato), cioè la parte più "da color grading" della
+    // Sintesi Armonica — quali colori il look enfatizza/desatura/sposta di
+    // hue per zona cromatica — non veniva mai copiata dalla foto campione,
+    // solo tone curve/contrasto/vibrance/split-toning globali. Qui si
+    // confronta ogni banda con l'INTERA foto campione (non un pivot
+    // assoluto), stesso principio già applicato a tone curve ed esposizione:
+    // una banda "più chiara/satura del resto della FOTO CAMPIONE" è uno
+    // stile da copiare, "questa banda è assolutamente chiara" no.
+    let mut hsl_hue = [0i32; HUE_BANDS];
+    let mut hsl_sat = [0i32; HUE_BANDS];
+    let mut hsl_lum = [0i32; HUE_BANDS];
+    for (band, bucket) in hue_bands.iter().enumerate() {
+        if bucket.count < MIN_BAND_PIXELS {
+            continue;
+        }
+        let n_band = bucket.count as f64;
+        let band_mean_sat = (bucket.sum_sat / n_band) as f32;
+        let band_mean_lum = (bucket.sum_lum / n_band) as f32;
+        let band_mean_hue = (bucket.sum_hue / n_band) as f32;
+        let band_center_hue = band as f32 * 45.0 + 22.5;
+
+        hsl_sat[band] = (((band_mean_sat - BASELINE_HSL_SATURATION) / BASELINE_HSL_SATURATION) * 100.0)
+            .clamp(-100.0, 100.0) as i32;
+        // Range stretto (+-30): un ritocco di luminanza per banda, non una
+        // riesposizione mascherata per colore.
+        hsl_lum[band] = ((band_mean_lum - overall_hsl_lum) * 200.0).clamp(-30.0, 30.0) as i32;
+        // Range ancora più stretto (+-15 gradi): uno scostamento di hue è il
+        // ritocco HSL più visibile e rischioso, va tenuto sottile.
+        hsl_hue[band] = (band_mean_hue - band_center_hue).clamp(-15.0, 15.0) as i32;
+    }
+
     let mut look = HarmonicLook {
         name: name.to_string(),
         exposure_ev,
@@ -172,6 +253,7 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
         vibrance,
         split_toning,
         tone_curve,
+        hsl: HslAdjustments { hue: hsl_hue, sat: hsl_sat, lum: hsl_lum },
         ..HarmonicLook::default()
     };
     look.white_balance.temp = temp;
@@ -238,6 +320,36 @@ mod tests {
         let look = extract_look_from_reference(&img, "Contrasty");
         assert_ne!(look.tone_curve[1], (64, 64), "punto ombre non deve restare sull'identita' per una scena molto contrastata");
         assert_ne!(look.tone_curve[3], (192, 192), "punto luci non deve restare sull'identita' per una scena molto contrastata");
+    }
+
+    #[test]
+    fn saturated_band_gets_a_positive_saturation_bias_others_stay_at_zero() {
+        // Foto quasi interamente rossa satura, con un piccolo angolo neutro
+        // (altrimenti nessuna banda avrebbe l'hue definito quando l'immagine
+        // è un unico colore piatto... in realtà anche un solo colore basta,
+        // ma un angolo neutro verifica anche che i pixel acromatici vengano
+        // esclusi correttamente dal calcolo). Rosso puro (255,0,0) sRGB cade
+        // in banda 0 (hue 0).
+        let img = synthetic_image(|x, y| {
+            if x < 4 && y < 4 {
+                [128, 128, 128, 255] // angolo neutro: escluso dalle bande
+            } else {
+                [230, 20, 20, 255] // rosso molto saturo: banda 0
+            }
+        });
+        let look = extract_look_from_reference(&img, "Red Test");
+        assert!(look.hsl.sat[0] > 0, "banda rossa (0) deve avere un bias di saturazione positivo, got {}", look.hsl.sat[0]);
+        // Una banda senza abbastanza pixel (es. la 4, Aqua) resta a zero: non
+        // deve inventare uno stile per un colore assente dalla foto.
+        assert_eq!(look.hsl.sat[4], 0, "banda assente dalla foto non deve avere bias, got {}", look.hsl.sat[4]);
+    }
+
+    #[test]
+    fn near_neutral_gray_leaves_all_hsl_bands_at_zero() {
+        let img = synthetic_image(|_, _| [128, 128, 128, 255]);
+        let look = extract_look_from_reference(&img, "Gray HSL Test");
+        assert_eq!(look.hsl.hue, [0; 8], "grigio puro non deve popolare l'hue di nessuna banda");
+        assert_eq!(look.hsl.sat, [0; 8], "grigio puro non deve popolare la saturazione di nessuna banda");
     }
 
     #[test]

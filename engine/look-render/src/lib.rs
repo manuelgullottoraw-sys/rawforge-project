@@ -11,12 +11,12 @@
 //!
 //! **Semplificazioni deliberate rispetto alla pipeline GPU completa**
 //! (documentate qui, non nascoste): il bilanciamento del bianco
-//! (`white_balance.temp`/`tint`) non viene applicato in valore assoluto —
-//! richiederebbe un profilo colore della fotocamera (matrice o DCP) che questo
-//! motore non ha ancora — mentre esposizione, tone curve, contrasto,
-//! highlights/shadows, HSL per banda, split toning e vibrance/saturazione sono
-//! applicati per intero, perché non dipendono da un profilo camera. Sharpening
-//! e riduzione rumore restano pianificati per la Fase 3-4 della roadmap (§8).
+//! (`white_balance.temp`/`tint`) è applicato come guadagno per canale in
+//! spazio lineare (approssimazione da color grading, non colorimetrica) —
+//! una resa assoluta corretta richiederebbe un profilo colore della
+//! fotocamera (matrice o DCP) che questo motore non ha ancora, ma per
+//! trasferire lo STILE caldo/freddo di un look è sufficiente. Sharpening e
+//! riduzione rumore restano pianificati per la Fase 3-4 della roadmap (§8).
 
 use color_science::{hsl_to_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
 use core_types::HarmonicLook;
@@ -97,9 +97,9 @@ fn highlight_mask(luma: f32) -> f32 {
 
 /// Applica un `HarmonicLook` ai pixel di `image`, restituendo una nuova
 /// immagine della stessa dimensione. Ordine degli stage (docs/ARCHITECTURE.md
-/// §3.2, sezione "Detail"/NR esclusa): esposizione -> highlights/shadows ->
-/// tone curve -> contrasto -> HSL per banda + split toning -> vibrance/
-/// saturazione globale.
+/// §3.2, sezione "Detail"/NR esclusa): bilanciamento del bianco + esposizione
+/// -> highlights/shadows -> tone curve -> contrasto -> HSL per banda + split
+/// toning -> vibrance/saturazione globale.
 pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> DynamicImage {
     let rgba = image.to_rgba8();
     let (width, _height) = rgba.dimensions();
@@ -110,6 +110,24 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     let contrast_amount = 1.0 + (look.contrast as f32 / 100.0);
     let shadows_amount = look.shadows as f32 / 100.0;
     let highlights_amount = look.highlights as f32 / 100.0;
+
+    // Bilanciamento del bianco: un guadagno per canale in spazio lineare, non
+    // un vero profilo colore camera (matrice o DCP) — quello richiederebbe
+    // conoscere la risposta della fotocamera che l'ha scattata, cosa che
+    // questo motore non ha. Come approssimazione DICHIARATA, sufficiente a
+    // trasferire lo STILE caldo/freddo di un look (non una resa colorimetrica
+    // assoluta): `temp` (convenzione Lightroom, valori più alti = più caldo)
+    // e `tint` (positivo = magenta) diventano guadagni simmetrici su R/B e G.
+    // `WB_STRENGTH` tiene l'effetto visibile ma non estremo anche ai bordi
+    // dell'intervallo (temp 2000..12000).
+    const WB_STRENGTH: f32 = 0.35;
+    let temp_shift = ((look.white_balance.temp as f32 - 5500.0) / 5000.0).clamp(-1.0, 1.0);
+    let tint_shift = (look.white_balance.tint as f32 / 100.0).clamp(-1.0, 1.0);
+    let wb_gain = [
+        1.0 + temp_shift * WB_STRENGTH,
+        1.0 - tint_shift * (WB_STRENGTH * 0.6),
+        1.0 - temp_shift * WB_STRENGTH,
+    ];
     // Guardrail: anche se `saturation`/`vibrance` in teoria arrivano da
     // `HarmonicLook` già limitati a +-100, mai spingere il moltiplicatore di
     // saturazione globale a un estremo che desaturi (quasi) completamente o
@@ -124,14 +142,16 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
         .zip(rgba.par_chunks(row_stride))
         .for_each(|(out_row, in_row)| {
             for (out_px, in_px) in out_row.chunks_exact_mut(4).zip(in_row.chunks_exact(4)) {
-                // Esposizione: guadagno scalare in spazio lineare.
+                // Bilanciamento del bianco + esposizione: guadagni scalari (uno
+                // per canale per il WB, uno unico per l'esposizione) in spazio
+                // lineare.
                 let mut linear = [
                     srgb_to_linear(in_px[0] as f32 / 255.0),
                     srgb_to_linear(in_px[1] as f32 / 255.0),
                     srgb_to_linear(in_px[2] as f32 / 255.0),
                 ];
-                for c in linear.iter_mut() {
-                    *c = (*c * exposure_mul).clamp(0.0, 1.0);
+                for (c, gain) in linear.iter_mut().zip(wb_gain.iter()) {
+                    *c = (*c * exposure_mul * gain).clamp(0.0, 1.0);
                 }
 
                 let mut srgb = [
@@ -289,6 +309,36 @@ mod tests {
             let expected = i as f32 / 255.0;
             assert!((lut[i] - expected).abs() < 0.01, "i={i} lut={} expected={expected}", lut[i]);
         }
+    }
+
+    #[test]
+    fn warm_white_balance_raises_red_relative_to_blue() {
+        let img = solid_image(4, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.white_balance.temp = 9000; // molto più caldo del neutro (5500)
+        let rendered = render_preview_with_look(&img, &look);
+        let px = rendered.to_rgba8().get_pixel(0, 0).0;
+        assert!(px[0] > px[2], "un WB caldo deve alzare il rosso rispetto al blu: R={} B={}", px[0], px[2]);
+    }
+
+    #[test]
+    fn cool_white_balance_raises_blue_relative_to_red() {
+        let img = solid_image(4, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.white_balance.temp = 2500; // molto più freddo del neutro (5500)
+        let rendered = render_preview_with_look(&img, &look);
+        let px = rendered.to_rgba8().get_pixel(0, 0).0;
+        assert!(px[2] > px[0], "un WB freddo deve alzare il blu rispetto al rosso: R={} B={}", px[0], px[2]);
+    }
+
+    #[test]
+    fn magenta_tint_lowers_green_relative_to_neutral() {
+        let img = solid_image(4, 4, [128, 128, 128]);
+        let mut look = HarmonicLook::default();
+        look.white_balance.tint = 100; // massima tinta magenta
+        let rendered = render_preview_with_look(&img, &look);
+        let px = rendered.to_rgba8().get_pixel(0, 0).0;
+        assert!(px[1] < px[0], "una tinta magenta deve abbassare il verde rispetto al rosso/blu: G={} R={}", px[1], px[0]);
     }
 
     #[test]

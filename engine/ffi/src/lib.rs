@@ -275,101 +275,134 @@ pub struct AdaptedRenderFfi {
     pub applied_look: HarmonicLookFfi,
 }
 
-/// Incolla sulla foto da modificare (`target`) le impostazioni copiate dalla
-/// foto campione, adattandole in modo intelligente alla scena specifica del
-/// target invece di applicarle identiche — è lo Smart-Batch Contestuale
-/// (docs/ARCHITECTURE.md, §4.2). In un solo passaggio: estrae il Look dalla
-/// foto campione (Sintesi Armonica, §4.1), calcola i descrittori di scena di
-/// campione e target dai rispettivi istogrammi di luminanza, i delta adattivi
-/// (esposizione, recupero luci/ombre, con i guardrail dell'architettura), li
-/// applica al Look di base e renderizza subito l'anteprima risultante — tutto
-/// resta nell'app. Prende solo bytes/stringhe primitive (non un
-/// `HarmonicLookFfi`) apposta: così la UI Kotlin comune (`commonMain`) può
-/// richiamarlo senza dover far attraversare il confine `expect`/`actual` a un
-/// tipo generato da UniFFI, che esiste solo nelle copie platform-specific dei
-/// binding (vedi `shared/src/commonMain/kotlin/com/rawforge/shared/Engine.kt`).
-///
-/// Per esportare lo stesso Look anche come preset `.xmp`, la UI richiama
-/// separatamente `extract_look_from_reference_image`/`extract_look_from_raw_
-/// reference` + `generate_lightroom_preset_xmp` sulla foto campione: è una
-/// piccola ri-analisi aggiuntiva (la Sintesi Armonica su una preview costa
-/// <50ms, §4.1 punto 1), non un giro a vuoto.
-///
-/// `override_strength` (0.0..1.0) è lo slider "Override Strength" della UI:
-/// 0.0 = applica il Look letterale (nessun adattamento), 1.0 = applica il
-/// massimo adattamento consentito dai guardrail. Vedi `smartbatch` per i
-/// dettagli dell'algoritmo, già testato indipendentemente da questo crate.
-#[uniffi::export]
-pub fn paste_look_onto_target_photo(
-    sample_bytes: Vec<u8>,
-    sample_file_name: String,
-    look_name: String,
-    target_bytes: Vec<u8>,
-    target_file_name: String,
-    override_strength: f32,
-) -> Result<AdaptedRenderFfi, EngineError> {
-    let sample_image = decode_any_photo(&sample_bytes, &sample_file_name)?;
-    let target_image = decode_any_photo(&target_bytes, &target_file_name)?;
+/// Dimensione massima (lato lungo) della copia ridotta che [`PhotoEditSession`]
+/// tiene in cache per il rendering interattivo. Ogni modifica di uno slider
+/// del pannello "Develop" richiama il rendering su QUESTA copia, non sulla
+/// foto a piena risoluzione: a questa dimensione l'intera pipeline per-pixel
+/// (`rayon`, CPU) gira in pochi millisecondi anche su foto da 24+ megapixel,
+/// il che è ciò che rende possibile un feedback dal vivo mentre si trascina
+/// uno slider invece di un rendering completo ad ogni rilascio.
+const INTERACTIVE_PREVIEW_MAX_DIM: u32 = 1024;
 
-    let base_look = harmonic::extract_look_from_reference(&sample_image, &look_name);
-
-    let sample_descriptors = smartbatch::compute_scene_descriptors(&look_render::luminance_histogram(&sample_image));
-    let target_descriptors = smartbatch::compute_scene_descriptors(&look_render::luminance_histogram(&target_image));
-
-    let clamped_strength = override_strength.clamp(0.0, 1.0);
-    let params = smartbatch::AdaptationParams {
-        override_strength: clamped_strength,
-        ..smartbatch::AdaptationParams::default()
-    };
-    let deltas = smartbatch::compute_adaptive_deltas(&sample_descriptors, &target_descriptors, &params);
-
-    // `base_look.exposure_ev` (Sintesi Armonica) è una stima ASSOLUTA di quanto
-    // la mediana della foto CAMPIONE si discosta dal grigio neutro — riflette
-    // la luminosità della SUA scena (es. una foto scattata volutamente in
-    // basso-chiave), non un'esposizione da ricalcare pari pari su una scena
-    // diversa. Sommarla per intero al delta di Smart-Batch (che invece È
-    // guardrailato, +-max_exposure_delta_ev) permetteva a questo valore
-    // assoluto e senza freni di dominare il risultato anche a
-    // override_strength=1.0 ("massimo adattamento") — il bug segnalato: -1.09
-    // EV su una foto con ampie zone scure, ben oltre il guardrail di +-0.5 EV.
-    // Interpoliamo quindi la componente assoluta con (1 - intensita'
-    // adattamento): a override_strength=0.0 resta "applica il Look letterale"
-    // (l'assoluto del campione, invariato); a override_strength=1.0 lascia
-    // spazio per intero al delta contestuale e guardrailato di Smart-Batch.
-    let mut adapted_base = base_look.clone();
-    adapted_base.exposure_ev = base_look.exposure_ev * (1.0 - clamped_strength);
-    let adapted_look = smartbatch::apply_deltas(&adapted_base, &deltas);
-
-    let rendered = look_render::render_preview_with_look(&target_image, &adapted_look);
-    let rendered_preview_png_bytes = encode_preview_as_png(&rendered)?;
-
-    Ok(AdaptedRenderFfi {
-        rendered_preview_png_bytes,
-        applied_look: adapted_look.into(),
-    })
+fn downscale_for_interactive_preview(image: &image::DynamicImage) -> image::DynamicImage {
+    if image.width() <= INTERACTIVE_PREVIEW_MAX_DIM && image.height() <= INTERACTIVE_PREVIEW_MAX_DIM {
+        image.clone()
+    } else {
+        image.resize(
+            INTERACTIVE_PREVIEW_MAX_DIM,
+            INTERACTIVE_PREVIEW_MAX_DIM,
+            image::imageops::FilterType::Triangle,
+        )
+    }
 }
 
-/// Renderizza `look` (qualunque sia la sua origine — estratto dalla Sintesi
-/// Armonica, adattato da Smart-Batch, o modificato a mano dall'utente nel
-/// pannello di editing manuale) sulla foto `target`, senza rifare estrazione
-/// né adattamento: è il passo veloce richiamato a ogni modifica di uno slider
-/// del pannello "Develop" della UI, che tiene già il Look corrente lato
-/// Kotlin (come `EditableLook`, solo tipi primitivi in `commonMain`) e qui
-/// deve solo vederne l'effetto sui pixel. Stesso identico stadio di rendering
-/// di `paste_look_onto_target_photo` (`look_render::render_preview_with_look`),
-/// isolato in una funzione a sé per evitare di ripetere ogni volta la
-/// (ri)estrazione del Look dalla foto campione, che non serve più una volta
-/// che l'utente sta correggendo a mano i valori.
+/// Una foto "da modificare" aperta per l'editing, con la sua decodifica già
+/// fatta e cacheiata in memoria (RAW-aware, via [`decode_any_photo`]) —
+/// un oggetto UniFFI vero e proprio (non solo funzioni), perché a differenza
+/// di `extract_look_from_reference_image`/`paste_look_onto_target_photo`
+/// (chiamate una tantum, su un click) questa sessione viene interrogata
+/// decine di volte al secondo mentre l'utente trascina uno slider del
+/// pannello "Develop": decodificare di nuovo il file ad ogni chiamata (come
+/// faceva la precedente `render_look_on_photo`, rimossa) sarebbe stato il
+/// collo di bottiglia principale, oltre a dover ritrasmettere i bytes
+/// dell'intera foto attraverso il confine Kotlin/JNI ad ogni tick di
+/// trascinamento invece che una volta sola all'apertura.
+///
+/// Tiene DUE copie decodificate: `full_res` (l'anteprima incorporata dalla
+/// fotocamera per un RAW, o l'immagine originale per un JPEG/PNG — non
+/// ancora un demosaic RAW completo, limite già noto) per l'esportazione
+/// finale, e `interactive_preview` (ridotta a
+/// [`INTERACTIVE_PREVIEW_MAX_DIM`]) per il rendering dal vivo mentre si
+/// modifica.
+#[derive(uniffi::Object)]
+pub struct PhotoEditSession {
+    full_res: image::DynamicImage,
+    interactive_preview: image::DynamicImage,
+}
+
 #[uniffi::export]
-pub fn render_look_on_photo(
-    target_bytes: Vec<u8>,
-    target_file_name: String,
-    look: HarmonicLookFfi,
-) -> Result<Vec<u8>, EngineError> {
-    let target_image = decode_any_photo(&target_bytes, &target_file_name)?;
-    let core_look: core_types::HarmonicLook = look.into();
-    let rendered = look_render::render_preview_with_look(&target_image, &core_look);
-    encode_preview_as_png(&rendered)
+impl PhotoEditSession {
+    /// Apre `target_bytes` per l'editing: decodifica una sola volta (RAW-aware)
+    /// e prepara la copia ridotta per il rendering interattivo. Va chiamata
+    /// quando l'utente importa/cambia la foto da modificare, non ad ogni
+    /// modifica di uno slider.
+    #[uniffi::constructor]
+    pub fn new(target_bytes: Vec<u8>, target_file_name: String) -> Result<Self, EngineError> {
+        let full_res = decode_any_photo(&target_bytes, &target_file_name)?;
+        let interactive_preview = downscale_for_interactive_preview(&full_res);
+        Ok(Self { full_res, interactive_preview })
+    }
+
+    /// Rendering veloce per l'editing interattivo: lavora sulla copia ridotta
+    /// cacheiata all'apertura, non ri-decodifica nulla. È il metodo chiamato
+    /// ad ogni singolo tick di trascinamento di uno slider del pannello
+    /// "Develop" — deve restare economico.
+    pub fn render_preview(&self, look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError> {
+        let core_look: core_types::HarmonicLook = look.into();
+        let rendered = look_render::render_preview_with_look(&self.interactive_preview, &core_look);
+        encode_preview_as_png(&rendered)
+    }
+
+    /// Rendering a piena risoluzione (dell'anteprima incorporata originale,
+    /// non ancora del RAW pieno — limite già noto), da usare solo per
+    /// l'esportazione finale: più lento, non va richiamato ad ogni modifica.
+    pub fn render_full_resolution(&self, look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError> {
+        let core_look: core_types::HarmonicLook = look.into();
+        let rendered = look_render::render_preview_with_look(&self.full_res, &core_look);
+        encode_preview_as_png(&rendered)
+    }
+
+    /// "Incolla le impostazioni" ma sulla scena già decodificata e cacheiata
+    /// di questa sessione — stesso algoritmo di adattamento della precedente
+    /// `paste_look_onto_target_photo` (rimossa, sostituita da questo metodo):
+    /// estrae il Look dalla foto campione (Sintesi Armonica, §4.1), calcola i
+    /// descrittori di scena di campione e target (quest'ultimo dalla copia
+    /// ridotta, non dalla foto intera — un'approssimazione già accettata
+    /// altrove nel motore, vedi `ANALYSIS_MAX_DIM` in `harmonic`), i delta
+    /// adattivi con i guardrail dell'architettura (§4.2), li applica al Look
+    /// di base e renderizza subito l'anteprima veloce.
+    ///
+    /// `override_strength` (0.0..1.0) è lo slider "Intensità adattamento"
+    /// della UI: 0.0 = applica il Look letterale (nessun adattamento), 1.0 =
+    /// applica il massimo adattamento consentito dai guardrail. L'esposizione
+    /// assoluta del campione viene interpolata con `(1 - override_strength)`
+    /// prima di sommare il delta di Smart-Batch — vedi la nota storica su
+    /// questo stesso punto più sotto nei test, che riproducono il bug
+    /// originale (-1.09 EV) e verificano che non si sia ripresentato.
+    pub fn paste_look_from_sample(
+        &self,
+        sample_bytes: Vec<u8>,
+        sample_file_name: String,
+        look_name: String,
+        override_strength: f32,
+    ) -> Result<AdaptedRenderFfi, EngineError> {
+        let sample_image = decode_any_photo(&sample_bytes, &sample_file_name)?;
+        let base_look = harmonic::extract_look_from_reference(&sample_image, &look_name);
+
+        let sample_descriptors =
+            smartbatch::compute_scene_descriptors(&look_render::luminance_histogram(&sample_image));
+        let target_descriptors =
+            smartbatch::compute_scene_descriptors(&look_render::luminance_histogram(&self.interactive_preview));
+
+        let clamped_strength = override_strength.clamp(0.0, 1.0);
+        let params = smartbatch::AdaptationParams {
+            override_strength: clamped_strength,
+            ..smartbatch::AdaptationParams::default()
+        };
+        let deltas = smartbatch::compute_adaptive_deltas(&sample_descriptors, &target_descriptors, &params);
+
+        let mut adapted_base = base_look.clone();
+        adapted_base.exposure_ev = base_look.exposure_ev * (1.0 - clamped_strength);
+        let adapted_look = smartbatch::apply_deltas(&adapted_base, &deltas);
+
+        let rendered = look_render::render_preview_with_look(&self.interactive_preview, &adapted_look);
+        let rendered_preview_png_bytes = encode_preview_as_png(&rendered)?;
+
+        Ok(AdaptedRenderFfi {
+            rendered_preview_png_bytes,
+            applied_look: adapted_look.into(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -484,19 +517,20 @@ mod tests {
     }
 
     #[test]
-    fn paste_look_onto_target_photo_renders_and_reports_positive_recovery_on_darker_target() {
+    fn photo_edit_session_open_reports_error_on_bad_bytes() {
+        let result = PhotoEditSession::new(vec![9, 9, 9], "x.png".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn paste_look_from_sample_renders_and_reports_positive_recovery_on_darker_target() {
         let sample_bytes = png_bytes_of_solid_color(6, [200, 150, 100]);
         let target_bytes = png_bytes_of_solid_color(6, [20, 20, 20]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
 
-        let result = paste_look_onto_target_photo(
-            sample_bytes,
-            "campione.png".to_string(),
-            "Campione".to_string(),
-            target_bytes,
-            "target.png".to_string(),
-            1.0,
-        )
-        .unwrap();
+        let result = session
+            .paste_look_from_sample(sample_bytes, "campione.png".to_string(), "Campione".to_string(), 1.0)
+            .unwrap();
 
         assert!(!result.rendered_preview_png_bytes.is_empty());
         // Il target è molto più scuro del campione: ci aspettiamo un recupero
@@ -514,10 +548,10 @@ mod tests {
     }
 
     #[test]
-    fn paste_look_onto_target_photo_does_not_force_large_exposure_shift_when_target_matches_reference_scene() {
-        // Riproduce il bug segnalato dall'utente: campione scattato ed editato
-        // in basso-chiave (scuro), target la STESSA scena non editata (qui
-        // approssimata da un colore identico, la stessa condizione che
+    fn paste_look_from_sample_does_not_force_large_exposure_shift_when_target_matches_reference_scene() {
+        // Riproduce il bug storico segnalato dall'utente: campione scattato ed
+        // editato in basso-chiave (scuro), target la STESSA scena non editata
+        // (qui approssimata da un colore identico, la stessa condizione che
         // rendeva l'istogramma di scena del target praticamente identico a
         // quello del campione). L'esposizione ASSOLUTA del campione (p50
         // basso -> exposure_ev fortemente negativo in `harmonic`) non deve
@@ -530,16 +564,11 @@ mod tests {
         // desaturato non voluto).
         let sample_bytes = png_bytes_of_solid_color(6, [20, 20, 20]);
         let target_bytes = png_bytes_of_solid_color(6, [20, 20, 20]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
 
-        let result = paste_look_onto_target_photo(
-            sample_bytes,
-            "campione_scuro.png".to_string(),
-            "Look Scuro".to_string(),
-            target_bytes,
-            "target.png".to_string(),
-            1.0,
-        )
-        .unwrap();
+        let result = session
+            .paste_look_from_sample(sample_bytes, "campione_scuro.png".to_string(), "Look Scuro".to_string(), 1.0)
+            .unwrap();
 
         assert!(
             result.applied_look.exposure_ev.abs() <= 0.5 + f32::EPSILON,
@@ -549,15 +578,25 @@ mod tests {
     }
 
     #[test]
-    fn render_look_on_photo_applies_manual_exposure_without_reextraction() {
+    fn paste_look_from_sample_reports_error_on_bad_sample_bytes() {
+        let target_bytes = png_bytes_of_solid_color(6, [20, 20, 20]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let result = session.paste_look_from_sample(vec![1, 2, 3], "x.jpg".to_string(), "Look".to_string(), 1.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn render_preview_applies_manual_exposure_without_reextraction() {
         // Il pannello di editing manuale non ripassa mai dalla foto campione:
         // prende il Look corrente (qui costruito a mano, come farebbe uno
-        // slider) e lo renderizza direttamente sul target.
+        // slider) e lo renderizza direttamente sulla sessione già aperta,
+        // senza ri-decodificare il target.
         let target_bytes = png_bytes_of_solid_color(6, [100, 100, 100]);
+        let session = PhotoEditSession::new(target_bytes.clone(), "target.png".to_string()).unwrap();
         let mut look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
         look.exposure_ev = 1.0;
 
-        let rendered_bytes = render_look_on_photo(target_bytes.clone(), "target.png".to_string(), look).unwrap();
+        let rendered_bytes = session.render_preview(look).unwrap();
         assert!(!rendered_bytes.is_empty());
 
         let before = image::load_from_memory(&target_bytes).unwrap().to_rgba8();
@@ -569,22 +608,25 @@ mod tests {
     }
 
     #[test]
-    fn render_look_on_photo_reports_error_on_bad_target_bytes() {
+    fn render_full_resolution_uses_the_uncropped_original_size() {
+        use image::GenericImageView;
+        // La copia interattiva viene ridotta oltre INTERACTIVE_PREVIEW_MAX_DIM,
+        // ma l'esportazione finale deve lavorare sulla foto originale intera.
+        let big_size = INTERACTIVE_PREVIEW_MAX_DIM + 200;
+        let target_bytes = png_bytes_of_solid_color(big_size, [80, 80, 80]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
         let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
-        let result = render_look_on_photo(vec![9, 9, 9], "x.png".to_string(), look);
-        assert!(result.is_err());
-    }
 
-    #[test]
-    fn paste_look_onto_target_photo_reports_error_on_bad_sample_bytes() {
-        let result = paste_look_onto_target_photo(
-            vec![1, 2, 3],
-            "x.jpg".to_string(),
-            "Look".to_string(),
-            vec![9, 9, 9],
-            "y.jpg".to_string(),
-            1.0,
+        let full = session.render_full_resolution(look.clone()).unwrap();
+        let full_dims = image::load_from_memory(&full).unwrap().dimensions();
+        assert_eq!(full_dims, (big_size, big_size), "il rendering a piena risoluzione deve preservare le dimensioni originali");
+
+        let preview = session.render_preview(look).unwrap();
+        let preview_dims = image::load_from_memory(&preview).unwrap().dimensions();
+        assert!(
+            preview_dims.0 <= INTERACTIVE_PREVIEW_MAX_DIM && preview_dims.1 <= INTERACTIVE_PREVIEW_MAX_DIM,
+            "l'anteprima interattiva deve restare entro il limite di downscale, got {:?}",
+            preview_dims
         );
-        assert!(result.is_err());
     }
 }

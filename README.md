@@ -24,9 +24,11 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   `color-science`, `harmonic` (Sintesi Armonica), `smartbatch` (Smart-Batch Contestuale),
   `metadata` (sidecar non distruttivo), `xmp` (export preset Lightroom), `gpu-pipe` (shader
   WGSL validati con `naga`), `raw-decode` (decodifica RAW vera), **`look-render`** (applica un
-  Look ai pixel su CPU, per l'anteprima "incolla impostazioni", vedi sotto) e **`ffi`** (la
-  superficie UniFFI che collega tutto quanto sopra a Kotlin). 50 test, tutti verdi, eseguiti in
-  locale prima di ogni consegna. Dettagli in [`engine/README.md`](engine/README.md).
+  Look ai pixel su CPU — bilanciamento del bianco, esposizione, tone curve, contrasto,
+  highlights/shadows, HSL per banda, split toning) e **`ffi`** (la superficie UniFFI che collega
+  tutto quanto sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` per il rendering dal
+  vivo, vedi sotto). 56 test, tutti verdi, eseguiti in locale prima di ogni consegna. Dettagli in
+  [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
   1. `rust-tests` — compila e testa l'intero workspace Rust.
   2. `generate-bindings` — compila il crate `ffi` per l'host e genera i binding Kotlin
@@ -94,21 +96,60 @@ fotografico professionale:
   si vedono entrambe senza dover scorrere, e si ridimensionano insieme alla finestra.
 - **Pannello "Develop" a destra**, con slider veri per esposizione, contrasto, luci/ombre,
   bianchi/neri, bilanciamento del bianco, vibrance/saturazione e viraggio (split toning) — legati
-  in tempo reale al motore Rust: ogni volta che si rilascia uno slider, la foto target viene
-  ri-renderizzata subito con i nuovi valori (nuova funzione `render_look_on_photo` nel motore, che
-  non rifà l'estrazione dalla foto campione né l'adattamento — solo il rendering, per restare
-  veloce). Dopo "Incolla impostazioni", il pannello parte già dai valori decisi da Smart-Batch, e
-  l'utente può correggerli a mano da lì.
-- **Pulsante "Esporta foto…"**: salva l'anteprima corrente (originale, incollata, o corretta a
-  mano) su un file scelto dall'utente — finestra di salvataggio nativa su Windows, selettore di
-  destinazione di sistema su Android (nessun permesso runtime richiesto).
+  in tempo reale al motore Rust, ora anche **durante il trascinamento**, non solo al rilascio (vedi
+  la sezione successiva). Dopo "Incolla impostazioni", il pannello parte già dai valori decisi da
+  Smart-Batch, e l'utente può correggerli a mano da lì.
+- **Pulsante "Esporta foto…"**: renderizza a piena risoluzione (non più la copia ridotta usata per
+  l'editing interattivo) e salva su un file scelto dall'utente — finestra di salvataggio nativa su
+  Windows, selettore di destinazione di sistema su Android (nessun permesso runtime richiesto). Il
+  pulsante mostra "Esportazione…" ed è disabilitato mentre il rendering finale è in corso.
 
 **Cosa NON c'è ancora in questo giro** (dichiarato, non nascosto): editor grafico della tone curve
-(trascinare i punti a mano) e slider HSL per singola banda colore — il motore li supporta già
-(`HarmonicLook`/`HarmonicLookFfi` li portano per intero da tempo), manca solo l'interfaccia; le
-maschere locali (pennello/gradiente/radiale) copiabili nei preset, la libreria/catalogo delle foto
-già modificate, e il batch reale su tante foto insieme — tutti pianificati per gli incrementi
-successivi, come discusso.
+(trascinare i punti a mano) e slider HSL per singola banda colore — il motore li supporta e li
+calcola già (Sintesi Armonica include ora anche l'estrazione HSL per banda, vedi sotto), manca solo
+l'interfaccia; le maschere locali (pennello/gradiente/radiale) copiabili nei preset, la
+libreria/catalogo delle foto già modificate, e il batch reale su tante foto insieme — tutti
+pianificati per gli incrementi successivi, come discusso.
+
+## Nuovo: rendering dal vivo mentre si trascina uno slider (`PhotoEditSession`)
+
+Richiesta esplicita dell'utente dopo un uso reale: "è veramente difficile da utilizzare" — il
+rendering avveniva solo al rilascio dello slider, e ogni chiamata ripartiva da zero: ri-decodificava
+l'intera foto target dai bytes grezzi (RAW compreso) e renderizzava a piena risoluzione originale,
+ritrasmettendo l'intera foto attraverso il confine Kotlin/nativo ogni volta.
+
+Corretto sostituendo le vecchie funzioni "usa e getta" con un nuovo oggetto nativo **stateful**,
+`PhotoEditSession`: quando si apre (o si cambia) la foto da modificare, il motore la decodifica
+UNA SOLA volta e la mantiene cacheiata in memoria in due copie — una a piena risoluzione (per
+l'export finale) e una ridotta apposta per l'editing interattivo (lato più lungo max 1024px). Ogni
+movimento di uno slider aggiorna solo lo stato leggero del Look e chiama il rendering veloce sulla
+copia ridotta già cacheiata: niente ri-decodifica, niente pixel a piena risoluzione, niente
+ri-trasmissione della foto ad ogni tick. Lato Kotlin, un `LaunchedEffect` osserva lo stato dello
+slider e richiama il rendering in background (`Dispatchers.Default`, mai sul thread della UI),
+scartando automaticamente il risultato di un rendering ormai superato non appena arriva una
+modifica più recente (`collectLatest`) — così il rendering insegue sempre l'ultima posizione dello
+slider mentre si trascina, invece di accodarsi in ritardo dietro ogni tick. Dettagli tecnici
+completi (inclusa la nuova firma UniFFI, `#[derive(uniffi::Object)]`) in
+[`engine/README.md`](engine/README.md).
+
+## Nuovo: copia dello stile più fedele (bilanciamento del bianco + HSL per banda)
+
+Insieme alla velocità, richiesto anche di migliorare quanto bene "incolla impostazioni" riproduce
+lo stile della foto campione. Due leve del motore che esistevano solo a metà sono state completate:
+
+- **Bilanciamento del bianco** (temperatura/tinta): prima dichiarato esplicitamente come non
+  applicato nel rendering. Ora è reso come guadagno per canale in spazio lineare — un'approssimazione
+  dichiarata da color grading, non un vero profilo colore camera, ma sufficiente a far corrispondere
+  meglio la temperatura quando si copia lo stile da una foto di riferimento più calda o più fredda.
+- **HSL per singola banda di colore**: la Sintesi Armonica calcolava già tone curve, contrasto,
+  esposizione e split toning dalla foto campione, ma le regolazioni HSL (hue/saturazione/luminanza
+  per 8 bande di tonalità, già supportate dal renderer) restavano sempre a zero — semplicemente non
+  venivano mai estratte. Ora vengono calcolate davvero dalla foto campione, con le stesse
+  precauzioni già applicate correggendo il bug storico dell'esposizione: sempre relative alla scena
+  stessa (mai un pivot assoluto fisso), e con una soglia minima di pixel per banda per non produrre
+  regolazioni rumorose su colori scarsamente rappresentati nella foto campione.
+
+Dettagli tecnici e formule complete in [`engine/README.md`](engine/README.md).
 
 **Onestà sulla verifica**: questo è, per distacco, il cambiamento Kotlin più esteso consegnato in
 un colpo solo finora — quasi tutto `App.kt`, più due file nuovi (`FileSaverLauncher.kt` e le sue
@@ -152,30 +193,36 @@ tecnici completi in [`engine/README.md`](engine/README.md).
 ## Cosa ho potuto verificare qui e cosa no
 
 Verificato **per davvero**, in locale, prima di questa consegna: build e test dell'intero
-workspace Rust (48 test, tutti verdi — inclusi i test aggiornati che riproducono e verificano la
-correzione del bug di esposizione/tone-curve descritta sopra: un campione scuro applicato alla
-stessa scena come target ora resta dentro al guardrail ±0.5 EV invece di produrre -1.09 EV). La
-superficie Kotlin (`pasteLookOntoTargetPhoto`, `HarmonicLookFfi`/`TonePointFfi`/`AdaptedRenderFfi`)
-non è cambiata in questo giro — solo la logica Rust sotto è stata corretta — quindi non è stato
-necessario rigenerare né ri-ispezionare i binding.
+workspace Rust (56 test, tutti verdi — inclusi i nuovi test su `PhotoEditSession`, sul
+bilanciamento del bianco reso nel renderer, e sull'estrazione HSL per banda). Rigenerati e
+ispezionati i binding Kotlin generati da UniFFI per il nuovo oggetto `PhotoEditSession`
+(confermata la forma esatta: costruttore, `renderPreview`/`renderFullResolution`/
+`pasteLookFromSample`, lifecycle `Disposable`/`AutoCloseable`/`close()`) prima di scrivere a mano
+il codice Kotlin che lo richiama.
 
 **Non verificabile da qui** (l'ambiente di sviluppo non ha un Android NDK né un PC Windows, e non
 può scaricare un NDK per una verifica autonoma — la rete di questo ambiente blocca `dl.google.com`
-per policy): l'intera build Gradle con la nuova UI (due import, uno slider, il rendering
-dell'anteprima incollata), mai compilata per davvero prima d'ora — la parte Kotlin più estesa
-consegnata finora in un colpo solo. Questa è la parte che osserveremo insieme nei log della
-prossima esecuzione su GitHub Actions: se qualcosa è rosso invece che verde, mandami il log
-dell'errore e lo sistemiamo, come abbiamo già fatto finora.
+per policy): l'intera build Gradle, in particolare le modifiche più estese di questo giro lato
+Kotlin — il nuovo `PhotoEditSession` in `Engine.kt`/`Engine.android.kt`/`Engine.desktop.kt` e la
+riscrittura di `App.kt` per il rendering dal vivo (`LaunchedEffect`/`snapshotFlow`/`collectLatest`,
+gli slider semplificati, i nuovi stati `session`/`exportBusy`). Riletto con attenzione più volte
+cercando gli errori tipici di Compose che non si vedono senza compilare (riferimenti residui a
+funzioni/parametri rimossi, chiavi ed effetti collaterali degli `Effect`, wiring degli stati) senza
+trovarne, ma resta tutto da compilare per la prima volta su CI, come sempre in questo ambiente: se
+GitHub Actions segnala un errore Kotlin/Gradle, mandami il log e lo sistemiamo, esattamente come
+fatto finora.
 
 ## Cosa manca ancora (prossimo incremento)
 
 - **Demosaic completo** per l'export a piena risoluzione (oggi `raw-decode` estrae solo
   l'anteprima incorporata dalla fotocamera, non l'immagine RAW "sviluppata" pixel per pixel) — il
-  rendering di "incolla impostazioni" lavora quindi sull'anteprima, non sul RAW pieno.
-  Il bilanciamento del bianco (temp/tint) non viene ancora applicato nel rendering per lo stesso
-  motivo (richiederebbe un profilo colore camera).
+  rendering lavora quindi sull'anteprima, non sul RAW pieno; il bilanciamento del bianco, pur ora
+  reso, resta di conseguenza un'approssimazione da color grading e non un vero profilo colore
+  camera.
 - Collegare `gpu-pipe` (gli shader WGSL già validati) alla UI per il rendering a piena risoluzione
   in tempo reale, al posto della pipeline CPU attuale.
+- Editor grafico della tone curve e slider HSL per singola banda nell'interfaccia (il motore li
+  supporta e li calcola già, vedi sopra).
 - `cache`, `catalog` (libreria/grid multi-foto), `job-scheduler` (batch reale su centinaia di
   foto insieme, non una alla volta) — oggi il flusso è a una foto campione + una foto target.
 

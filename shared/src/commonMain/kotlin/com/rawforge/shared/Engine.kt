@@ -40,40 +40,73 @@ expect object Engine {
     fun extractLookAndExportXmp(bytes: ByteArray, fileName: String, lookName: String): Result<String>
 
     /**
+     * Apre la foto da modificare per l'editing: la decodifica una sola volta
+     * (RAW-aware) e la mantiene cacheiata lato Rust (motore `PhotoEditSession`,
+     * inclusa una copia ridotta apposta per il rendering interattivo) invece
+     * di decodificarla di nuovo ad ogni singola modifica — è quello che rende
+     * possibile un feedback dal vivo mentre si trascina uno slider del
+     * pannello "Develop", non solo al rilascio. Va richiamata quando l'utente
+     * importa/cambia la foto da modificare; la sessione risultante va chiusa
+     * con `PhotoEditSession.close()` quando non serve più (una nuova foto
+     * sostituisce la precedente, o l'app si chiude) per liberare la memoria
+     * lato Rust.
+     */
+    fun openPhotoForEditing(bytes: ByteArray, fileName: String): Result<PhotoEditSession>
+}
+
+/**
+ * Una foto aperta per l'editing (vedi `Engine.openPhotoForEditing`). Incapsula
+ * la sessione nativa `PhotoEditSession` generata da UniFFI — che, come
+ * `HarmonicLookFfi`, esiste solo nelle copie platform-specific dei binding e
+ * non può quindi comparire direttamente in `commonMain` — dietro tipi comuni
+ * (`EditableLook`, `ByteArray`). `close()` va chiamata esplicitamente quando
+ * la sessione non serve più: non c'è un finalizer automatico lato Kotlin, la
+ * memoria della foto decodificata resterebbe altrimenti allocata lato Rust.
+ */
+expect class PhotoEditSession {
+    /**
      * "Incolla le impostazioni": prende il Look copiato dalla foto campione
-     * (`sampleBytes`/`sampleFileName`) e lo applica alla foto da modificare
-     * (`targetBytes`/`targetFileName`), adattandolo in modo intelligente alla
-     * scena specifica di quest'ultima — Smart-Batch Contestuale
-     * (docs/ARCHITECTURE.md, §4.2) — invece di applicarlo identico. Ritorna
-     * l'anteprima già renderizzata insieme al Look completo effettivamente
-     * applicato (`AdaptedPreview.appliedLook`): quest'ultimo è anche il punto
-     * di partenza del pannello di editing manuale, che l'utente può poi
-     * correggere a mano richiamando `renderLookOnTarget`. L'export come
-     * preset `.xmp` (`extractLookAndExportXmp`, sulla sola foto campione)
-     * resta un'azione separata e facoltativa.
+     * (`sampleBytes`/`sampleFileName`) e lo applica alla scena già cacheiata
+     * in questa sessione, adattandolo in modo intelligente — Smart-Batch
+     * Contestuale (docs/ARCHITECTURE.md, §4.2) — invece di applicarlo
+     * identico. Ritorna l'anteprima già renderizzata insieme al Look completo
+     * effettivamente applicato (`AdaptedPreview.appliedLook`): quest'ultimo è
+     * anche il punto di partenza del pannello di editing manuale, che
+     * l'utente può poi correggere a mano (`renderPreview`). L'export come
+     * preset `.xmp` (`Engine.extractLookAndExportXmp`, sulla sola foto
+     * campione) resta un'azione separata e facoltativa.
      *
      * `overrideStrength` (0f..1f) è lo slider "Intensità adattamento": 0
      * applica il Look letterale (nessun adattamento), 1 applica il massimo
      * adattamento consentito dai guardrail del motore.
      */
-    fun pasteLookOntoTarget(
+    fun pasteLookFromSample(
         sampleBytes: ByteArray,
         sampleFileName: String,
         lookName: String,
-        targetBytes: ByteArray,
-        targetFileName: String,
         overrideStrength: Float,
     ): Result<AdaptedPreview>
 
     /**
-     * Renderizza `look` (qualunque sia la sua origine: quello incollato da
-     * Smart-Batch, o quello corrente del pannello di editing manuale dopo che
-     * l'utente ha mosso uno slider) sulla foto `target` — senza rifare né
-     * l'estrazione dalla foto campione né l'adattamento, è il passo veloce
-     * richiamato a ogni modifica manuale. Non lancia mai eccezioni verso la
-     * UI: un errore del motore diventa un `Result` fallito.
+     * Renderizza `look` sulla copia RIDOTTA cacheiata da questa sessione —
+     * veloce apposta (niente ri-decodifica, niente pixel a piena
+     * risoluzione): è il passo richiamato ad ogni singola modifica di uno
+     * slider del pannello "Develop", pensato per un feedback dal vivo mentre
+     * si trascina, non solo al rilascio.
      */
-    fun renderLookOnTarget(targetBytes: ByteArray, targetFileName: String, look: EditableLook): Result<ByteArray>
+    fun renderPreview(look: EditableLook): Result<ByteArray>
+
+    /**
+     * Renderizza `look` sulla foto a piena risoluzione (l'anteprima
+     * incorporata originale, non ancora un demosaic RAW completo — limite
+     * già noto) — più lento, va usato solo per l'esportazione finale del
+     * risultato, non ad ogni modifica.
+     */
+    fun renderFullResolution(look: EditableLook): Result<ByteArray>
+
+    /** Libera la foto decodificata cacheiata lato Rust. Va chiamata quando
+     * questa sessione non serve più (nuova foto importata, o chiusura app). */
+    fun close()
 }
 
 /**
@@ -112,9 +145,9 @@ data class TonePoint(val x: Int, val y: Int)
  * `HarmonicLookFfi`. Esiste apposta perché un tipo generato da UniFFI vive
  * solo nelle copie platform-specific dei binding Kotlin (`androidMain`/
  * `desktopMain`): non può comparire nella firma di una funzione `expect` in
- * `commonMain` (vedi `pasteLookOntoTarget`/`renderLookOnTarget` sopra, e la
- * stessa nota già presente lato Rust su `paste_look_onto_target_photo`).
- * `EditableLook` è quindi lo stato che il pannello "Develop" della UI comune
+ * `commonMain` (vedi `PhotoEditSession` sopra, e la stessa nota già presente
+ * lato Rust sui metodi di `PhotoEditSession`). `EditableLook` è quindi lo
+ * stato che il pannello "Develop" della UI comune
  * tiene in memoria (uno per slider) e che le implementazioni Android/Desktop
  * convertono avanti e indietro da/verso `HarmonicLookFfi` solo al proprio
  * interno, mai attraverso il confine `expect`/`actual`.

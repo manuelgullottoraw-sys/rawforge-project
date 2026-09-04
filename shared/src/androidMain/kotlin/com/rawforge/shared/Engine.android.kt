@@ -8,8 +8,7 @@ import uniffi.rawforge_ffi.extractLookFromRawReference
 import uniffi.rawforge_ffi.extractLookFromReferenceImage
 import uniffi.rawforge_ffi.generateLightroomPresetXmp
 import uniffi.rawforge_ffi.isKnownRawFileName
-import uniffi.rawforge_ffi.pasteLookOntoTargetPhoto
-import uniffi.rawforge_ffi.renderLookOnPhoto
+import uniffi.rawforge_ffi.PhotoEditSession as NativePhotoEditSession
 
 /**
  * Converte da/verso `HarmonicLookFfi` (generato da UniFFI, esiste solo qui
@@ -64,6 +63,31 @@ private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
     highlightSat = highlightSat,
     splitToningBalance = splitToningBalance,
 )
+
+actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
+    actual fun pasteLookFromSample(
+        sampleBytes: ByteArray,
+        sampleFileName: String,
+        lookName: String,
+        overrideStrength: Float,
+    ): Result<AdaptedPreview> = runCatching {
+        val result = inner.pasteLookFromSample(sampleBytes, sampleFileName, lookName, overrideStrength)
+        AdaptedPreview(
+            renderedImageBytes = result.renderedPreviewPngBytes,
+            appliedLook = result.appliedLook.toEditable(),
+        )
+    }
+
+    actual fun renderPreview(look: EditableLook): Result<ByteArray> = runCatching {
+        inner.renderPreview(look.toFfi())
+    }
+
+    actual fun renderFullResolution(look: EditableLook): Result<ByteArray> = runCatching {
+        inner.renderFullResolution(look.toFfi())
+    }
+
+    actual fun close() = inner.close()
+}
 
 actual object Engine {
     actual fun versionInfo(): String = engineVersion()
@@ -133,30 +157,7 @@ actual object Engine {
             generateLightroomPresetXmp(look)
         }
 
-    actual fun pasteLookOntoTarget(
-        sampleBytes: ByteArray,
-        sampleFileName: String,
-        lookName: String,
-        targetBytes: ByteArray,
-        targetFileName: String,
-        overrideStrength: Float,
-    ): Result<AdaptedPreview> = runCatching {
-        val result = pasteLookOntoTargetPhoto(
-            sampleBytes,
-            sampleFileName,
-            lookName,
-            targetBytes,
-            targetFileName,
-            overrideStrength,
-        )
-        AdaptedPreview(
-            renderedImageBytes = result.renderedPreviewPngBytes,
-            appliedLook = result.appliedLook.toEditable(),
-        )
+    actual fun openPhotoForEditing(bytes: ByteArray, fileName: String): Result<PhotoEditSession> = runCatching {
+        PhotoEditSession(NativePhotoEditSession(bytes, fileName))
     }
-
-    actual fun renderLookOnTarget(targetBytes: ByteArray, targetFileName: String, look: EditableLook): Result<ByteArray> =
-        runCatching {
-            renderLookOnPhoto(targetBytes, targetFileName, look.toFfi())
-        }
 }
