@@ -62,8 +62,14 @@ impl From<HarmonicLookFfi> for core_types::HarmonicLook {
 
 #[derive(uniffi::Error, thiserror::Error, Debug)]
 pub enum EngineError {
-    #[error("impossibile decodificare l'immagine di riferimento: {message}")]
-    DecodeError { message: String },
+    // NB: il campo non può chiamarsi "message" — UniFFI genera già una proprietà
+    // `message` sulla sottoclasse Kotlin di Exception (presa dalla stringa di
+    // Display di thiserror), e un campo dati con lo stesso nome produce due
+    // dichiarazioni in conflitto nel Kotlin generato (errore reale osservato in
+    // CI: "Conflicting declarations: public open val message / public final val
+    // message"). Soluzione: rinominare il campo, qui "reason".
+    #[error("impossibile decodificare l'immagine di riferimento: {reason}")]
+    DecodeError { reason: String },
 }
 
 /// Stringa di stato del motore — usata dalla UI (pulsante "Stato motore") per
@@ -85,7 +91,7 @@ pub fn extract_look_from_reference_image(
     look_name: String,
 ) -> Result<HarmonicLookFfi, EngineError> {
     let img = image::load_from_memory(&reference_image_bytes)
-        .map_err(|e| EngineError::DecodeError { message: e.to_string() })?;
+        .map_err(|e| EngineError::DecodeError { reason: e.to_string() })?;
     let look = harmonic::extract_look_from_reference(&img, &look_name);
     Ok(look.into())
 }
