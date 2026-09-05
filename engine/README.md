@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (74 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 11, `look_render` 25, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
+Crate reali, compilati e testati (75 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 11, `look_render` 26, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -404,6 +404,80 @@ corpus — `BASELINE_CHROMA = 10.0` e il moltiplicatore `150.0` di `hsl_sat` res
 ritarare con più foto di riferimento; il principio strutturale (curve sulla luminosità, non per
 canale; bias per-banda relativo alla stessa foto) è però una correzione solida, non solo un numero.
 Workspace completo: 74 test, tutti verdi.
+
+## Corretto (questo giro): "Incolla impostazioni" desaturava ANCORA i sedili rossi sotto il livello del target originale
+
+Il giro precedente (sezione sopra) aveva verificato con uno script di debug isolato che la chroma
+MEDIA dell'intera foto migliorava (1.45 → 6.24). L'utente ha però rifatto la build (dopo un fix di
+compilazione separato, vedi sotto) e riportato che il problema persisteva sui sedili rossi
+specificamente. Rieseguito lo stesso script di debug end-to-end (`paste_look_from_sample` reale,
+non solo la formula isolata) e misurata la chroma Lab SOLO sulla regione dei sedili (una maschera
+sui pixel con saturazione HSL > 0.3, non tutta la foto): campione 36.7, target originale 35.0
+(quasi identici — il colore della pelle è simile in entrambe le foto, cambia soprattutto lo sfondo),
+render dopo "Incolla impostazioni" **18.2** — molto sotto ENTRAMBI, l'opposto dell'obiettivo.
+
+**Causa**: `vibrance` globale (-55 su questa foto, dominato da un ampio asfalto grigio quasi neutro,
+vedi sezione precedente) veniva applicato in `look-render` come moltiplicatore PIATTO
+(`global_sat_mul`) uguale per ogni pixel, qualunque fosse la sua saturazione di partenza. Un
+moltiplicatore piatto riduce la saturazione in valore ASSOLUTO più sui pixel già molto saturi (i
+sedili rossi) che su quelli quasi grigi (che di saturazione ne hanno poca da perdere) — l'esatto
+opposto di cosa significa "vibrance" in un editor fotografico reale, a differenza di "saturation":
+la vibrance è pensata per proteggere i colori già vividi (tipicamente soggetti intenzionali come
+pelle, tessuti, fiori) e agire soprattutto sui colori spenti/di sfondo. Il vecchio guardrail (clamp
+0.35..2.5 sul moltiplicatore) attutiva l'effetto ma restava piatto: stessa percentuale di riduzione
+per ogni pixel.
+
+**Corretto** sostituendo il moltiplicatore piatto con la formula standard di vibrance non lineare:
+`protezione = (1 - saturazione_attuale)²`, `moltiplicatore = 1 + vibrance × protezione`. A
+saturazione già alta (→1.0) il moltiplicatore tende a 1.0 qualunque sia `vibrance` (pixel già pieno
+di colore, protetto); a saturazione quasi nulla il moltiplicatore riceve il pieno effetto di
+`vibrance` (dove comunque non è percepibile). Il quadrato (non lineare) invece che una protezione
+lineare semplice è stato scelto DOPO aver misurato che quella lineare proteggeva a sufficienza solo i
+pixel vicinissimi alla saturazione massima, lasciando un calo ancora percepibile sulla fascia
+medio-alta (~0.6-0.7) dove ricade la pelle dei sedili in ombra. `saturation` (lo slider esplicito
+"Saturazione", diverso da "Vivacità") resta invece un moltiplicatore piatto, invariato: è un intento
+diretto dell'utente, non una statistica della foto campione da correggere.
+
+Risultato misurato sulle stesse foto vere (chroma Lab, maschera solo-sedili): 18.2 → **35.5** —
+ora praticamente identica al target originale (35.0) e al campione (36.7), invece che ben sotto
+entrambi. Nuovo test `negative_global_vibrance_protects_a_very_saturated_pixel_more_than_a_moderately_saturated_one`
+in `look-render`: con lo stesso `vibrance` fortemente negativo, un pixel molto saturo deve perdere
+una frazione relativa della propria saturazione minore di uno moderatamente saturo (mai il
+contrario), e non deve comunque perderne più del 15% — prima della correzione un pixel così ne
+perdeva oltre il 30%. Workspace completo: 75 test, tutti verdi.
+
+## Corretto (questo giro): build Windows falliva con "Unresolved reference: graphicsLayer"
+
+Riportato separatamente dall'utente prima di poter anche solo testare il fix sopra: la build
+falliva su `:shared:compileKotlinDesktop` per un import dal pacchetto sbagliato in `App.kt`
+(`androidx.compose.ui.draw.graphicsLayer` invece di `androidx.compose.ui.graphics.graphicsLayer` —
+l'estensione `Modifier.graphicsLayer` vive nel modulo `ui-graphics`, non `ui` base, a differenza di
+`clipToBounds` che invece è davvero in `draw`, da cui la confusione). Non è specifico di Windows: lo
+stesso errore avrebbe bloccato anche la build Android, essendo `App.kt` in `commonMain`.
+
+## Corretto (questo giro): layout Android illeggibile — foto compresse in verticale, impossibile vedere campione e target insieme
+
+Segnalato insieme al bug di desaturazione. Causa: sia la schermata principale di confronto sia la
+modalità "Modifica a schermo intero" usano un `Row` con un pannello Develop a larghezza FISSA (320dp
+e 360dp rispettivamente) accanto al resto del contenuto — un layout pensato per una finestra desktop
+larga, senza nessun adattamento per uno schermo stretto. Su un telefono largo 360-400dp il solo
+pannello Develop consuma quasi tutta la larghezza disponibile, lasciando alle foto pochissimi pixel
+e costringendo Compose a schiacciare in verticale tutto il resto (pulsanti, slider) pur di farlo
+stare nello spazio residuo.
+
+**Corretto** in entrambe le schermate con `BoxWithConstraints`: sotto i 700dp di larghezza
+disponibile si passa da un layout affiancato (`Row`) a uno impilato in verticale (`Column`) — stesso
+identico contenuto (stessi componenti, stesse azioni, definiti una sola volta ed estratti in lambda
+locali per evitare di duplicarli con il rischio che le due versioni divergano), disposizione diversa.
+Nella schermata di confronto le due foto restano affiancate anche nel layout stretto (il confronto
+campione/target è il punto della schermata, e un telefono ha comunque larghezza sufficiente per due
+miniature verticali — le foto usate per scoprire il bug erano proprio verticali) ma con un'altezza
+fissa (240dp) invece di condividere lo spazio con il resto della pagina; il pannello Develop passa da
+barra laterale a blocco a piena larghezza sotto le foto, con il suo scroll verticale interno
+(preesistente) invariato. Nella modalità a schermo intero, dove non c'è un blocco a contenuto fisso
+da preservare, la foto e il pannello Develop si dividono lo spazio verticale a metà. **Non verificato
+da un compilatore** (limite noto di questo ambiente per tutta la parte Kotlin/Compose): verifica
+prevista alla prossima build su GitHub Actions.
 
 ## Comandi
 

@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 74 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 75 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -578,7 +578,7 @@ test in `look-render` (`negative_contrast_and_a_real_tone_curve_do_not_collapse_
 esattamente questo meccanismo con un singolo pixel sintetico, e due nuovi test in `harmonic`
 (`saturated_band_gets_a_positive_saturation_bias_others_stay_at_zero`, riscritto per il nuovo
 confronto relativo, e `uniformly_saturated_photo_gives_no_per_band_bias_only_global_vibrance`)
-coprono il punto 1. Workspace completo: 74 test, tutti verdi.
+coprono il punto 1. Workspace completo: 75 test, tutti verdi.
 
 **Onestà su cosa resta**: due foto reali non sono un corpus — `BASELINE_CHROMA = 10.0` e il
 moltiplicatore `150.0` di `hsl_sat` restano stime, seppur ora ancorate a una misura vera invece che
@@ -599,6 +599,47 @@ davvero in `androidx.compose.ui.draw` — da qui la confusione). Corretto l'impo
 `App.kt`; nessun'altra occorrenza nel progetto. Non è un problema specifico di Windows: lo
 stesso identico errore avrebbe bloccato anche la build Android, semplicemente il job
 Windows è quello che ha girato ed è fallito per primo.
+
+## Corretto: i sedili rossi restavano desaturati anche dopo la correzione precedente
+
+Dopo il fix di compilazione sopra, l'utente ha potuto finalmente testare dal vivo la correzione
+precedente ("Incolla impostazioni" desaturava la foto target...") — e ha confermato che il problema
+persisteva sui sedili rossi delle sue foto vere, con un risultato descritto come "desaturato e
+glitchato, inutilizzabile". Rieseguendo lo stesso script di debug (questa volta misurando la chroma
+Lab SOLO sulla regione dei sedili, non su tutta la foto) è emerso che il fix precedente aveva
+davvero migliorato la chroma MEDIA dell'intera immagine, ma i sedili specificamente uscivano ancora
+molto più desaturati (18.2) sia del target originale (35.0) sia del campione (36.7) — l'opposto
+dell'obiettivo.
+
+Causa reale: `vibrance` (fortemente negativo su questa foto, per via del suo ampio asfalto grigio
+quasi neutro) veniva applicato come moltiplicatore PIATTO, uguale su ogni pixel qualunque fosse la
+sua saturazione di partenza — che riduce in valore ASSOLUTO più i pixel già molto saturi (i sedili
+rossi) di quelli quasi grigi. È l'opposto di cosa significa "vibrance" in un editor fotografico
+reale: a differenza di "saturation" (moltiplicatore piatto, intenzionale), la vibrance è pensata per
+proteggere i colori già vividi. Corretto sostituendo il moltiplicatore piatto con la formula
+standard di vibrance non lineare, che protegge quadraticamente i pixel già saturi (moltiplicatore →
+1.0, nessun effetto, quando la saturazione di partenza è già alta) e concentra l'effetto sui pixel
+quasi neutri (dove comunque non è percepibile). Risultato misurato: chroma dei sedili 18.2 → 35.5,
+ora vicina sia al target originale sia al campione. Dettagli tecnici e numeri completi in
+`engine/README.md`.
+
+## Corretto: su Android non si vedevano entrambe le foto — UI compressa in verticale
+
+Stesso messaggio dell'utente sopra segnalava anche che su Android l'app risultava "inutilizzabile":
+il pannello "Develop" a destra ha una larghezza fissa (320dp nella schermata principale, 360dp in
+"Modifica a schermo intero") pensata per una finestra desktop larga; su un telefono (tipicamente
+360-400dp di larghezza TOTALE) quel solo pannello consuma quasi tutto lo schermo, lasciando alle foto
+pochi pixel e costringendo il resto del contenuto (pulsanti, slider) a schiacciarsi in verticale per
+starci comunque.
+
+Corretto in entrambe le schermate: sotto una soglia di larghezza (700dp) il layout passa da
+affiancato a impilato verticalmente — stesso contenuto, disposizione diversa, decisa a runtime in
+base allo spazio davvero disponibile invece che assumere sempre una finestra larga. Sulla schermata
+di confronto le due foto restano affiancate (c'è comunque spazio per due miniature anche su un
+telefono) con un'altezza fissa, e il pannello Develop scende sotto a piena larghezza; nella modalità
+a schermo intero foto e pannello Develop si dividono lo spazio verticale a metà. **Non verificabile
+in questo ambiente** (limite noto, solo Rust è testabile localmente qui): la verifica reale resta la
+prossima build Android su GitHub Actions.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

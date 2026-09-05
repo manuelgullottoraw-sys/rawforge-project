@@ -297,14 +297,43 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     // al comportamento pre-esistente a guadagno singolo.
     let wb_gain_a = compute_wb_gain(&look.white_balance);
     let wb_gain_b = compute_wb_gain(&look.white_balance_b);
-    // Guardrail: anche se `saturation`/`vibrance` in teoria arrivano da
-    // `HarmonicLook` già limitati a +-100, mai spingere il moltiplicatore di
-    // saturazione globale a un estremo che desaturi (quasi) completamente o
-    // esploda l'immagine — un Look estratto da una scena con ampie zone quasi
-    // neutre (es. asfalto, cielo uniforme) può produrre una stima di vibrance
-    // molto negativa che, da sola, non rappresenta l'intento stilistico da
-    // trasferire quanto un artefatto della composizione della foto campione.
-    let global_sat_mul = (1.0 + (look.saturation as f32 / 100.0) + (look.vibrance as f32 / 200.0)).clamp(0.35, 2.5);
+    // `saturation` resta un moltiplicatore piatto (uniforme su ogni pixel,
+    // qualunque sia la sua saturazione di partenza) — è lo slider esplicito
+    // "Saturazione" dell'utente, un intento diretto da applicare così com'è.
+    let saturation_mul = 1.0 + (look.saturation as f32 / 100.0);
+    // `vibrance` invece NON è più un moltiplicatore piatto (era il bug reale
+    // scoperto in questo giro, segnalato dall'utente con due foto vere: dopo
+    // "Incolla impostazioni" i sedili rossi del campione — già molto saturi —
+    // uscivano PIÙ desaturati della foto target originale, l'opposto di
+    // quanto ci si aspetterebbe copiando lo stile di una foto che quei rossi
+    // li aveva vividi). Misurato sulle foto vere: chroma Lab dei sedili
+    // 21.98 (target originale) -> 18.17 (dopo incolla, con il vecchio
+    // moltiplicatore piatto) invece di avvicinarsi ai 27.23 del campione.
+    // Causa: `vibrance` viene estratto come UNA media sull'intera foto
+    // campione, dominata qui dall'ampio asfalto grigio quasi neutro (che
+    // fa scendere la chroma media a ~4.5, ben sotto BASELINE_CHROMA=10,
+    // producendo vibrance=-55) — ma applicato poi come moltiplicatore PIATTO
+    // su OGNI pixel del target, quello stesso -55 colpiva in valore assoluto
+    // proprio i pixel già più saturi (i sedili rossi) più forte dei pixel
+    // già quasi grigi (che hanno poca saturazione da perdere) — l'opposto di
+    // cosa significa "vibrance" in qualunque editor fotografico reale (a
+    // differenza di "saturation", la vibrance protegge i colori già vividi e
+    // agisce di più su quelli spenti, proprio per evitare che uno sfondo
+    // neutro schiacci un soggetto colorato). Il vecchio guardrail (clamp
+    // 0.35..2.5 sul moltiplicatore) attutiva l'effetto ma restava piatto:
+    // stessa percentuale di riduzione per un pixel quasi grigio e per un
+    // pixel rosso vivo, quindi il soggetto saturo perdeva comunque più
+    // saturazione assoluta dello sfondo. Corretto sostituendo il
+    // moltiplicatore piatto con la formula standard di vibrance non lineare
+    // (vedi uso più sotto, vicino a `hsl[1] = ...`): l'effetto per-pixel ora
+    // dipende dalla saturazione ATTUALE di quel pixel, protegge quasi del
+    // tutto i pixel già molto saturi (moltiplicatore -> 1.0 quando
+    // `base_sat` -> 1.0, qualunque sia `vibrance`) e agisce quasi per intero
+    // su quelli quasi neutri — dove non è comunque percepibile. Per questo
+    // il vecchio clamp guardrail (0.35..2.5) non serve più: la formula è già
+    // limitata per costruzione (mai sotto 0 né sopra circa 2 per i range
+    // leciti di `vibrance`), niente da ricalibrare con un numero arbitrario.
+    let vibrance_amount = (look.vibrance as f32 / 100.0).clamp(-1.0, 1.0);
 
     let mut out = rgba.clone();
     out.par_chunks_mut(row_stride)
@@ -413,7 +442,41 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                 let sat_adjust = interpolate_hsl_band(&look.hsl.sat, hsl[0]);
                 let lum_adjust = interpolate_hsl_band(&look.hsl.lum, hsl[0]);
                 hsl[0] = (hsl[0] + hue_adjust).rem_euclid(360.0);
-                hsl[1] = (hsl[1] * (1.0 + sat_adjust / 100.0) * global_sat_mul).clamp(0.0, 1.0);
+                // Bias per banda (hue-selettivo, trasferito dal campione) e
+                // saturazione piatta (intento esplicito dell'utente) prima,
+                // come già facevano: solo l'ordine con cui entra la vibrance
+                // (subito sotto) è cambiato.
+                let base_sat = (hsl[1] * (1.0 + sat_adjust / 100.0) * saturation_mul).clamp(0.0, 1.0);
+                // Vibrance non lineare: protegge i pixel già saturi (vedi
+                // commento esteso sopra, vicino a `vibrance_amount`). A
+                // `base_sat` -> 1.0 il moltiplicatore tende a 1.0 qualunque
+                // sia `vibrance_amount` (il pixel è già pieno di colore, non
+                // c'è altro da togliere né altro spazio per aggiungerne); a
+                // `base_sat` -> 0.0 il moltiplicatore tende a
+                // `1.0 + vibrance_amount` (pieno effetto, ma su un pixel
+                // già quasi grigio dove non è comunque percepibile).
+                // `protection` è il QUADRATO di `(1 - base_sat)`, non lineare:
+                // misurato sulle foto vere dell'utente, una protezione lineare
+                // (provata per prima) lasciava comunque un calo percepibile
+                // sui sedili rossi del target — già quasi identici in
+                // saturazione a quelli della foto campione (chroma Lab
+                // misurata: 35.0 target originale vs 36.7 campione, quasi
+                // uguali) — perché a saturazione "solo" medio-alta (non
+                // ancora vicinissima a 1.0, es. ~0.65-0.7, tipica di pelle in
+                // ombra) il fattore lineare `(1-base_sat)` è ancora abbastanza
+                // grande da lasciar passare una riduzione notabile. Il
+                // quadrato scende più ripidamente: a base_sat=0.68 la
+                // protezione lineare vale 0.32 (riduzione ancora forte), il
+                // quadrato vale 0.10 (riduzione quasi trascurabile) — cioè
+                // protegge sul serio non solo i pixel "già al 100% saturi" in
+                // senso stretto ma l'intera fascia alta di saturazione, dove
+                // in pratica ricadono i soggetti colorati intenzionali di una
+                // foto (pelle, tessuti, fiori...) a differenza dello sfondo
+                // quasi neutro che la vibrance globale della foto campione
+                // intende davvero attenuare.
+                let protection = (1.0 - base_sat) * (1.0 - base_sat);
+                let vibrance_mul = 1.0 + vibrance_amount * protection;
+                hsl[1] = (base_sat * vibrance_mul).clamp(0.0, 1.0);
                 hsl[2] = (hsl[2] + lum_adjust / 200.0).clamp(0.0, 1.0);
 
                 let shadow_weight = shadow_mask(hsl[2]);
@@ -818,6 +881,57 @@ mod tests {
             "salto di saturazione troppo grande attorno al confine banda: below={} above={}",
             hsl_below[1],
             hsl_above[1]
+        );
+    }
+
+    #[test]
+    fn negative_global_vibrance_protects_a_very_saturated_pixel_more_than_a_moderately_saturated_one() {
+        // Bug reale scoperto e corretto in questo giro, segnalato dall'utente
+        // con due foto vere (i sedili rossi di un'auto): "Incolla impostazioni"
+        // da una foto campione con un ampio sfondo quasi neutro (es. asfalto
+        // grigio) produce un `vibrance` globale molto negativo (misurato:
+        // -55 su una foto vera) — ma applicarlo come moltiplicatore PIATTO
+        // (com'era prima) colpisce in valore ASSOLUTO proprio i pixel già più
+        // saturi (il soggetto colorato, es. pelle rossa dei sedili) più forte
+        // dei pixel già quasi grigi (che di saturazione ne hanno poca da
+        // perdere) — l'opposto di cosa significa "vibrance" in un editor
+        // fotografico reale, a differenza di "saturation". Qui due pixel
+        // sintetici con la STESSA tinta ma saturazione HSL di partenza
+        // diversa (uno moderato, uno molto vicino al pieno): con lo stesso
+        // `vibrance` molto negativo, il pixel più saturo deve perdere una
+        // frazione RELATIVA della propria saturazione minore di quello
+        // moderatamente saturo — mai il contrario.
+        let mut look = HarmonicLook::default();
+        look.vibrance = -55;
+
+        let moderate_rgb = hsl_to_rgb([0.0, 0.45, 0.5]);
+        let vivid_rgb = hsl_to_rgb([0.0, 0.95, 0.5]);
+        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let img_moderate = solid_image(4, 4, [to_u8(moderate_rgb[0]), to_u8(moderate_rgb[1]), to_u8(moderate_rgb[2])]);
+        let img_vivid = solid_image(4, 4, [to_u8(vivid_rgb[0]), to_u8(vivid_rgb[1]), to_u8(vivid_rgb[2])]);
+
+        let sat_of = |img: &DynamicImage| {
+            let rendered = render_preview_with_look(img, &look).to_rgba8();
+            let px = rendered.get_pixel(0, 0);
+            rgb_to_hsl([px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0])[1]
+        };
+
+        let moderate_relative_drop = 1.0 - sat_of(&img_moderate) / 0.45;
+        let vivid_relative_drop = 1.0 - sat_of(&img_vivid) / 0.95;
+
+        assert!(
+            vivid_relative_drop < moderate_relative_drop,
+            "un pixel molto saturo deve perdere una frazione minore della propria saturazione di uno moderato: \
+             calo relativo moderato={moderate_relative_drop:.3} vivido={vivid_relative_drop:.3}"
+        );
+        // Guardrail assoluto (non solo relativo): sulle foto vere che hanno
+        // fatto scoprire il bug, i sedili (saturazione HSL originale ~0.6-0.7)
+        // non devono perdere più del 15% della propria saturazione per un
+        // `vibrance` di questa entità — prima della correzione ne perdevano
+        // oltre il 30% (moltiplicatore piatto 0.725).
+        assert!(
+            vivid_relative_drop < 0.15,
+            "un pixel molto saturo non deve perdere più del 15% della saturazione: calo={vivid_relative_drop:.3}"
         );
     }
 

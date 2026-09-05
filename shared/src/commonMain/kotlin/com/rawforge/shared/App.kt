@@ -406,190 +406,300 @@ fun RawForgeApp() {
                         highlightClipFraction = preview?.highlightClipFraction,
                     )
                 } else {
-                Row(modifier = Modifier.fillMaxSize()) {
-                    // Colonna principale: le due foto affiancate + le azioni
-                    // di "incolla impostazioni" ed esporta. Niente scroll
-                    // qui: le immagini si ridimensionano per stare entrambe
-                    // a video, come nel modulo Develop di Lightroom.
-                    Column(modifier = Modifier.weight(1f).fillMaxHeight().padding(16.dp)) {
-                        Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                            PhotoPanel(
-                                modifier = Modifier.weight(1f).fillMaxHeight().padding(end = 8.dp),
-                                title = "Campione (il look da copiare)",
-                                state = sampleState,
-                                error = sampleError,
-                                onImportClick = { launchSamplePicker() },
-                                importLabel = "Importa foto campione…",
-                            ) {
-                                Spacer(Modifier.height(8.dp))
-                                Button(
-                                    onClick = {
-                                        val sample = sampleState ?: return@Button
-                                        harmonicError = null
-                                        presetSaveMessage = null
-                                        presetSaveError = null
-                                        Engine.extractLookAndExportXmp(
-                                            sample.rawBytes,
-                                            sample.fileName,
-                                            "Look da ${sample.fileName}"
-                                        ).fold(
-                                            onSuccess = { xmp ->
-                                                harmonicXmp = xmp
-                                                // Subito dopo aver calcolato il preset, chiede
-                                                // all'utente dove salvarlo — non solo
-                                                // un'anteprima di testo come prima.
-                                                val suggested = sample.fileName.substringBeforeLast('.') + "_look.xmp"
-                                                launchExportXmp(xmp, suggested)
-                                            },
-                                            onFailure = { error -> harmonicError = error.message ?: "Errore sconosciuto" }
-                                        )
+                // Sotto una soglia di larghezza (telefoni, sia in verticale
+                // che orizzontale su molti dispositivi) il layout "desktop"
+                // qui sotto — due foto affiancate a sinistra + un pannello
+                // Develop a larghezza FISSA di 320dp a destra — non ha spazio
+                // per respirare: su un telefono largo 360-400dp il solo
+                // pannello Develop consuma quasi tutta la larghezza
+                // disponibile, lasciando alle due foto pochissimi pixel e
+                // costringendo Compose a schiacciare in verticale il resto
+                // del contenuto (pulsanti, slider) pur di farcelo stare —
+                // il problema segnalato dall'utente ("mi comprime in
+                // verticale la UI e l'app diventa inutilizzabile").
+                // `BoxWithConstraints` misura la larghezza disponibile e
+                // sceglie fra due composizioni alternative dello STESSO
+                // contenuto (stessi componenti, stesse azioni, definite una
+                // volta sola qui sotto come lambda locali): affiancata
+                // (larga) o impilata verticalmente (stretta) — non un
+                // ridimensionamento proporzionale, che a queste larghezze
+                // non basterebbe comunque.
+                BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                    val isWide = maxWidth > 700.dp
+
+                    val sampleActions: @Composable ColumnScope.() -> Unit = {
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                val sample = sampleState ?: return@Button
+                                harmonicError = null
+                                presetSaveMessage = null
+                                presetSaveError = null
+                                Engine.extractLookAndExportXmp(
+                                    sample.rawBytes,
+                                    sample.fileName,
+                                    "Look da ${sample.fileName}"
+                                ).fold(
+                                    onSuccess = { xmp ->
+                                        harmonicXmp = xmp
+                                        // Subito dopo aver calcolato il preset, chiede
+                                        // all'utente dove salvarlo — non solo
+                                        // un'anteprima di testo come prima.
+                                        val suggested = sample.fileName.substringBeforeLast('.') + "_look.xmp"
+                                        launchExportXmp(xmp, suggested)
                                     },
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
-                                ) {
-                                    Text("Esporta preset .xmp", style = MaterialTheme.typography.caption)
-                                }
-                                harmonicError?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
-                                }
-                                presetSaveError?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
-                                }
-                                presetSaveMessage?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text(it, style = MaterialTheme.typography.caption, color = TextMuted)
-                                }
-                                harmonicXmp?.let {
-                                    Spacer(Modifier.height(4.dp))
+                                    onFailure = { error -> harmonicError = error.message ?: "Errore sconosciuto" }
+                                )
+                            },
+                            colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
+                        ) {
+                            Text("Esporta preset .xmp", style = MaterialTheme.typography.caption)
+                        }
+                        harmonicError?.let {
+                            Spacer(Modifier.height(4.dp))
+                            Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                        }
+                        presetSaveError?.let {
+                            Spacer(Modifier.height(4.dp))
+                            Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                        }
+                        presetSaveMessage?.let {
+                            Spacer(Modifier.height(4.dp))
+                            Text(it, style = MaterialTheme.typography.caption, color = TextMuted)
+                        }
+                        harmonicXmp?.let {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                it.take(300) + if (it.length > 300) "\n… (troncato)" else "",
+                                style = MaterialTheme.typography.caption,
+                                color = TextMuted,
+                            )
+                        }
+                    }
+
+                    val targetActions: @Composable ColumnScope.() -> Unit = {
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { exportCurrentPhoto() },
+                                enabled = session != null && !exportBusy,
+                                shape = PillShape,
+                                colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
+                            ) {
+                                Text(if (exportBusy) "Esportazione…" else "Esporta foto…", style = MaterialTheme.typography.caption)
+                            }
+                            // Modalità "Develop" a schermo intero, in stile
+                            // Lightroom: foto grande + pannello di editing,
+                            // niente confronto affiancato con il campione —
+                            // pensata per il fine-tuning dopo un eventuale
+                            // "Incolla impostazioni" (ma disponibile anche
+                            // per editare a mano da zero).
+                            Button(
+                                onClick = { fullScreenEditing = true },
+                                enabled = session != null,
+                                shape = PillShape,
+                                colors = ButtonDefaults.buttonColors(backgroundColor = AccentBlue),
+                            ) {
+                                Text("Modifica a schermo intero", style = MaterialTheme.typography.caption)
+                            }
+                        }
+                        exportMessage?.let {
+                            Spacer(Modifier.height(4.dp))
+                            Text(it, style = MaterialTheme.typography.caption, color = TextMuted)
+                        }
+                        exportError?.let {
+                            Spacer(Modifier.height(4.dp))
+                            Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                        }
+                    }
+
+                    // Card "Incolla impostazioni": identica in entrambi i
+                    // layout, si autoesclude finché non sono aperte sia la
+                    // foto campione sia quella da modificare.
+                    val pasteSettingsCard: @Composable () -> Unit = {
+                        if (sampleState != null && targetState != null) {
+                            PanelCard(modifier = Modifier.fillMaxWidth()) {
+                                Column(modifier = Modifier.padding(16.dp)) {
                                     Text(
-                                        it.take(300) + if (it.length > 300) "\n… (troncato)" else "",
+                                        "Intensità adattamento: ${(overrideStrength * 100).roundToInt()}% " +
+                                            "(0% = impostazioni identiche alla foto campione, " +
+                                            "100% = massimo adattamento intelligente alla scena)",
                                         style = MaterialTheme.typography.caption,
                                         color = TextMuted,
                                     )
-                                }
-                            }
-
-                            PhotoPanel(
-                                modifier = Modifier.weight(1f).fillMaxHeight().padding(start = 8.dp),
-                                title = "Foto da modificare",
-                                state = targetState,
-                                error = targetError ?: sessionError,
-                                onImportClick = { launchTargetPicker() },
-                                importLabel = "Apri foto da modificare…",
-                                overrideBitmap = preview?.bitmap,
-                            ) {
-                                Spacer(Modifier.height(8.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Slider(
+                                        value = overrideStrength,
+                                        onValueChange = { overrideStrength = it },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
                                     Button(
-                                        onClick = { exportCurrentPhoto() },
-                                        enabled = session != null && !exportBusy,
                                         shape = PillShape,
-                                        colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
-                                    ) {
-                                        Text(if (exportBusy) "Esportazione…" else "Esporta foto…", style = MaterialTheme.typography.caption)
-                                    }
-                                    // Modalità "Develop" a schermo intero, in stile
-                                    // Lightroom: foto grande + pannello di editing,
-                                    // niente confronto affiancato con il campione —
-                                    // pensata per il fine-tuning dopo un eventuale
-                                    // "Incolla impostazioni" (ma disponibile anche
-                                    // per editare a mano da zero).
-                                    Button(
-                                        onClick = { fullScreenEditing = true },
+                                        onClick = {
+                                            val sample = sampleState
+                                            val activeSession = session
+                                            if (sample == null || activeSession == null) return@Button
+                                            pasteError = null
+                                            activeSession.pasteLookFromSample(
+                                                sampleBytes = sample.rawBytes,
+                                                sampleFileName = sample.fileName,
+                                                lookName = "Look da ${sample.fileName}",
+                                                overrideStrength = overrideStrength,
+                                            ).fold(
+                                                onSuccess = { adapted ->
+                                                    currentLook = adapted.appliedLook
+                                                    editIntensity = 1f
+                                                    preview = PreviewState(
+                                                        adapted.renderedImageBytes,
+                                                        decodeImageBitmapOrNull(adapted.renderedImageBytes),
+                                                    )
+                                                },
+                                                onFailure = { error -> pasteError = error.message ?: "Errore sconosciuto" }
+                                            )
+                                        },
                                         enabled = session != null,
-                                        shape = PillShape,
-                                        colors = ButtonDefaults.buttonColors(backgroundColor = AccentBlue),
                                     ) {
-                                        Text("Modifica a schermo intero", style = MaterialTheme.typography.caption)
+                                        Text("Incolla impostazioni (adattamento intelligente)")
+                                    }
+                                    pasteError?.let {
+                                        Spacer(Modifier.height(4.dp))
+                                        Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                                    }
+                                    renderError?.let {
+                                        Spacer(Modifier.height(4.dp))
+                                        Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
                                     }
                                 }
-                                exportMessage?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text(it, style = MaterialTheme.typography.caption, color = TextMuted)
-                                }
-                                exportError?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
-                                }
-                            }
-                        }
-
-                        if (sampleState != null && targetState != null) {
-                            Spacer(Modifier.height(12.dp))
-                            PanelCard(modifier = Modifier.fillMaxWidth()) {
-                            Column(
-                                modifier = Modifier.padding(16.dp)
-                            ) {
-                                Text(
-                                    "Intensità adattamento: ${(overrideStrength * 100).roundToInt()}% " +
-                                        "(0% = impostazioni identiche alla foto campione, " +
-                                        "100% = massimo adattamento intelligente alla scena)",
-                                    style = MaterialTheme.typography.caption,
-                                    color = TextMuted,
-                                )
-                                Slider(
-                                    value = overrideStrength,
-                                    onValueChange = { overrideStrength = it },
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                                Button(
-                                    shape = PillShape,
-                                    onClick = {
-                                        val sample = sampleState
-                                        val activeSession = session
-                                        if (sample == null || activeSession == null) return@Button
-                                        pasteError = null
-                                        activeSession.pasteLookFromSample(
-                                            sampleBytes = sample.rawBytes,
-                                            sampleFileName = sample.fileName,
-                                            lookName = "Look da ${sample.fileName}",
-                                            overrideStrength = overrideStrength,
-                                        ).fold(
-                                            onSuccess = { adapted ->
-                                                currentLook = adapted.appliedLook
-                                                editIntensity = 1f
-                                                preview = PreviewState(
-                                                    adapted.renderedImageBytes,
-                                                    decodeImageBitmapOrNull(adapted.renderedImageBytes),
-                                                )
-                                            },
-                                            onFailure = { error -> pasteError = error.message ?: "Errore sconosciuto" }
-                                        )
-                                    },
-                                    enabled = session != null,
-                                ) {
-                                    Text("Incolla impostazioni (adattamento intelligente)")
-                                }
-                                pasteError?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
-                                }
-                                renderError?.let {
-                                    Spacer(Modifier.height(4.dp))
-                                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
-                                }
-                            }
                             }
                         }
                     }
 
-                    if (targetState != null) {
-                        // Non `Divider`: quel componente applica al suo interno
-                        // `.fillMaxWidth().height(thickness)` DOPO il modifier
-                        // passato, quindi ignorerebbe la larghezza fissa/altezza
-                        // piena richieste qui per un separatore verticale.
-                        Box(modifier = Modifier.fillMaxHeight().width(1.dp).background(PanelDivider))
-                        DevelopPanel(
-                            modifier = Modifier.width(320.dp).fillMaxHeight(),
-                            look = currentLook,
-                            onEdit = { mutate -> currentLook = mutate(currentLook) },
-                            onReset = { currentLook = EditableLook(); editIntensity = 1f },
-                            editIntensity = editIntensity,
-                            onEditIntensityChange = { editIntensity = it },
-                            shadowClipFraction = preview?.shadowClipFraction,
-                            highlightClipFraction = preview?.highlightClipFraction,
-                        )
+                    if (isWide) {
+                        Row(modifier = Modifier.fillMaxSize()) {
+                            // Colonna principale: le due foto affiancate + le azioni
+                            // di "incolla impostazioni" ed esporta. Niente scroll
+                            // qui: le immagini si ridimensionano per stare entrambe
+                            // a video, come nel modulo Develop di Lightroom.
+                            Column(modifier = Modifier.weight(1f).fillMaxHeight().padding(16.dp)) {
+                                Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                                    PhotoPanel(
+                                        modifier = Modifier.weight(1f).fillMaxHeight().padding(end = 8.dp),
+                                        title = "Campione (il look da copiare)",
+                                        state = sampleState,
+                                        error = sampleError,
+                                        onImportClick = { launchSamplePicker() },
+                                        importLabel = "Importa foto campione…",
+                                        actions = sampleActions,
+                                    )
+
+                                    PhotoPanel(
+                                        modifier = Modifier.weight(1f).fillMaxHeight().padding(start = 8.dp),
+                                        title = "Foto da modificare",
+                                        state = targetState,
+                                        error = targetError ?: sessionError,
+                                        onImportClick = { launchTargetPicker() },
+                                        importLabel = "Apri foto da modificare…",
+                                        overrideBitmap = preview?.bitmap,
+                                        actions = targetActions,
+                                    )
+                                }
+
+                                Spacer(Modifier.height(12.dp))
+                                pasteSettingsCard()
+                            }
+
+                            if (targetState != null) {
+                                // Non `Divider`: quel componente applica al suo interno
+                                // `.fillMaxWidth().height(thickness)` DOPO il modifier
+                                // passato, quindi ignorerebbe la larghezza fissa/altezza
+                                // piena richieste qui per un separatore verticale.
+                                Box(modifier = Modifier.fillMaxHeight().width(1.dp).background(PanelDivider))
+                                DevelopPanel(
+                                    modifier = Modifier.width(320.dp).fillMaxHeight(),
+                                    look = currentLook,
+                                    onEdit = { mutate -> currentLook = mutate(currentLook) },
+                                    onReset = { currentLook = EditableLook(); editIntensity = 1f },
+                                    editIntensity = editIntensity,
+                                    onEditIntensityChange = { editIntensity = it },
+                                    shadowClipFraction = preview?.shadowClipFraction,
+                                    highlightClipFraction = preview?.highlightClipFraction,
+                                )
+                            }
+                        }
+                    } else {
+                        // Layout stretto (telefono): tutto impilato in
+                        // verticale invece che affiancato. Le due foto
+                        // restano una accanto all'altra (il confronto
+                        // campione/target è il punto centrale di questa
+                        // schermata, e anche un telefono stretto ha
+                        // abbastanza larghezza per due miniature verticali:
+                        // sono per lo più foto in verticale, come quelle
+                        // usate per scoprire questo bug) ma con un'altezza
+                        // FISSA invece di condividere `weight(1f)` con il
+                        // resto della pagina; il pannello Develop passa da
+                        // barra laterale a larghezza fissa a blocco a piena
+                        // larghezza SOTTO le foto, con un'altezza assegnata
+                        // via `weight` invece di `fillMaxHeight()` (che qui
+                        // non avrebbe un limite finito da riempire) — il suo
+                        // scroll verticale interno (già presente, vedi
+                        // `DevelopPanel`) resta invariato, ora semplicemente
+                        // su un'area più bassa e larga invece che stretta e
+                        // alta.
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            // Niente `weight` qui: questo blocco (foto ad
+                            // altezza fissa + card "incolla impostazioni")
+                            // deve occupare solo lo spazio che il suo
+                            // contenuto richiede davvero, non una quota
+                            // proporzionale fissa dello schermo — altrimenti
+                            // uno split 50/50 con `DevelopPanel` sotto
+                            // rischierebbe di tagliare il contenuto di
+                            // QUESTO blocco (che non ha scroll proprio) su
+                            // schermi bassi, mentre `DevelopPanel` (che ha
+                            // già il suo scroll interno) può assorbire
+                            // tranquillamente tutto lo spazio residuo,
+                            // qualunque esso sia.
+                            Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                                Row(modifier = Modifier.height(240.dp).fillMaxWidth()) {
+                                    PhotoPanel(
+                                        modifier = Modifier.weight(1f).fillMaxHeight().padding(end = 8.dp),
+                                        title = "Campione (il look da copiare)",
+                                        state = sampleState,
+                                        error = sampleError,
+                                        onImportClick = { launchSamplePicker() },
+                                        importLabel = "Importa foto campione…",
+                                        actions = sampleActions,
+                                    )
+
+                                    PhotoPanel(
+                                        modifier = Modifier.weight(1f).fillMaxHeight().padding(start = 8.dp),
+                                        title = "Foto da modificare",
+                                        state = targetState,
+                                        error = targetError ?: sessionError,
+                                        onImportClick = { launchTargetPicker() },
+                                        importLabel = "Apri foto da modificare…",
+                                        overrideBitmap = preview?.bitmap,
+                                        actions = targetActions,
+                                    )
+                                }
+
+                                Spacer(Modifier.height(12.dp))
+                                pasteSettingsCard()
+                            }
+
+                            if (targetState != null) {
+                                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(PanelDivider))
+                                DevelopPanel(
+                                    modifier = Modifier.fillMaxWidth().weight(1f),
+                                    look = currentLook,
+                                    onEdit = { mutate -> currentLook = mutate(currentLook) },
+                                    onReset = { currentLook = EditableLook(); editIntensity = 1f },
+                                    editIntensity = editIntensity,
+                                    onEditIntensityChange = { editIntensity = it },
+                                    shadowClipFraction = preview?.shadowClipFraction,
+                                    highlightClipFraction = preview?.highlightClipFraction,
+                                    shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
+                                )
+                            }
+                        }
                     }
                 }
                 }
@@ -650,41 +760,75 @@ private fun FullScreenDevelopView(
                 modifier = Modifier.fillMaxWidth().background(PanelSurface).padding(horizontal = 16.dp, vertical = 4.dp),
             )
         }
-        Row(modifier = Modifier.fillMaxSize()) {
-            Box(
-                modifier = Modifier.weight(1f).fillMaxHeight().background(PanelBackground).padding(16.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (bitmap != null) {
-                    ZoomableImage(
-                        bitmap = bitmap,
-                        contentDescription = title,
-                        resetKey = title,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else {
-                    Text("Rendering in corso…", style = MaterialTheme.typography.caption, color = TextMuted)
+        // Stessa logica di `App` (vedi commento esteso lì): sotto una certa
+        // larghezza un pannello Develop a 360dp fissi accanto alla foto non
+        // lascia spazio a nessuno dei due. `BoxWithConstraints` sceglie fra
+        // affiancato (largo) e impilato (stretto, foto sopra/pannello sotto,
+        // divisi a metà — qui, a differenza della schermata di confronto,
+        // NON c'è un blocco a contenuto fisso da preservare: la foto si
+        // adatta a qualunque riquadro le venga dato, quindi uno split 1:1
+        // va bene per entrambi).
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val isWide = maxWidth > 700.dp
+
+            val photoBox: @Composable (Modifier) -> Unit = { boxModifier ->
+                Box(
+                    modifier = boxModifier.background(PanelBackground).padding(16.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (bitmap != null) {
+                        ZoomableImage(
+                            bitmap = bitmap,
+                            contentDescription = title,
+                            resetKey = title,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    } else {
+                        Text("Rendering in corso…", style = MaterialTheme.typography.caption, color = TextMuted)
+                    }
+                    renderError?.let {
+                        Text(
+                            "Errore: $it",
+                            color = MaterialTheme.colors.error,
+                            style = MaterialTheme.typography.caption,
+                            modifier = Modifier.align(Alignment.BottomCenter).background(PanelSurface).padding(8.dp),
+                        )
+                    }
                 }
-                renderError?.let {
-                    Text(
-                        "Errore: $it",
-                        color = MaterialTheme.colors.error,
-                        style = MaterialTheme.typography.caption,
-                        modifier = Modifier.align(Alignment.BottomCenter).background(PanelSurface).padding(8.dp),
+            }
+
+            if (isWide) {
+                Row(modifier = Modifier.fillMaxSize()) {
+                    photoBox(Modifier.weight(1f).fillMaxHeight())
+                    Box(modifier = Modifier.fillMaxHeight().width(1.dp).background(PanelDivider))
+                    DevelopPanel(
+                        modifier = Modifier.width(360.dp).fillMaxHeight(),
+                        look = look,
+                        onEdit = onEdit,
+                        onReset = onReset,
+                        editIntensity = editIntensity,
+                        onEditIntensityChange = onEditIntensityChange,
+                        shadowClipFraction = shadowClipFraction,
+                        highlightClipFraction = highlightClipFraction,
+                    )
+                }
+            } else {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    photoBox(Modifier.weight(1f).fillMaxWidth())
+                    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(PanelDivider))
+                    DevelopPanel(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        look = look,
+                        onEdit = onEdit,
+                        onReset = onReset,
+                        editIntensity = editIntensity,
+                        onEditIntensityChange = onEditIntensityChange,
+                        shadowClipFraction = shadowClipFraction,
+                        highlightClipFraction = highlightClipFraction,
+                        shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
                     )
                 }
             }
-            Box(modifier = Modifier.fillMaxHeight().width(1.dp).background(PanelDivider))
-            DevelopPanel(
-                modifier = Modifier.width(360.dp).fillMaxHeight(),
-                look = look,
-                onEdit = onEdit,
-                onReset = onReset,
-                editIntensity = editIntensity,
-                onEditIntensityChange = onEditIntensityChange,
-                shadowClipFraction = shadowClipFraction,
-                highlightClipFraction = highlightClipFraction,
-            )
         }
     }
 }
@@ -866,6 +1010,13 @@ private fun DevelopPanel(
     onEditIntensityChange: (Float) -> Unit,
     shadowClipFraction: Float? = null,
     highlightClipFraction: Float? = null,
+    // Angoli arrotondati solo a sinistra di default: il caso d'uso storico
+    // (finestra larga) tiene questo pannello incollato al bordo destro dello
+    // schermo. Nel layout stretto per telefono (vedi `App`) il pannello
+    // diventa invece un blocco a piena larghezza in fondo alla pagina, e il
+    // chiamante passa una forma diversa (arrotondata solo in alto) — da qui
+    // il parametro invece di una forma fissa.
+    shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp),
 ) {
     // "Slider sicuri" (idea approvata, vedi README.md): solo un avviso sul
     // valore CORRENTE — quanto di QUESTO rendering sta bruciando le luci o
@@ -873,12 +1024,8 @@ private fun DevelopPanel(
     // slider (richiederebbe ri-renderizzare per ogni posizione possibile).
     val highlightsClipping = (highlightClipFraction ?: 0f) > CLIP_WARNING_THRESHOLD
     val shadowsClipping = (shadowClipFraction ?: 0f) > CLIP_WARNING_THRESHOLD
-    // Angoli arrotondati solo sul lato sinistro: il pannello sta comunque
-    // incollato al bordo destro della finestra, arrotondarlo tutto intorno
-    // avrebbe un aspetto strano contro il bordo dello schermo.
-    val sidePanelShape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
     Column(
-        modifier = modifier.background(PanelSurface, sidePanelShape).verticalScroll(rememberScrollState()).padding(20.dp),
+        modifier = modifier.background(PanelSurface, shape).verticalScroll(rememberScrollState()).padding(20.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
