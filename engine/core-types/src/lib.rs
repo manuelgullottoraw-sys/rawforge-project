@@ -66,6 +66,19 @@ pub struct HarmonicLook {
     /// Ampiezza della transizione, 0..100: 0 = bordo netto, 100 = sfumatura
     /// distribuita sull'intero fotogramma.
     pub wb_gradient_spread: i32,
+    /// Riduzione del rumore di LUMINANZA (0..100, 0 = nessun effetto): sfoca
+    /// il canale L (Lab) nelle zone piatte, protetta ai bordi (vedi
+    /// `look-render::apply_noise_reduction`) — corrisponde al concetto di
+    /// "Luminance" nel pannello Dettaglio di Lightroom/ACR.
+    pub noise_reduction_luma: i32,
+    /// Riduzione del rumore CROMATICO (0..100, 0 = nessun effetto): sfoca i
+    /// canali a*/b* (Lab), anch'essa protetta ai bordi per evitare aloni di
+    /// colore — corrisponde al concetto di "Color" nel pannello Dettaglio di
+    /// Lightroom/ACR. Il rumore cromatico è percettivamente meno legato al
+    /// dettaglio della scena rispetto a quello di luminanza, quindi in
+    /// pratica tollera un raggio di sfocatura maggiore prima di risultare
+    /// visibile come perdita di nitidezza.
+    pub noise_reduction_color: i32,
 }
 
 impl Default for HarmonicLook {
@@ -93,6 +106,8 @@ impl Default for HarmonicLook {
             wb_gradient_vertical: true,
             wb_gradient_position: 50,
             wb_gradient_spread: 50,
+            noise_reduction_luma: 0,
+            noise_reduction_color: 0,
         }
     }
 }

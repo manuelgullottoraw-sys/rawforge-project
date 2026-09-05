@@ -15,10 +15,11 @@
 //! spazio lineare (approssimazione da color grading, non colorimetrica) —
 //! una resa assoluta corretta richiederebbe un profilo colore della
 //! fotocamera (matrice o DCP) che questo motore non ha ancora, ma per
-//! trasferire lo STILE caldo/freddo di un look è sufficiente. Sharpening e
-//! riduzione rumore restano pianificati per la Fase 3-4 della roadmap (§8).
+//! trasferire lo STILE caldo/freddo di un look è sufficiente. Sharpening resta
+//! pianificato per la Fase 3-4 della roadmap (§8); la riduzione del rumore
+//! (luminanza + colore) è implementata qui sotto (`apply_noise_reduction`).
 
-use color_science::{hsl_to_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
+use color_science::{hsl_to_rgb, linear_rgb_to_lab, lab_to_linear_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
 use core_types::HarmonicLook;
 use image::DynamicImage;
 use rayon::prelude::*;
@@ -263,6 +264,166 @@ fn gradient_blend_factor(x: u32, y: u32, width: u32, height: u32, look: &Harmoni
     t.clamp(0.0, 1.0)
 }
 
+/// Sfocatura gaussiana separabile (orizzontale poi verticale) su un buffer a
+/// canale singolo in virgola mobile, row-major (`width * height` elementi) —
+/// non `image::imageops::blur` (pensato per buffer RGBA a 8 bit): qui serve
+/// operare sui canali Lab in float senza un giro perdita-precisione
+/// conversione-u8 a ogni passata. Ai bordi dell'immagine il campionamento
+/// blocca l'indice al pixel più vicino (clamp), non wrap né nero: un bordo
+/// fisico della foto non ha "fuori scena" da mescolare. `sigma <= 0` restituisce
+/// una copia identica (nessun bordo speciale da gestire a monte).
+fn gaussian_blur_channel(data: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+    if sigma <= 0.0 || width == 0 || height == 0 {
+        return data.to_vec();
+    }
+    let radius = (sigma * 3.0).ceil().max(1.0) as isize;
+    let mut kernel: Vec<f32> = (-radius..=radius)
+        .map(|i| (-((i * i) as f32) / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let kernel_sum: f32 = kernel.iter().sum();
+    for v in kernel.iter_mut() {
+        *v /= kernel_sum;
+    }
+
+    let mut horizontal = vec![0f32; data.len()];
+    horizontal
+        .par_chunks_mut(width)
+        .zip(data.par_chunks(width))
+        .for_each(|(out_row, in_row)| {
+            for x in 0..width {
+                let mut acc = 0f32;
+                for (k, &kv) in kernel.iter().enumerate() {
+                    let dx = k as isize - radius;
+                    let sx = (x as isize + dx).clamp(0, width as isize - 1) as usize;
+                    acc += in_row[sx] * kv;
+                }
+                out_row[x] = acc;
+            }
+        });
+
+    let mut vertical = vec![0f32; data.len()];
+    vertical
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            for x in 0..width {
+                let mut acc = 0f32;
+                for (k, &kv) in kernel.iter().enumerate() {
+                    let dy = k as isize - radius;
+                    let sy = (y as isize + dy).clamp(0, height as isize - 1) as usize;
+                    acc += horizontal[sy * width + x] * kv;
+                }
+                out_row[x] = acc;
+            }
+        });
+    vertical
+}
+
+/// Riduzione del rumore (luminanza + colore, ognuna 0..100, docs/ARCHITECTURE.md
+/// §8 — pianificata per una fase successiva, implementata qui): lavora in Lab
+/// perché è lo spazio in cui luminanza (`L`) e colore (`a`/`b`) sono
+/// davvero separati — a differenza di RGB, dove sfocare un canale sfoca
+/// SEMPRE anche un po' di luminosità. Applicata come primo stage della
+/// pipeline, PRIMA di bilanciamento del bianco/esposizione/contrasto/HSL: il
+/// resto della pipeline amplifica differenze locali minuscole (lo stesso
+/// principio, misurato più volte su foto vere in questo motore, dietro sia il
+/// bug della croma instabile vicino al nero sia quello del salto ripido fra
+/// bande HSL) — ridurre il rumore ATTIVAMENTE PRIMA di quell'amplificazione è
+/// l'unico momento in cui ha un effetto pulito, farlo dopo lo renderebbe
+/// meno efficace e più visibile come sfocatura.
+///
+/// Entrambi i canali sono sfocati con un raggio gaussiano proporzionale
+/// all'intensità (0 = nessuna sfocatura, esattamente il valore originale —
+/// stesso principio "zero = invariato" di `apply_texture_bands`), poi
+/// miscelati con l'originale in proporzione a `1 - edge_weight`: `edge_weight`
+/// (derivato dal gradiente locale di `L`, quindi dai bordi reali della SCENA,
+/// non dal colore) protegge i contorni netti dalla sfocatura — altrimenti
+/// ridurre il rumore comporterebbe sempre perdita di nitidezza sui bordi, non
+/// solo nelle zone piatte dove serve davvero. La riduzione CROMATICA riusa
+/// deliberatamente lo stesso `edge_weight` calcolato dalla luminanza (non un
+/// proprio bordo calcolato su a/b): è così che si evita che il colore
+/// "sbordi" oltre un contorno netto (es. il rosso di un soggetto che tinge lo
+/// sfondo vicino), lo stesso principio con cui qualunque riduzione rumore
+/// cromatica reale è guidata dai bordi di luminanza, non dai propri.
+fn apply_noise_reduction(base: &image::RgbaImage, look: &HarmonicLook) -> image::RgbaImage {
+    if look.noise_reduction_luma <= 0 && look.noise_reduction_color <= 0 {
+        return base.clone();
+    }
+    const MAX_LUMA_SIGMA: f32 = 2.5;
+    const MAX_COLOR_SIGMA: f32 = 7.0;
+    // Soglia (in unità L, 0..100) sopra la quale un gradiente locale è
+    // considerato un bordo reale della scena da proteggere per intero — non
+    // una misura fotometrica, una scelta empirica: abbastanza bassa da
+    // proteggere anche contorni a basso contrasto (pelle, cielo/orizzonte),
+    // abbastanza alta da non trattare ogni minima variazione di tono come un
+    // "bordo" (altrimenti la sfocatura non avrebbe mai un pixel su cui agire).
+    const EDGE_GRADIENT_THRESHOLD: f32 = 6.0;
+
+    let (width, height) = base.dimensions();
+    let w = width as usize;
+    let h = height as usize;
+    let n = w * h;
+
+    let mut l_ch = vec![0f32; n];
+    let mut a_ch = vec![0f32; n];
+    let mut b_ch = vec![0f32; n];
+    let mut alpha_ch = vec![0u8; n];
+    l_ch.par_iter_mut()
+        .zip(a_ch.par_iter_mut())
+        .zip(b_ch.par_iter_mut())
+        .zip(alpha_ch.par_iter_mut())
+        .zip(base.par_chunks(4))
+        .for_each(|((((l, a), b), alpha), px)| {
+            let lin = [
+                srgb_to_linear(px[0] as f32 / 255.0),
+                srgb_to_linear(px[1] as f32 / 255.0),
+                srgb_to_linear(px[2] as f32 / 255.0),
+            ];
+            let lab = linear_rgb_to_lab(lin);
+            *l = lab[0];
+            *a = lab[1];
+            *b = lab[2];
+            *alpha = px[3];
+        });
+
+    let luma_strength = (look.noise_reduction_luma.clamp(0, 100) as f32) / 100.0;
+    let color_strength = (look.noise_reduction_color.clamp(0, 100) as f32) / 100.0;
+    let blurred_l = gaussian_blur_channel(&l_ch, w, h, luma_strength * MAX_LUMA_SIGMA);
+    let blurred_a = gaussian_blur_channel(&a_ch, w, h, color_strength * MAX_COLOR_SIGMA);
+    let blurred_b = gaussian_blur_channel(&b_ch, w, h, color_strength * MAX_COLOR_SIGMA);
+
+    let mut out = base.clone();
+    out.par_chunks_mut(4)
+        .enumerate()
+        .for_each(|(i, out_px)| {
+            let x = i % w;
+            let y = i / w;
+            // Gradiente centrale di L (non un vero Sobel, sufficiente per una
+            // stima di "bordo sì/no"): campiona i vicini bloccando l'indice
+            // al bordo dell'immagine invece di uscire fuori scena.
+            let xm = x.saturating_sub(1);
+            let xp = (x + 1).min(w - 1);
+            let ym = y.saturating_sub(1);
+            let yp = (y + 1).min(h - 1);
+            let gx = l_ch[y * w + xp] - l_ch[y * w + xm];
+            let gy = l_ch[yp * w + x] - l_ch[ym * w + x];
+            let gradient = (gx * gx + gy * gy).sqrt();
+            let edge_weight = (gradient / EDGE_GRADIENT_THRESHOLD).clamp(0.0, 1.0);
+            let flat_weight = 1.0 - edge_weight;
+
+            let l_final = l_ch[i] + (blurred_l[i] - l_ch[i]) * flat_weight;
+            let a_final = a_ch[i] + (blurred_a[i] - a_ch[i]) * flat_weight;
+            let b_final = b_ch[i] + (blurred_b[i] - b_ch[i]) * flat_weight;
+
+            let lin = lab_to_linear_rgb([l_final, a_final, b_final]);
+            out_px[0] = (linear_to_srgb(lin[0]).clamp(0.0, 1.0) * 255.0).round() as u8;
+            out_px[1] = (linear_to_srgb(lin[1]).clamp(0.0, 1.0) * 255.0).round() as u8;
+            out_px[2] = (linear_to_srgb(lin[2]).clamp(0.0, 1.0) * 255.0).round() as u8;
+            out_px[3] = alpha_ch[i];
+        });
+    out
+}
+
 /// Applica i tre controlli di "texture" (fine/media/grossa, -100..100) via
 /// separazione di frequenza gaussiana: sfoca `base` a tre raggi crescenti,
 /// ricava le bande di dettaglio per differenza tra sfocature successive
@@ -319,11 +480,16 @@ fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::R
 
 /// Applica un `HarmonicLook` ai pixel di `image`, restituendo una nuova
 /// immagine della stessa dimensione. Ordine degli stage (docs/ARCHITECTURE.md
-/// §3.2, sezione "Detail"/NR esclusa): bilanciamento del bianco + esposizione
-/// -> highlights/shadows -> tone curve -> contrasto -> HSL per banda + split
-/// toning -> vibrance/saturazione globale.
+/// §3.2): riduzione del rumore (luminanza + colore, in Lab) -> bilanciamento
+/// del bianco + esposizione -> highlights/shadows -> tone curve -> contrasto
+/// -> HSL per banda + split toning -> vibrance/saturazione globale -> texture.
+/// La riduzione rumore va PRIMA di tutto il resto: è un'operazione spaziale
+/// (serve il vicinato del pixel, non un guadagno per-pixel) e i suoi
+/// benefici si perdono se applicata dopo che contrasto/HSL hanno già
+/// amplificato le differenze locali che genera il rumore stesso.
 pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> DynamicImage {
     let rgba = image.to_rgba8();
+    let rgba = apply_noise_reduction(&rgba, look);
     let (width, height) = rgba.dimensions();
     let row_stride = 4 * width as usize;
 
@@ -1094,5 +1260,137 @@ mod tests {
         let rendered = render_preview_with_look(&img, &look).to_rgba8();
         let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
         assert_eq!(rendered.get_pixel(0, 0), baseline.get_pixel(0, 0));
+    }
+
+    /// Immagine sintetica con rumore deterministico pseudo-casuale (nessuna
+    /// dipendenza da `rand`): un pattern a scacchiera di piccola ampiezza,
+    /// sovrapposto a un colore di base uniforme, su un canale scelto
+    /// (0=R/G/B insieme = rumore di luminanza, altrimenti solo un canale =
+    /// rumore quasi puramente cromatico). Deterministico e riproducibile,
+    /// a differenza di un vero rumore casuale — sufficiente per verificare che
+    /// la riduzione rumore SMORZI l'ampiezza pixel-a-pixel senza dipendere da
+    /// un seed.
+    fn noisy_image(width: u32, height: u32, base: [u8; 3], amplitude: i32, luma_noise: bool) -> DynamicImage {
+        let img = ImageBuffer::from_fn(width, height, |x, y| {
+            let sign = if (x + y) % 2 == 0 { 1 } else { -1 };
+            let delta = sign * amplitude;
+            if luma_noise {
+                let r = (base[0] as i32 + delta).clamp(0, 255) as u8;
+                let g = (base[1] as i32 + delta).clamp(0, 255) as u8;
+                let b = (base[2] as i32 + delta).clamp(0, 255) as u8;
+                Rgba([r, g, b, 255])
+            } else {
+                // Solo il canale rosso oscilla: variazione quasi puramente di
+                // tinta/croma a parità di luminanza media, non di luminosità.
+                let r = (base[0] as i32 + delta).clamp(0, 255) as u8;
+                Rgba([r, base[1], base[2], 255])
+            }
+        });
+        DynamicImage::ImageRgba8(img)
+    }
+
+    /// Rumore residuo di un'immagine renderizzata: deviazione standard dei
+    /// valori di un canale su un'area piatta (nessun contenuto reale, solo il
+    /// pattern di rumore sintetico) — una riduzione rumore efficace deve
+    /// abbassarla, non lasciarla invariata né (peggio) alzarla.
+    fn channel_std_dev(image: &image::RgbaImage, channel: usize) -> f64 {
+        let values: Vec<f64> = image.pixels().map(|p| p[channel] as f64).collect();
+        let n = values.len() as f64;
+        let mean = values.iter().sum::<f64>() / n;
+        (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt()
+    }
+
+    #[test]
+    fn noise_reduction_has_no_effect_at_zero_strength() {
+        let img = noisy_image(32, 32, [120, 120, 120], 15, true);
+        let mut look = HarmonicLook::default();
+        look.noise_reduction_luma = 0;
+        look.noise_reduction_color = 0;
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        assert_eq!(rendered, baseline, "a intensità 0 la riduzione rumore non deve cambiare nulla");
+    }
+
+    #[test]
+    fn luma_noise_reduction_reduces_pixel_to_pixel_variation_in_a_flat_area() {
+        // Rumore sui tre canali insieme (variazione di LUMINANZA): con
+        // `noise_reduction_luma` alto, la deviazione standard del canale
+        // rosso su quest'area piatta deve calare sensibilmente.
+        let img = noisy_image(48, 48, [120, 120, 120], 20, true);
+        let mut look = HarmonicLook::default();
+        look.noise_reduction_luma = 100;
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let before = channel_std_dev(&img.to_rgba8(), 0);
+        let after = channel_std_dev(&rendered, 0);
+        assert!(
+            after < before * 0.5,
+            "atteso un calo sostanziale del rumore di luminanza: prima={before:.2} dopo={after:.2}"
+        );
+    }
+
+    #[test]
+    fn color_noise_reduction_reduces_chroma_variation_without_needing_luma_reduction() {
+        // Rumore solo sul canale rosso (variazione quasi puramente cromatica):
+        // con SOLO `noise_reduction_color` alto (luma a 0), la deviazione
+        // standard del canale rosso deve comunque calare, perché il rumore è
+        // portato dai canali a*/b* di Lab, non da L.
+        let img = noisy_image(48, 48, [120, 120, 120], 20, false);
+        let mut look = HarmonicLook::default();
+        look.noise_reduction_luma = 0;
+        look.noise_reduction_color = 100;
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let before = channel_std_dev(&img.to_rgba8(), 0);
+        let after = channel_std_dev(&rendered, 0);
+        assert!(
+            after < before * 0.5,
+            "atteso un calo sostanziale del rumore cromatico: prima={before:.2} dopo={after:.2}"
+        );
+    }
+
+    #[test]
+    fn noise_reduction_preserves_a_sharp_edge_instead_of_blurring_it_away() {
+        // Un bordo netto (metà nera, metà bianca) con riduzione rumore al
+        // massimo non deve spianarsi in un morbido grigio: la protezione ai
+        // bordi (`edge_weight`) deve tenere i due lati quasi ai loro valori
+        // originali, non fonderli.
+        let img = ImageBuffer::from_fn(32, 32, |x, _| {
+            if x < 16 {
+                Rgba([10, 10, 10, 255])
+            } else {
+                Rgba([245, 245, 245, 255])
+            }
+        });
+        let img = DynamicImage::ImageRgba8(img);
+        let mut look = HarmonicLook::default();
+        look.noise_reduction_luma = 100;
+        look.noise_reduction_color = 100;
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let dark_side = rendered.get_pixel(4, 16)[0] as i32;
+        let bright_side = rendered.get_pixel(27, 16)[0] as i32;
+        assert!(dark_side < 40, "il lato scuro non deve schiarirsi verso il grigio: {dark_side}");
+        assert!(bright_side > 220, "il lato chiaro non deve scurirsi verso il grigio: {bright_side}");
+    }
+
+    #[test]
+    fn noise_reduction_on_a_solid_color_image_changes_nothing() {
+        // Un'immagine a tinta piatta non ha rumore da ridurre: qualunque
+        // sfocatura di un'area completamente uniforme restituisce lo stesso
+        // valore, quindi il render deve restare identico a intensità 0.
+        let img = solid_image(16, 16, [80, 140, 200]);
+        let mut look = HarmonicLook::default();
+        look.noise_reduction_luma = 100;
+        look.noise_reduction_color = 100;
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        assert_eq!(
+            rendered.get_pixel(8, 8),
+            baseline.get_pixel(8, 8),
+            "una tinta piatta non deve cambiare con la riduzione rumore, qualunque sia l'intensità"
+        );
     }
 }

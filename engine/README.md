@@ -4,9 +4,9 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (91 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 17, `look_render` 29, `metadata` 3, `raw_decode` 4, `ffi` 22, `smartbatch`
-5, `xmp` 2):
+Crate reali, compilati e testati (103 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 21, `look_render` 34, `metadata` 3, `raw_decode` 4, `ffi` 24, `smartbatch`
+5, `xmp` 3):
 
 | Crate | Cosa fa | Rif. architettura |
 |---|---|---|
@@ -18,8 +18,8 @@ Crate reali, compilati e testati (91 test, tutti verdi — `color_science` 6, `c
 | `xmp` | Generatore di preset Lightroom `.xmp` dal `HarmonicLook` | §5 |
 | `gpu-pipe` | Sorgenti WGSL degli stage di color grading, validati con `naga` (nessuna GPU richiesta per i test) | §3.2, §6.2 |
 | `raw-decode` | Decodifica RAW vera (`rawler`, Rust puro): anteprima incorporata dalla fotocamera + metadati base | §2, §9 |
-| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
-| `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` (vedi sotto) — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
+| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza, riduzione del rumore luminanza/colore in Lab con protezione ai bordi) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
+| `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` (vedi sotto) e `compute_subject_saliency_preview` (mappa di salienza ispezionabile, non collegata al color-matching automatico — vedi sotto) — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
 
 **Novità di questo giro**: lo Smart-Batch Contestuale (`smartbatch`) era già scritto e testato ma
 irraggiungibile dalla UI — l'unico modo di "usare" un Look era esportarlo come `.xmp`. Il nuovo
@@ -500,6 +500,75 @@ sparso in una banda dove è una minoranza trascurabile del fotogramma in una del
 per banda resta comunque un confronto "quello che c'è in questa banda in entrambe le foto", non
 necessariamente "lo stesso oggetto": un limite architetturale onesto, non nascosto — un vero
 abbinamento per soggetto richiederebbe segmentazione, fuori scope da questo fix.
+
+## Nuovo (questo giro): riduzione del rumore luminanza/colore, e un tentativo di "riconoscimento soggetto" con un risultato onesto (non wired)
+
+Richiesta dell'utente dopo aver ricevuto il fix della tinta sopra: implementare riconoscimento del
+soggetto, riduzione del rumore colore e riduzione del rumore di luminanza.
+
+**Riduzione del rumore (fatta e verificata)**: due nuovi campi su `HarmonicLook`,
+`noise_reduction_luma` e `noise_reduction_color` (0..100, esportati come `crs:Luminance` e
+`crs:Color`, i tag reali del pannello Dettaglio di ACR/Lightroom), implementati in
+`look-render::apply_noise_reduction` come primo stage della pipeline di rendering. A differenza di
+una sfocatura in RGB (che sfoca sempre un po' anche la luminosità), l'immagine viene convertita in
+Lab e i canali L (luminanza) e a\*/b\* (colore) sono sfocati **separatamente** con un blur
+Gaussiano separabile fatto a mano (`gaussian_blur_channel`, su buffer f32 — non
+`image::imageops::blur`, pensata per u8/RGBA), con sigma proporzionale allo slider
+(`MAX_LUMA_SIGMA = 2.5`, `MAX_COLOR_SIGMA = 7.0` — il rumore cromatico tollera un raggio maggiore
+prima di risultare visibile come perdita di nitidezza). Il risultato sfocato è poi fuso con
+l'originale pesato da una mappa di "protezione ai bordi" derivata dal gradiente locale di L (stesso
+peso riusato per luminanza e colore, per evitare aloni cromatici sui bordi veri): dove c'è un bordo
+di scena reale, l'effetto è quasi nullo; dove l'immagine è piatta, si applica per intero.
+
+Verificato sulle foto vere dell'utente (una zona di paraurti scuro, piatta): la prima misura usava
+la deviazione standard sull'intera patch e mostrava un miglioramento debole (~4.5%) — un errore
+metodologico mio, perché quella patch contiene anche un vero gradiente di luce (non rumore) che un
+blur protetto ai bordi non deve rimuovere. Rimisurato con la "rugosità locale" (finestra scorrevole
+5×5, `scipy.ndimage.uniform_filter`), che isola solo la variazione pixel-a-pixel ad alta frequenza
+dal trend di luce a bassa frequenza: **39–45%** di riduzione della rugosità di luminanza e **35.7%**
+di riduzione della rugosità cromatica, a piena intensità. Confermato anche visivamente su un crop
+ingrandito: la grana del paraurti scompare nelle zone piatte, mentre la mesh della griglia (un bordo
+di scena vero) resta nitida. 5 nuovi test in `look-render`.
+
+**Riconoscimento soggetto (implementato, testato, ma NON collegato al color-matching automatico —
+per una ragione misurata, non per pigrizia)**: `harmonic::compute_saliency_map` calcola una mappa
+di salienza per pixel con una tecnica classica di computer vision (non un modello ML): contrasto
+globale di colore su istogramma quantizzato in Lab (8×8×8=512 bin, stile Cheng et al. 2011
+"Global Contrast based Salient Region Detection" — ogni bin pesa quanto la propria popolazione è
+lontana in Lab da tutte le altre), moltiplicato per un prior di centratura fotografica (gaussiana
+sulla distanza dal centro fotogramma). 4 test unitari confermano che si comporta in modo sensato in
+isolamento (valori sempre in 0..1, un piccolo soggetto colorato e centrato risulta più saliente dello
+sfondo uniforme, lo stesso colore raro è più saliente vicino al centro che in un angolo, un'immagine
+perfettamente piatta ricade su salienza uniforme invece che zero).
+
+Il primo tentativo è stato collegarla al meccanismo di hue-matching appena corretto sopra: pesare le
+medie per banda di tonalità (sia in `extract_look_from_reference` sia in `analyze_hue_bands`) per la
+salienza di ciascun pixel, nell'idea che il "vero soggetto" dovesse pesare di più della media
+grezza per banda. Rimisurato sulla stessa foto vera già usata per verificare il fix della tinta: lo
+scarto di tonalità sedili, che il fix precedente aveva portato da 6.7° a **1.3°**, è
+**peggiorato a 9.5°** con la salienza attiva su entrambe le funzioni (9.2° con la salienza attiva
+solo su una delle due — un'altra regressione, non una coincidenza). Causa: la salienza è calcolata
+indipendentemente per ciascuna immagine, quindi può enfatizzare sotto-regioni DIVERSE della stessa
+banda di tonalità nel campione e nel target — invece di far convergere le due tinte, le allontana.
+
+Non ho ignorato né minimizzato questo risultato: ho **completamente annullato** il collegamento (in
+entrambe le funzioni), riverificato numericamente che `analyze_hue_bands`/`extract_look_from_reference`
+tornassero a produrre esattamente gli stessi valori misurati prima del tentativo, e tenuto un test
+ormai invalido (`per_band_hue_extraction_favors_a_small_centered_subject...`) rimosso perché passava
+per una ragione non correlata, non perché il comportamento fosse corretto. La mappa di salienza resta
+comunque codice reale, testato e utile: esposta come nuova funzione FFI standalone
+`compute_subject_saliency_preview(image_bytes) -> Vec<u8>` (restituisce una PNG in scala di grigi
+512×512 con la mappa di salienza), pensata per un futuro uso ispezionabile in UI (per esempio: mostrare
+all'utente dove il motore "guarda" prima di un'eventuale selezione guidata del soggetto), non per
+influenzare automaticamente il color-matching. La regressione misurata è documentata direttamente
+nel commento della funzione, per chiunque sia tentato di ricollegarla in futuro senza rimisurare.
+Verificato anche visivamente su una foto vera (auto su asfalto): la mappa illumina chiaramente l'auto
+e lascia scuro lo sfondo, quindi l'euristica di per sé funziona — il problema era specificamente nel
+collegamento al color-matching per-banda, non nella qualità della mappa.
+
+4 nuovi test in `harmonic` (netto: +5 nuovi, -1 invalidato = +4), 2 nuovi in `ffi`
+(`saliency_preview_reports_error_on_bad_bytes`,
+`saliency_preview_returns_a_valid_grayscale_png_at_analysis_resolution`).
 
 ## Corretto (questo giro, giro precedente): "Intensità adattamento" non aveva ALCUN effetto su contrasto e tone curve — copiati letteralmente dal campione a qualunque valore dello slider
 

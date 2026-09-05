@@ -130,11 +130,189 @@ fn percentile(sorted: &[f32], p: f64) -> f32 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Numero di livelli di quantizzazione per canale Lab nell'istogramma usato
+/// da [`compute_saliency_map`]: 8³ = 512 bin totali. Abbastanza fine da
+/// distinguere colori genuinamente diversi (i sedili rossi da un asfalto
+/// grigio), abbastanza grossolano da rendere banale il confronto a coppie
+/// fra tutti i bin (`O(bin²)`, qui 262144 operazioni: trascurabile anche
+/// alla risoluzione di analisi massima).
+const SALIENCY_BINS_PER_CHANNEL: usize = 8;
+const SALIENCY_TOTAL_BINS: usize = SALIENCY_BINS_PER_CHANNEL.pow(3);
+
+/// Deviazione standard (in frazione della semidiagonale del fotogramma) del
+/// prior di centratura fotografica usato da [`compute_saliency_map`): quanto
+/// rapidamente la salienza cala allontanandosi dal centro. Euristica, non una
+/// misura — chi scatta mette il soggetto vicino al centro molto più spesso
+/// che ai bordi, ma non sempre (una composizione marcata "regola dei terzi"
+/// lo smentisce): 0.45 è un ammorbidimento deliberato, non un vincolo rigido.
+const SALIENCY_CENTER_SIGMA: f32 = 0.45;
+
+/// Indice del bin (0..[`SALIENCY_TOTAL_BINS`]) per un colore Lab, quantizzando
+/// ciascun canale in [`SALIENCY_BINS_PER_CHANNEL`] livelli uniformi. `a`/`b`
+/// sono attesi tipicamente in -128..127 ma qui il range di quantizzazione è
+/// ristretto a -100..100 (clampato): oltre quel range la componente cromatica
+/// per una foto reale è quasi sempre rumore di conversione, non un colore
+/// genuino, e sprecherebbe risoluzione di quantizzazione sui bin centrali
+/// (dove in pratica cade la stragrande maggioranza dei pixel).
+fn lab_bin_index(l: f32, a: f32, b: f32) -> usize {
+    let bin = |v: f32, lo: f32, hi: f32| -> usize {
+        let t = ((v - lo) / (hi - lo)).clamp(0.0, 0.999_999);
+        (t * SALIENCY_BINS_PER_CHANNEL as f32) as usize
+    };
+    let li = bin(l, 0.0, 100.0);
+    let ai = bin(a, -100.0, 100.0);
+    let bi = bin(b, -100.0, 100.0);
+    (li * SALIENCY_BINS_PER_CHANNEL + ai) * SALIENCY_BINS_PER_CHANNEL + bi
+}
+
+/// Mappa di salienza euristica: **non** un modello di segmentazione o
+/// riconoscimento del soggetto (non sa cosa sia un'auto o un sedile,
+/// non è addestrata su alcun dato, non "capisce" la scena) — un punteggio di
+/// contrasto globale di colore, nello stile di Cheng et al. 2011 ("Global
+/// Contrast based Salient Region Detection": istogramma Lab quantizzato,
+/// punteggio di contrasto per bin come somma delle distanze Lab dagli altri
+/// bin pesate dalla loro popolazione), combinato con un prior di centratura
+/// fotografica. Restituisce un valore 0..1 per pixel (row-major, stesso
+/// ordine di `rgba.pixels()`, stessa dimensione di `rgba`): più alto per un
+/// colore RARO nella foto E vicino al centro del fotogramma (probabile
+/// soggetto deliberato), più basso per un colore DOMINANTE e/o periferico
+/// (probabile sfondo — cielo, pavimentazione, muro).
+///
+/// **Limite onesto, dichiarato qui perché è il punto in cui conta di più**:
+/// funziona quando il soggetto ha un colore minoritario rispetto al resto
+/// della foto ed è ragionevolmente centrato — la composizione fotografica
+/// più comune, ma non l'unica. Un soggetto che riempie la maggioranza del
+/// fotogramma (un primo piano estremo), o deliberatamente decentrato (regola
+/// dei terzi marcata), o dello stesso colore dello sfondo (mimetismo,
+/// controluce che appiattisce tutto a silhouette) riceve una salienza bassa
+/// pur essendo "il soggetto" per un fotografo umano: questa euristica non ha
+/// modo di saperlo, e non pretende di sostituire una vera segmentazione
+/// semantica.
+pub fn compute_saliency_map(rgba: &image::RgbaImage) -> Vec<f32> {
+    let (width, height) = rgba.dimensions();
+    let n = (width as usize) * (height as usize);
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut bin_of_pixel = vec![0u16; n];
+    let mut bin_count = vec![0u64; SALIENCY_TOTAL_BINS];
+    let mut bin_sum_l = vec![0f64; SALIENCY_TOTAL_BINS];
+    let mut bin_sum_a = vec![0f64; SALIENCY_TOTAL_BINS];
+    let mut bin_sum_b = vec![0f64; SALIENCY_TOTAL_BINS];
+
+    for (i, px) in rgba.pixels().enumerate() {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let lin = [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)];
+        let lab = linear_rgb_to_lab(lin);
+        let bin = lab_bin_index(lab[0], lab[1], lab[2]);
+        bin_of_pixel[i] = bin as u16;
+        bin_count[bin] += 1;
+        bin_sum_l[bin] += lab[0] as f64;
+        bin_sum_a[bin] += lab[1] as f64;
+        bin_sum_b[bin] += lab[2] as f64;
+    }
+
+    let mut bin_centroid = vec![[0f32; 3]; SALIENCY_TOTAL_BINS];
+    for bin in 0..SALIENCY_TOTAL_BINS {
+        if bin_count[bin] > 0 {
+            let c = bin_count[bin] as f64;
+            bin_centroid[bin] = [
+                (bin_sum_l[bin] / c) as f32,
+                (bin_sum_a[bin] / c) as f32,
+                (bin_sum_b[bin] / c) as f32,
+            ];
+        }
+    }
+
+    // Contrasto globale per bin: quanto il colore di questo bin è raro
+    // rispetto al resto della foto — la somma delle distanze Lab dagli altri
+    // bin occupati, ciascuna pesata dalla popolazione di quel bin (un bin
+    // che differisce molto da un altro bin MOLTO popolato conta di più di
+    // uno che differisce da un bin quasi vuoto, esattamente come nell'HC
+    // saliency di Cheng et al.).
+    let mut bin_contrast = vec![0f32; SALIENCY_TOTAL_BINS];
+    for bin in 0..SALIENCY_TOTAL_BINS {
+        if bin_count[bin] == 0 {
+            continue;
+        }
+        let mut acc = 0f64;
+        for other in 0..SALIENCY_TOTAL_BINS {
+            if other == bin || bin_count[other] == 0 {
+                continue;
+            }
+            let dl = bin_centroid[bin][0] - bin_centroid[other][0];
+            let da = bin_centroid[bin][1] - bin_centroid[other][1];
+            let db = bin_centroid[bin][2] - bin_centroid[other][2];
+            let dist = ((dl * dl + da * da + db * db) as f64).sqrt();
+            acc += dist * bin_count[other] as f64;
+        }
+        bin_contrast[bin] = (acc / n as f64) as f32;
+    }
+    let max_contrast = bin_contrast.iter().cloned().fold(0f32, f32::max);
+    if max_contrast > 0.0 {
+        for v in bin_contrast.iter_mut() {
+            *v /= max_contrast;
+        }
+    } else {
+        // Nessun contrasto di colore misurabile: o l'immagine è
+        // effettivamente a tinta piatta, o un solo bin è occupato (nessun
+        // "altro" bin con cui confrontarsi — non un caso raro nei test
+        // sintetici a tinta unita, ma nemmeno impossibile su una foto vera
+        // molto uniforme). Lasciare tutto a 0 azzererebbe la salienza di
+        // OGNI pixel — l'opposto dell'intento (nessun segnale di colore da
+        // usare non significa "nessun pixel è il soggetto", significa "non
+        // so distinguerli per colore"): i bin occupati restano a piena
+        // salienza di colore (1.0), lasciando il prior di centratura come
+        // unico segnale rimasto.
+        for (bin, v) in bin_contrast.iter_mut().enumerate() {
+            if bin_count[bin] > 0 {
+                *v = 1.0;
+            }
+        }
+    }
+
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let half_diag = (cx * cx + cy * cy).sqrt().max(1.0);
+
+    let mut out = vec![0f32; n];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) as usize;
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist_norm = (dx * dx + dy * dy).sqrt() / half_diag;
+            let centeredness =
+                (-(dist_norm * dist_norm) / (2.0 * SALIENCY_CENTER_SIGMA * SALIENCY_CENTER_SIGMA)).exp();
+            out[idx] = bin_contrast[bin_of_pixel[idx] as usize] * centeredness;
+        }
+    }
+    let max_out = out.iter().cloned().fold(0f32, f32::max);
+    if max_out > 0.0 {
+        for v in out.iter_mut() {
+            *v /= max_out;
+        }
+    }
+    out
+}
+
 /// Estrae un `HarmonicLook` da un'immagine di riferimento già caricata in memoria.
 pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLook {
     let analysis = img.resize(ANALYSIS_MAX_DIM, ANALYSIS_MAX_DIM, image::imageops::FilterType::Triangle);
     let rgba = analysis.to_rgba8();
-
+    // **Deliberatamente SENZA `compute_saliency_map` qui** — un primo
+    // tentativo la usava per pesare le bande HSL verso il probabile
+    // soggetto, ma misurato sulla stessa foto vera usata per verificare
+    // `hue_matching_deltas` peggiorava la convergenza di tonalità appena
+    // ottenuta in quel fix (da un divario di 1.3° a 3.7° dal campione), pur
+    // essendo applicata SOLO qui e non nel confronto incrociato — vedi il
+    // commento esteso su `compute_saliency_map` per l'analisi completa e
+    // perché questa mappa resta comunque un fondamento utile per una futura
+    // funzione "mostra cosa il motore considera il soggetto" invece che una
+    // pesatura automatica silenziosa qui.
     let mut l_values: Vec<f32> = Vec::with_capacity(rgba.pixels().len());
     let mut ab_values: Vec<(f32, f32)> = Vec::with_capacity(rgba.pixels().len());
 
@@ -402,6 +580,22 @@ pub struct BandHue {
 pub fn analyze_hue_bands(img: &DynamicImage) -> [BandHue; HUE_BANDS] {
     let analysis = img.resize(ANALYSIS_MAX_DIM, ANALYSIS_MAX_DIM, image::imageops::FilterType::Triangle);
     let rgba = analysis.to_rgba8();
+    // **Deliberatamente SENZA la mappa di salienza** usata invece da
+    // `extract_look_from_reference` — vedi il commento esteso su
+    // `compute_saliency_map` per cosa fa e i suoi limiti. Provato e misurato
+    // su una foto vera (la stessa usata per verificare `hue_matching_deltas`
+    // nel giro precedente): pesare per salienza ANCHE qui, sia sul campione
+    // sia sul target, peggiorava la convergenza che quel fix aveva appena
+    // ottenuto (il divario di tonalità misurato sui sedili era sceso a 1.3°
+    // con il confronto grezzo per popolazione; pesando per salienza saliva a
+    // 9.5°) — la mappa di salienza di ciascuna foto è calcolata in modo
+    // indipendente dall'altra, quindi può facilmente enfatizzare porzioni
+    // diverse della stessa banda di tonalità nelle due foto invece di
+    // convergere sullo stesso oggetto reale. Il confronto grezzo per
+    // popolazione, pur più ingenuo, si è dimostrato più affidabile per
+    // QUESTO confronto incrociato fra due foto — la salienza resta comunque
+    // utile per l'estrazione a foto singola qui sopra, dove non c'è nessun
+    // secondo lato con cui disallinearsi.
     let mut buckets: [HueBandBucket; HUE_BANDS] = std::array::from_fn(|_| HueBandBucket::new());
     for px in rgba.pixels() {
         let r = px[0] as f32 / 255.0;
@@ -753,5 +947,91 @@ mod tests {
         // 10° -> 350° deve essere -20, simmetrico.
         let d2 = circular_hue_diff(10.0, 350.0);
         assert!((d2 + 20.0).abs() < 0.01, "atteso -20, got {d2}");
+    }
+
+    fn sized_image(width: u32, height: u32, pixel_fn: impl Fn(u32, u32) -> [u8; 4]) -> image::RgbaImage {
+        ImageBuffer::from_fn(width, height, |x, y| Rgba(pixel_fn(x, y)))
+    }
+
+    #[test]
+    fn saliency_values_always_stay_within_zero_and_one() {
+        // Un pattern con più colori distinti e un forte prior di centratura
+        // (un quadrato saturo vicino al centro, sfondo neutro) non deve mai
+        // produrre valori fuori range, qualunque sia la posizione del pixel.
+        let img = sized_image(128, 128, |x, y| {
+            if (50..78).contains(&x) && (50..78).contains(&y) {
+                [220, 30, 30, 255]
+            } else {
+                [130, 130, 130, 255]
+            }
+        });
+        let saliency = compute_saliency_map(&img);
+        assert_eq!(saliency.len(), 128 * 128);
+        assert!(saliency.iter().all(|&v| (0.0..=1.0).contains(&v)), "valori di salienza fuori da 0..1");
+    }
+
+    #[test]
+    fn a_small_centered_colorful_subject_is_more_salient_than_the_uniform_background() {
+        // Il caso base che questa euristica deve azzeccare: un piccolo
+        // soggetto saturo vicino al centro su un grande sfondo neutro e
+        // uniforme (il caso più comune in fotografia) deve ricevere una
+        // salienza nettamente più alta del proprio sfondo.
+        let img = sized_image(200, 200, |x, y| {
+            if (90..110).contains(&x) && (90..110).contains(&y) {
+                [230, 40, 40, 255] // soggetto: piccolo, saturo, centrato
+            } else {
+                [140, 140, 140, 255] // sfondo: grande, neutro
+            }
+        });
+        let saliency = compute_saliency_map(&img);
+        let width = 200usize;
+        let subject_saliency = saliency[100 * width + 100];
+        let background_saliency = saliency[10 * width + 10];
+        assert!(
+            subject_saliency > background_saliency * 3.0,
+            "il soggetto centrato ({subject_saliency}) deve essere molto più saliente dello sfondo ({background_saliency})"
+        );
+    }
+
+    #[test]
+    fn the_same_rare_color_is_more_salient_near_the_center_than_near_a_corner() {
+        // Isola il prior di centratura da solo: due macchie dello STESSO
+        // colore raro (quindi stesso contrasto di colore, stesso bin) — una
+        // vicino al centro, una vicino a un angolo — la centrale deve
+        // risultare più saliente.
+        let img = sized_image(200, 200, |x, y| {
+            let near_center = (95..105).contains(&x) && (95..105).contains(&y);
+            let near_corner = (5..15).contains(&x) && (5..15).contains(&y);
+            if near_center || near_corner {
+                [230, 40, 40, 255]
+            } else {
+                [140, 140, 140, 255]
+            }
+        });
+        let saliency = compute_saliency_map(&img);
+        let width = 200usize;
+        let center_saliency = saliency[100 * width + 100];
+        let corner_saliency = saliency[10 * width + 10];
+        assert!(
+            center_saliency > corner_saliency,
+            "stesso colore raro, ma il centro ({center_saliency}) deve pesare più dell'angolo ({corner_saliency})"
+        );
+    }
+
+    #[test]
+    fn a_perfectly_flat_image_falls_back_to_uniform_saliency_instead_of_zero() {
+        // Bug reale scoperto scrivendo questo fix: senza NESSUN contrasto di
+        // colore misurabile (un solo bin popolato), il punteggio di
+        // contrasto per bin non ha "altri bin" con cui confrontarsi e
+        // resterebbe a 0 di default — il che azzererebbe la salienza di OGNI
+        // pixel, non solo di quelli davvero non salienti. Un'immagine a
+        // tinta piatta deve ricadere su una salienza uniforme (> 0), non
+        // spegnersi del tutto: altrimenti `extract_look_from_reference` su
+        // una foto vera molto uniforme perderebbe TUTTI i pixel dalle bande
+        // HSL (esattamente il bug preso da un test di regressione più sopra,
+        // `does_not_panic_on_uniform_gray`, prima di questo fix).
+        let img = sized_image(64, 64, |_, _| [230, 40, 40, 255]);
+        let saliency = compute_saliency_map(&img);
+        assert!(saliency.iter().all(|&v| v > 0.0), "un'immagine a tinta piatta non deve avere salienza zero ovunque");
     }
 }

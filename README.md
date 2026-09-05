@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 91 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 103 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -736,6 +736,32 @@ target dopo il fix 334.3°, a soli 1.3° dal campione (contro i 6.7° di prima) 
 dell'81% del divario, con la saturazione già recuperata rimasta invariata. Dettagli tecnici, nuovi
 test e i limiti onesti di questo approccio (un confronto globale per banda, non un riconoscimento
 del soggetto) in `engine/README.md`.
+
+## Nuovo (questo giro): riduzione del rumore, e un riconoscimento del soggetto onestamente NON collegato al color-matching
+
+Richiesta dell'utente: "puoi provare anche a implementare un riconoscimento soggetto, riduzione del
+rumore colore e luminanza?".
+
+**Riduzione del rumore**: fatta e verificata sulle foto vere. Due nuovi controlli (luminanza e
+colore, 0-100, esportati nei tag `.xmp` reali del pannello Dettaglio Lightroom/ACR) che sfocano
+separatamente la luminosità e il colore in spazio Lab, con protezione ai bordi in modo che i dettagli
+veri della scena (per esempio la mesh di una griglia) restino nitidi mentre le zone piatte e rumorose
+vengono ripulite. Misurato con la rugosità locale (non la deviazione standard grezza, che confonderebbe
+un vero gradiente di luce con rumore): 39-45% di riduzione del rumore di luminanza, 35.7% del rumore
+cromatico, a piena intensità.
+
+**Riconoscimento soggetto**: implementato con una tecnica classica (contrasto di colore + centratura
+fotografica, non un modello ML) e verificato — su una foto vera, illumina correttamente l'auto e
+lascia scuro l'asfalto. Ho però provato a usarlo per migliorare ulteriormente "Incolla impostazioni"
+(pesare l'abbinamento colore verso il soggetto invece che sull'intera foto) e la misura sulle foto
+vere dell'utente ha mostrato un peggioramento, non un miglioramento: lo scarto di tonalità dei sedili,
+già ridotto a 1.3° dal fix precedente, saliva a 9.5° con questo collegamento attivo. Invece di
+consegnare una regressione mascherata da funzionalità nuova, ho annullato completamente quel
+collegamento (riverificando che il fix della tinta tornasse esattamente com'era) e ho pubblicato il
+riconoscimento del soggetto come funzione indipendente e ispezionabile
+(`compute_subject_saliency_preview`, restituisce una mappa in scala di grigi), pronta per un futuro
+utilizzo guidato dall'utente in UI ma non ancora collegata a nessuna regolazione automatica. Dettagli
+tecnici completi, inclusa la causa della regressione, in `engine/README.md`.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

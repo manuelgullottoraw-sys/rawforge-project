@@ -62,6 +62,8 @@ pub fn generate_lightroom_xmp(look: &HarmonicLook) -> String {
         crs:Blacks2012="{blacks}"
         crs:Vibrance="{vibrance}"
         crs:Saturation="{saturation}"
+        crs:Luminance="{noise_luma}"
+        crs:Color="{noise_color}"
         {hsl_fields}crs:SplitToningShadowHue="{sh_hue}"
         crs:SplitToningShadowSaturation="{sh_sat}"
         crs:SplitToningHighlightHue="{hl_hue}"
@@ -90,6 +92,8 @@ pub fn generate_lightroom_xmp(look: &HarmonicLook) -> String {
         blacks = look.blacks,
         vibrance = look.vibrance,
         saturation = look.saturation,
+        noise_luma = look.noise_reduction_luma,
+        noise_color = look.noise_reduction_color,
         hsl_fields = hsl_fields,
         sh_hue = look.split_toning.shadow_hue,
         sh_sat = look.split_toning.shadow_sat,
@@ -133,5 +137,15 @@ mod tests {
         let xmp = generate_lightroom_xmp(&look);
         assert!(xmp.contains("crs:Temperature=\"5500\""));
         assert!(xmp.contains("crs:Exposure2012=\"0.00\""));
+        assert!(xmp.contains("crs:Luminance=\"0\""), "riduzione rumore di default deve esportare 0, non essere omessa");
+        assert!(xmp.contains("crs:Color=\"0\""));
+    }
+
+    #[test]
+    fn noise_reduction_amounts_are_exported_to_the_real_lightroom_detail_panel_tags() {
+        let look = HarmonicLook { noise_reduction_luma: 40, noise_reduction_color: 65, ..Default::default() };
+        let xmp = generate_lightroom_xmp(&look);
+        assert!(xmp.contains("crs:Luminance=\"40\""));
+        assert!(xmp.contains("crs:Color=\"65\""));
     }
 }

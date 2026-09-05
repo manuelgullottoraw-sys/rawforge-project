@@ -69,6 +69,9 @@ pub struct HarmonicLookFfi {
     pub wb_gradient_vertical: bool,
     pub wb_gradient_position: i32,
     pub wb_gradient_spread: i32,
+    /// Riduzione rumore (0..100 ciascuno) — vedi `core_types::HarmonicLook`.
+    pub noise_reduction_luma: i32,
+    pub noise_reduction_color: i32,
 }
 
 /// Adatta un `Vec<i32>` di lunghezza arbitraria a un array fisso di 8 elementi
@@ -118,6 +121,8 @@ impl From<core_types::HarmonicLook> for HarmonicLookFfi {
             wb_gradient_vertical: look.wb_gradient_vertical,
             wb_gradient_position: look.wb_gradient_position,
             wb_gradient_spread: look.wb_gradient_spread,
+            noise_reduction_luma: look.noise_reduction_luma,
+            noise_reduction_color: look.noise_reduction_color,
         }
     }
 }
@@ -163,6 +168,8 @@ impl From<HarmonicLookFfi> for core_types::HarmonicLook {
             wb_gradient_vertical: look.wb_gradient_vertical,
             wb_gradient_position: look.wb_gradient_position,
             wb_gradient_spread: look.wb_gradient_spread,
+            noise_reduction_luma: look.noise_reduction_luma,
+            noise_reduction_color: look.noise_reduction_color,
         }
     }
 }
@@ -207,6 +214,43 @@ pub fn extract_look_from_reference_image(
         .map_err(|e| EngineError::DecodeError { reason: e.to_string() })?;
     let look = harmonic::extract_look_from_reference(&img, &look_name);
     Ok(look.into())
+}
+
+/// Anteprima ispezionabile del "probabile soggetto" di un'immagine —
+/// `harmonic::compute_saliency_map` reso come immagine in scala di grigi
+/// (bianco = alta salienza, nero = bassa) alla stessa risoluzione di analisi
+/// usata internamente (max 512px sul lato lungo, non piena risoluzione: è
+/// solo un'anteprima diagnostica, non un dato da usare per un crop o una
+/// maschera di precisione).
+///
+/// **Perché questa funzione esiste ma non è collegata a "Incolla
+/// impostazioni"**: `compute_saliency_map` è un'euristica di contrasto
+/// globale di colore + prior di centratura (vedi il commento esteso su
+/// quella funzione in `harmonic` per il funzionamento e i limiti dichiarati)
+/// — NON un riconoscimento semantico del soggetto (non sa cosa sia un'auto o
+/// un volto). Un primo tentativo di usarla per pesare l'estrazione HSL e
+/// l'hue-matching è stato scartato dopo averlo misurato su una foto vera:
+/// peggiorava la convergenza di tonalità appena corretta (da un divario di
+/// 1.3° a 9.5° dal campione), perché la salienza di ciascuna foto è calcolata
+/// in modo indipendente dall'altra e può enfatizzare porzioni diverse dello
+/// stesso soggetto reale. Esposta qui invece come funzione autonoma e
+/// ispezionabile: la UI può mostrarla come overlay ("ecco cosa il motore
+/// considera il soggetto") per un futuro strumento di selezione guidata, senza
+/// che influenzi silenziosamente il color matching automatico.
+#[uniffi::export]
+pub fn compute_subject_saliency_preview(image_bytes: Vec<u8>) -> Result<Vec<u8>, EngineError> {
+    let img = image::load_from_memory(&image_bytes)
+        .map_err(|e| EngineError::DecodeError { reason: e.to_string() })?;
+    let analysis = img.resize(512, 512, image::imageops::FilterType::Triangle);
+    let rgba = analysis.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let saliency = harmonic::compute_saliency_map(&rgba);
+
+    let mut out = image::GrayImage::new(width, height);
+    for (i, px) in out.pixels_mut().enumerate() {
+        px.0[0] = (saliency[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    encode_preview_as_png(&image::DynamicImage::ImageLuma8(out))
 }
 
 /// Esporta un `HarmonicLookFfi` come preset Lightroom `.xmp` (docs/ARCHITECTURE.md, §5).
@@ -586,6 +630,25 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn saliency_preview_reports_error_on_bad_bytes() {
+        let result = compute_subject_saliency_preview(vec![0, 1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn saliency_preview_returns_a_valid_grayscale_png_at_analysis_resolution() {
+        // `image::DynamicImage::resize` riscala per STARE DENTRO 512x512
+        // preservando l'aspect ratio — anche ingrandendo se la sorgente è più
+        // piccola (qui: un quadrato piccolo diventa 512x512, non resta 20x20).
+        let bytes = png_bytes_of_solid_color(20, [180, 60, 60]);
+        let result = compute_subject_saliency_preview(bytes).unwrap();
+        assert!(!result.is_empty());
+        let decoded = image::load_from_memory(&result).unwrap();
+        assert_eq!(decoded.width(), 512);
+        assert_eq!(decoded.height(), 512);
+    }
+
     // NB: nessun file RAW reale è disponibile in questo ambiente (nessuna
     // fotocamera, nessun campione scaricabile qui) — questi test coprono solo
     // i percorsi di errore su input non validi, non un vero round-trip di
@@ -641,6 +704,8 @@ mod tests {
         original.wb_gradient_vertical = false;
         original.wb_gradient_position = 65;
         original.wb_gradient_spread = 20;
+        original.noise_reduction_luma = 35;
+        original.noise_reduction_color = 60;
 
         let ffi: HarmonicLookFfi = original.clone().into();
         let round_tripped: core_types::HarmonicLook = ffi.into();
@@ -665,6 +730,8 @@ mod tests {
         assert_eq!(round_tripped.wb_gradient_vertical, original.wb_gradient_vertical);
         assert_eq!(round_tripped.wb_gradient_position, original.wb_gradient_position);
         assert_eq!(round_tripped.wb_gradient_spread, original.wb_gradient_spread);
+        assert_eq!(round_tripped.noise_reduction_luma, original.noise_reduction_luma);
+        assert_eq!(round_tripped.noise_reduction_color, original.noise_reduction_color);
     }
 
     fn png_bytes_of_solid_color(size: u32, rgb: [u8; 3]) -> Vec<u8> {
