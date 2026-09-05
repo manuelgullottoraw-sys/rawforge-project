@@ -134,8 +134,12 @@ actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
         )
     }
 
-    actual fun renderFullResolution(look: EditableLook): Result<ByteArray> = runCatching {
-        inner.renderFullResolution(look.toFfi())
+    actual fun renderFullResolutionExport(look: EditableLook): Result<FullResolutionExport> = runCatching {
+        val result = inner.renderFullResolutionExport(look.toFfi())
+        FullResolutionExport(
+            jpegBytes = result.jpegBytes,
+            masterTiffBytes = result.masterTiffBytes,
+        )
     }
 
     actual fun close() = inner.close()

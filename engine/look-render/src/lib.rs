@@ -18,6 +18,22 @@
 //! trasferire lo STILE caldo/freddo di un look è sufficiente. Sharpening resta
 //! pianificato per la Fase 3-4 della roadmap (§8); la riduzione del rumore
 //! (luminanza + colore) è implementata qui sotto (`apply_noise_reduction`).
+//!
+//! **Pipeline interna esclusivamente in `f32` (aggiunto in questo giro,
+//! richiesta esplicita dell'utente per un uso editoriale — "non è ammessa la
+//! minima imperfezione")**: `render_look_core` (il vero motore, sotto) lavora
+//! SEMPRE su un buffer `f32` per canale, dall'ingresso all'uscita, qualunque
+//! sia la precisione dell'immagine sorgente — mai un arrotondamento a 8 bit
+//! nel mezzo della catena. `render_preview_with_look` (anteprima interattiva,
+//! invariata nella firma) resta una conversione u8 -> f32 -> u8 attorno a
+//! questo stesso motore: economica, pensata per essere ridisegnata ad ogni
+//! tick di uno slider, quindi il suo output finale a 8 bit va comunque bene
+//! (è solo per lo schermo). `render_full_resolution_with_look` (nuova) è
+//! invece l'unica pensata per il file consegnato all'utente: stesso motore,
+//! ma senza MAI quantizzare a 8 bit — restituisce `DynamicImage::ImageRgb32F`,
+//! che `rawforge-ffi` codifica come JPEG (per la consegna) e come TIFF a 16
+//! bit senza perdita (per il "master") a partire dallo STESSO rendering,
+//! calcolato una sola volta.
 
 use color_science::{hsl_to_rgb, linear_rgb_to_lab, lab_to_linear_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
 use core_types::{HarmonicLook, MaskTarget};
@@ -26,6 +42,80 @@ use image::DynamicImage;
 use rayon::prelude::*;
 
 const HUE_BANDS: usize = 8;
+
+/// Buffer di lavoro interno: RGBA in virgola mobile a 32 bit, canali 0.0..1.0
+/// (sRGB-encoded, NON lineare — stessa convenzione dei valori u8/255 che
+/// sostituisce). Il canale alpha non ha un significato fotografico reale (le
+/// foto non hanno mai trasparenza) — è mantenuto solo perché tutto il resto
+/// del motore, ereditato dalla pipeline u8 preesistente, ragiona a passi di 4
+/// canali (`chunks_exact(4)`); per il percorso a piena risoluzione resta
+/// sempre 1.0 e viene scartato alla codifica finale.
+type RgbaF32 = image::ImageBuffer<image::Rgba<f32>, Vec<f32>>;
+
+/// Converte QUALUNQUE variante di `DynamicImage` (8 bit o già `f32`, con o
+/// senza alpha) nel buffer di lavoro interno — punto di ingresso unico sia per
+/// l'anteprima interattiva (sempre 8 bit in ingresso) sia per il rendering a
+/// piena risoluzione (`ImageRgb32F`, dal demosaic RAW vero in `raw-decode`, o
+/// ancora 8 bit per una foto JPEG/PNG già sviluppata — vedi
+/// `render_full_resolution_with_look`).
+fn to_rgba_f32(image: &DynamicImage) -> RgbaF32 {
+    match image {
+        DynamicImage::ImageRgba32F(buf) => buf.clone(),
+        DynamicImage::ImageRgb32F(buf) => rgb32f_to_rgba_f32(buf),
+        other => u8_rgba_to_f32(&other.to_rgba8()),
+    }
+}
+
+fn u8_rgba_to_f32(rgba8: &image::RgbaImage) -> RgbaF32 {
+    let (width, height) = rgba8.dimensions();
+    let mut out = vec![0f32; rgba8.as_raw().len()];
+    out.par_iter_mut()
+        .zip(rgba8.as_raw().par_iter())
+        .for_each(|(o, &i)| *o = i as f32 / 255.0);
+    image::ImageBuffer::from_raw(width, height, out).expect("stessa dimensione del buffer sorgente")
+}
+
+fn rgb32f_to_rgba_f32(buf: &image::ImageBuffer<image::Rgb<f32>, Vec<f32>>) -> RgbaF32 {
+    let (width, height) = buf.dimensions();
+    let src = buf.as_raw();
+    let mut out = vec![0f32; src.len() / 3 * 4];
+    out.par_chunks_mut(4).zip(src.par_chunks(3)).for_each(|(o, i)| {
+        o[0] = i[0];
+        o[1] = i[1];
+        o[2] = i[2];
+        o[3] = 1.0;
+    });
+    image::ImageBuffer::from_raw(width, height, out).expect("stessa dimensione del buffer sorgente")
+}
+
+/// Quantizza il buffer di lavoro a RGBA 8 bit — usata solo dal percorso
+/// dell'anteprima interattiva (`render_preview_with_look`) e per derivare uno
+/// snapshot 8 bit ad uso interno della maschera di salienza (vedi
+/// `render_look_core`), MAI dal percorso a piena risoluzione.
+fn rgba_f32_to_u8(buf: &RgbaF32) -> image::RgbaImage {
+    let (width, height) = buf.dimensions();
+    let mut out = vec![0u8; buf.as_raw().len()];
+    out.par_iter_mut()
+        .zip(buf.as_raw().par_iter())
+        .for_each(|(o, &i)| *o = (i.clamp(0.0, 1.0) * 255.0).round() as u8);
+    image::ImageBuffer::from_raw(width, height, out).expect("stessa dimensione del buffer sorgente")
+}
+
+/// Scarta il canale alpha (sempre 1.0, senza significato fotografico) e
+/// clampa a 0.0..1.0 — l'UNICA quantizzazione del percorso a piena
+/// risoluzione è quella che fa poi `rawforge-ffi` codificando JPEG (8 bit) o
+/// TIFF (16 bit): qui restiamo in `f32` fino all'ultimo momento utile.
+fn rgba_f32_to_rgb32f(buf: &RgbaF32) -> image::ImageBuffer<image::Rgb<f32>, Vec<f32>> {
+    let (width, height) = buf.dimensions();
+    let src = buf.as_raw();
+    let mut out = vec![0f32; src.len() / 4 * 3];
+    out.par_chunks_mut(3).zip(src.par_chunks(4)).for_each(|(o, i)| {
+        o[0] = i[0].clamp(0.0, 1.0);
+        o[1] = i[1].clamp(0.0, 1.0);
+        o[2] = i[2].clamp(0.0, 1.0);
+    });
+    image::ImageBuffer::from_raw(width, height, out).expect("stessa dimensione del buffer sorgente")
+}
 
 /// Soglia di salienza (0..1) sopra la quale un pixel è considerato parte del
 /// "Soggetto" da `apply_subject_mask` — sotto, parte dello "Sfondo". Scelta
@@ -384,7 +474,7 @@ fn gaussian_blur_channel(data: &[f32], width: usize, height: usize, sigma: f32) 
 /// "sbordi" oltre un contorno netto (es. il rosso di un soggetto che tinge lo
 /// sfondo vicino), lo stesso principio con cui qualunque riduzione rumore
 /// cromatica reale è guidata dai bordi di luminanza, non dai propri.
-fn apply_noise_reduction(base: &image::RgbaImage, look: &HarmonicLook) -> image::RgbaImage {
+fn apply_noise_reduction(base: &RgbaF32, look: &HarmonicLook) -> RgbaF32 {
     if look.noise_reduction_luma <= 0 && look.noise_reduction_color <= 0 {
         return base.clone();
     }
@@ -406,17 +496,17 @@ fn apply_noise_reduction(base: &image::RgbaImage, look: &HarmonicLook) -> image:
     let mut l_ch = vec![0f32; n];
     let mut a_ch = vec![0f32; n];
     let mut b_ch = vec![0f32; n];
-    let mut alpha_ch = vec![0u8; n];
+    let mut alpha_ch = vec![0f32; n];
     l_ch.par_iter_mut()
         .zip(a_ch.par_iter_mut())
         .zip(b_ch.par_iter_mut())
         .zip(alpha_ch.par_iter_mut())
-        .zip(base.par_chunks(4))
+        .zip(base.as_raw().par_chunks(4))
         .for_each(|((((l, a), b), alpha), px)| {
             let lin = [
-                srgb_to_linear(px[0] as f32 / 255.0),
-                srgb_to_linear(px[1] as f32 / 255.0),
-                srgb_to_linear(px[2] as f32 / 255.0),
+                srgb_to_linear(px[0].clamp(0.0, 1.0)),
+                srgb_to_linear(px[1].clamp(0.0, 1.0)),
+                srgb_to_linear(px[2].clamp(0.0, 1.0)),
             ];
             let lab = linear_rgb_to_lab(lin);
             *l = lab[0];
@@ -455,9 +545,9 @@ fn apply_noise_reduction(base: &image::RgbaImage, look: &HarmonicLook) -> image:
             let b_final = b_ch[i] + (blurred_b[i] - b_ch[i]) * flat_weight;
 
             let lin = lab_to_linear_rgb([l_final, a_final, b_final]);
-            out_px[0] = (linear_to_srgb(lin[0]).clamp(0.0, 1.0) * 255.0).round() as u8;
-            out_px[1] = (linear_to_srgb(lin[1]).clamp(0.0, 1.0) * 255.0).round() as u8;
-            out_px[2] = (linear_to_srgb(lin[2]).clamp(0.0, 1.0) * 255.0).round() as u8;
+            out_px[0] = linear_to_srgb(lin[0]).clamp(0.0, 1.0);
+            out_px[1] = linear_to_srgb(lin[1]).clamp(0.0, 1.0);
+            out_px[2] = linear_to_srgb(lin[2]).clamp(0.0, 1.0);
             out_px[3] = alpha_ch[i];
         });
     out
@@ -473,7 +563,7 @@ fn apply_noise_reduction(base: &image::RgbaImage, look: &HarmonicLook) -> image:
 /// un'immagine a tinta unita (senza dettaglio da nessuna banda) resta
 /// invariata qualunque sia l'amount — solo il DETTAGLIO locale cambia
 /// ampiezza, non la luminosità media, a differenza di "Chiarezza"/contrasto.
-fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::RgbaImage {
+fn apply_texture_bands(base: &RgbaF32, look: &HarmonicLook) -> RgbaF32 {
     if look.texture_fine == 0 && look.texture_medium == 0 && look.texture_coarse == 0 {
         return base.clone();
     }
@@ -481,6 +571,10 @@ fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::R
     const SIGMA_MEDIUM: f32 = 4.0;
     const SIGMA_COARSE: f32 = 10.0;
 
+    // `image::imageops::blur` è generica sul tipo di subpixel (richiede solo
+    // `Into<f32> + From<f32>`, soddisfatto da `f32` stessa banalmente) — nessun
+    // giro perdita-precisione conversione-u8 qui, a differenza di quando
+    // questa funzione operava su `RgbaImage` a 8 bit.
     let blur_fine = image::imageops::blur(base, SIGMA_FINE);
     let blur_medium = image::imageops::blur(base, SIGMA_MEDIUM);
     let blur_coarse = image::imageops::blur(base, SIGMA_COARSE);
@@ -501,15 +595,15 @@ fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::R
             for i in 0..width as usize {
                 let px = i * 4;
                 for c in 0..3 {
-                    let base_v = base_row[px + c] as f32;
-                    let bf = bf_row[px + c] as f32;
-                    let bm = bm_row[px + c] as f32;
-                    let bc = bc_row[px + c] as f32;
+                    let base_v = base_row[px + c];
+                    let bf = bf_row[px + c];
+                    let bm = bm_row[px + c];
+                    let bc = bc_row[px + c];
                     let f_detail = base_v - bf;
                     let m_detail = bf - bm;
                     let c_detail = bm - bc;
                     let reconstructed = bc + f_detail * fine_mul + m_detail * medium_mul + c_detail * coarse_mul;
-                    out_row[px + c] = reconstructed.round().clamp(0.0, 255.0) as u8;
+                    out_row[px + c] = reconstructed.clamp(0.0, 1.0);
                 }
                 out_row[px + 3] = base_row[px + 3];
             }
@@ -532,8 +626,35 @@ fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::R
 /// della texture, anch'essa spaziale): è pensata come un raffinamento LOCALE
 /// sopra il Look già completo, non un sostituto delle regolazioni globali.
 pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> DynamicImage {
-    let rgba = image.to_rgba8();
-    let rgba = apply_noise_reduction(&rgba, look);
+    let input = to_rgba_f32(image);
+    let out = render_look_core(&input, look);
+    DynamicImage::ImageRgba8(rgba_f32_to_u8(&out))
+}
+
+/// Come [`render_preview_with_look`], ma per il file consegnato all'utente
+/// (JPEG di esportazione + master TIFF 16 bit), non per lo schermo: stesso
+/// motore (`render_look_core`), stessa qualsiasi sorgente accettata (8 bit o
+/// già `f32`), ma **nessuna quantizzazione a 8 bit qui** — restituisce
+/// `DynamicImage::ImageRgb32F`. È `rawforge-ffi` a fare l'unica
+/// quantizzazione finale, una volta per la JPEG (8 bit) e una volta per il
+/// TIFF (16 bit), a partire dallo STESSO rendering `f32` calcolato qui una
+/// sola volta (vedi `PhotoEditSession::render_full_resolution_export`).
+pub fn render_full_resolution_with_look(image: &DynamicImage, look: &HarmonicLook) -> DynamicImage {
+    let input = to_rgba_f32(image);
+    let out = render_look_core(&input, look);
+    DynamicImage::ImageRgb32F(rgba_f32_to_rgb32f(&out))
+}
+
+/// Il vero motore di rendering, condiviso da [`render_preview_with_look`]
+/// (anteprima interattiva, ridisegnata ad ogni tick di uno slider) e
+/// [`render_full_resolution_with_look`] (file consegnato all'utente):
+/// un'unica implementazione dell'algoritmo, in `f32` dall'ingresso
+/// all'uscita — le due funzioni pubbliche differiscono SOLO per come
+/// convertono l'immagine sorgente in ingresso e il risultato in uscita, mai
+/// per la matematica del rendering stesso. Vedi il commento di modulo in
+/// testa al file per il perché di questa scelta.
+fn render_look_core(rgba: &RgbaF32, look: &HarmonicLook) -> RgbaF32 {
+    let rgba = apply_noise_reduction(rgba, look);
     let (width, height) = rgba.dimensions();
     let row_stride = 4 * width as usize;
 
@@ -545,8 +666,21 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     // solo da mostrare). Calcolata solo se la maschera è attiva: è un costo
     // non trascurabile (scansione completa dell'immagine più un confronto
     // fra tutti i bin occupati) da evitare quando nessuna maschera è in uso.
+    //
+    // **Semplificazione deliberata**: `compute_saliency_map` (crate
+    // `harmonic`) accetta solo un buffer 8 bit — qui le passiamo uno snapshot
+    // quantizzato del buffer f32 corrente invece di propagare `f32` anche
+    // dentro `harmonic`. È una scelta ragionata, non una svista: il risultato
+    // è un PESO di maschera 0..1 (quanto un pixel appartiene al "Soggetto"),
+    // non un valore di colore finale — la precisione fotografica che questo
+    // intero giro di lavoro persegue riguarda i PIXEL consegnati all'utente,
+    // non un peso intermedio derivato da un'euristica di contrasto globale
+    // già dichiaratamente approssimativa (vedi i limiti documentati su
+    // `compute_saliency_map` stessa). Propagare `f32` anche lì avrebbe un
+    // costo di manutenzione reale (un'altra API cross-crate da mantenere in
+    // sincronia) per un guadagno di qualità non misurabile su questo output.
     let mask_weights: Option<Vec<f32>> = if look.subject_mask.enabled {
-        Some(compute_saliency_map(&rgba))
+        Some(compute_saliency_map(&rgba_f32_to_u8(&rgba)))
     } else {
         None
     };
@@ -631,9 +765,9 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                     wb_gain_a
                 };
                 let mut linear = [
-                    srgb_to_linear(in_px[0] as f32 / 255.0),
-                    srgb_to_linear(in_px[1] as f32 / 255.0),
-                    srgb_to_linear(in_px[2] as f32 / 255.0),
+                    srgb_to_linear(in_px[0].clamp(0.0, 1.0)),
+                    srgb_to_linear(in_px[1].clamp(0.0, 1.0)),
+                    srgb_to_linear(in_px[2].clamp(0.0, 1.0)),
                 ];
                 for (c, gain) in linear.iter_mut().zip(wb_gain.iter()) {
                     *c = (*c * exposure_mul * gain).clamp(0.0, 1.0);
@@ -814,9 +948,9 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                 }
 
                 let final_rgb = hsl_to_rgb(hsl);
-                out_px[0] = (final_rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-                out_px[1] = (final_rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
-                out_px[2] = (final_rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                out_px[0] = final_rgb[0].clamp(0.0, 1.0);
+                out_px[1] = final_rgb[1].clamp(0.0, 1.0);
+                out_px[2] = final_rgb[2].clamp(0.0, 1.0);
                 out_px[3] = in_px[3];
             }
         });
@@ -824,9 +958,7 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
     // Texture (separazione di frequenza) è un'operazione spaziale, non
     // per-pixel: va applicata come passata separata sull'immagine già
     // color-gradata dal loop qui sopra, non dentro di esso.
-    let out = apply_texture_bands(&out, look);
-
-    DynamicImage::ImageRgba8(out)
+    apply_texture_bands(&out, look)
 }
 
 /// Sposta l'hue di un pixel verso quello del toning e alza leggermente la
@@ -1681,5 +1813,103 @@ mod tests {
             baseline.get_pixel(8, 8),
             "una tinta piatta non deve cambiare con la riduzione rumore, qualunque sia l'intensità"
         );
+    }
+
+    // --- Pipeline f32 a piena risoluzione (aggiunto in questo giro) ---
+
+    #[test]
+    fn render_full_resolution_with_look_returns_an_rgb32f_image_of_the_same_dimensions() {
+        let img = solid_image(6, 4, [90, 150, 210]);
+        let rendered = render_full_resolution_with_look(&img, &HarmonicLook::default());
+        assert!(
+            rendered.as_rgb32f().is_some(),
+            "il rendering a piena risoluzione deve restituire ImageRgb32F, non 8 bit"
+        );
+        assert_eq!(rendered.dimensions(), img.dimensions());
+    }
+
+    #[test]
+    fn full_resolution_render_preserves_sub_8bit_precision_not_snapped_to_a_255_step_grid() {
+        // 85.5/255 cade ESATTAMENTE a metà fra due livelli 8 bit consecutivi
+        // (85 e 86): se in un punto qualunque della pipeline il buffer
+        // venisse arrotondato a 8 bit (come accadeva prima di questo giro,
+        // con la riduzione rumore che scriveva un `RgbaImage` a metà
+        // pipeline), il valore in uscita finirebbe forzatamente su UNO dei
+        // due livelli — qui verifichiamo che non sia agganciato a nessuno dei
+        // due (a differenza di un valore come 1/3, che per puro caso
+        // numerico cade quasi esattamente su un livello già esistente,
+        // 85/255, e non sarebbe un test valido).
+        let value = 85.5_f32 / 255.0;
+        let buf: image::ImageBuffer<image::Rgb<f32>, Vec<f32>> =
+            ImageBuffer::from_fn(4, 4, |_, _| image::Rgb([value, value, value]));
+        let source = DynamicImage::ImageRgb32F(buf);
+
+        let rendered = render_full_resolution_with_look(&source, &HarmonicLook::default());
+        let out = rendered.as_rgb32f().expect("ImageRgb32F atteso");
+        let out_v = out.get_pixel(0, 0)[0];
+
+        let nearest_255_step = (out_v * 255.0).round() / 255.0;
+        assert!(
+            (out_v - nearest_255_step).abs() > 0.0005,
+            "il valore f32 in uscita ({out_v}) non deve essere agganciato a un livello 0..255: pipeline non più esclusivamente f32?"
+        );
+        // Con un Look neutro il round-trip srgb<->lineare e HSL<->RGB deve
+        // restituire (quasi) lo stesso valore in ingresso, non una versione
+        // quantizzata: la differenza residua è solo l'errore in virgola
+        // mobile dei round-trip matematici, non un arrotondamento a step fisso.
+        assert!((out_v - value).abs() < 0.01, "un Look neutro non deve alterare percettibilmente il valore: {out_v} vs {value}");
+    }
+
+    #[test]
+    fn render_full_resolution_and_render_preview_agree_within_8bit_rounding_on_an_8bit_source() {
+        // Stesso motore (`render_look_core`) dietro entrambe le funzioni
+        // pubbliche: partendo dalla STESSA sorgente 8 bit e applicando lo
+        // STESSO Look, i due percorsi devono restituire lo stesso colore a
+        // meno dell'arrotondamento finale a 8 bit del percorso anteprima.
+        let img = solid_image(4, 4, [60, 130, 200]);
+        let mut look = HarmonicLook::default();
+        look.exposure_ev = 0.3;
+        look.contrast = 15;
+
+        let preview_px = render_preview_with_look(&img, &look).to_rgba8().get_pixel(0, 0).0;
+        let full = render_full_resolution_with_look(&img, &look);
+        let full_rgb32f = full.as_rgb32f().expect("ImageRgb32F atteso");
+        let full_px = full_rgb32f.get_pixel(0, 0);
+
+        for c in 0..3 {
+            let full_as_u8 = (full_px[c].clamp(0.0, 1.0) * 255.0).round() as i32;
+            let diff = (full_as_u8 - preview_px[c] as i32).abs();
+            assert!(diff <= 1, "canale {c}: pieno={full_as_u8} anteprima={} (differenza oltre l'arrotondamento atteso)", preview_px[c]);
+        }
+    }
+
+    #[test]
+    fn u8_to_f32_and_back_round_trip_is_lossless_for_every_byte_value() {
+        // La conversione u8 <-> f32 usata ai bordi della pipeline (anteprima
+        // interattiva) non deve introdurre alcuna perdita: ogni singolo
+        // valore 0..255 deve tornare esattamente identico dopo /255.0 poi
+        // *255.0 arrotondato.
+        let img: image::RgbaImage = ImageBuffer::from_fn(256, 1, |x, _| {
+            let v = x as u8;
+            Rgba([v, v, v, 255])
+        });
+        let as_f32 = u8_rgba_to_f32(&img);
+        let back = rgba_f32_to_u8(&as_f32);
+        assert_eq!(back, img, "il giro u8 -> f32 -> u8 deve essere perfettamente senza perdita per ogni livello");
+    }
+
+    #[test]
+    fn rgb32f_and_rgba_f32_round_trip_preserves_color_and_forces_full_alpha() {
+        // 0.25/0.5/0.75: frazioni binarie esatte (potenze di 2), scelte
+        // apposta per poter confrontare i risultati con `assert_eq!` esatto
+        // senza rischiare un falso negativo per errore di arrotondamento
+        // dell'ultimo bit (cosa che capiterebbe con una frazione come 0.1,
+        // non rappresentabile esattamente in virgola mobile binaria).
+        let buf: image::ImageBuffer<image::Rgb<f32>, Vec<f32>> =
+            ImageBuffer::from_fn(3, 2, |x, y| image::Rgb([x as f32 * 0.25, y as f32 * 0.25, 0.75]));
+        let as_rgba = rgb32f_to_rgba_f32(&buf);
+        assert_eq!(as_rgba.get_pixel(2, 1).0, [0.5, 0.25, 0.75, 1.0]);
+        let back = rgba_f32_to_rgb32f(&as_rgba);
+        assert_eq!(back.get_pixel(2, 1).0, [0.5, 0.25, 0.75]);
     }
 }

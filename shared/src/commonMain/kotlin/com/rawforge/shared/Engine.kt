@@ -128,12 +128,17 @@ expect class PhotoEditSession {
     fun renderPreview(look: EditableLook): Result<RenderedPreview>
 
     /**
-     * Renderizza `look` sulla foto a piena risoluzione (l'anteprima
-     * incorporata originale, non ancora un demosaic RAW completo — limite
-     * già noto) — più lento, va usato solo per l'esportazione finale del
-     * risultato, non ad ogni modifica.
+     * Renderizza `look` sulla foto a piena risoluzione — per un RAW vero, dal
+     * demosaic COMPLETO del sensore (cambio architetturale di questo giro:
+     * prima si limitava all'anteprima incorporata dalla fotocamera, limite
+     * ora eliminato) — più lento, va usato solo per l'esportazione finale del
+     * risultato, non ad ogni modifica. Restituisce DUE file dallo stesso
+     * rendering: un JPEG ad alta qualità pronto per la consegna/condivisione,
+     * e un master TIFF a 16 bit per canale senza perdita da conservare —
+     * richiesta esplicita dell'utente per un uso editoriale ("non è ammessa
+     * la minima imperfezione").
      */
-    fun renderFullResolution(look: EditableLook): Result<ByteArray>
+    fun renderFullResolutionExport(look: EditableLook): Result<FullResolutionExport>
 
     /** Libera la foto decodificata cacheiata lato Rust. Va chiamata quando
      * questa sessione non serve più (nuova foto importata, o chiusura app). */
@@ -178,6 +183,19 @@ data class RenderedPreview(
     val imageBytes: ByteArray,
     val shadowClipFraction: Float,
     val highlightClipFraction: Float,
+)
+
+/**
+ * Esito di `PhotoEditSession.renderFullResolutionExport`: lo STESSO rendering
+ * a piena risoluzione (pipeline `f32` esclusiva, nessuna quantizzazione a 8
+ * bit prima di questo punto — vedi `look_render::render_full_resolution_with_look`
+ * lato Rust) incodificato in due file — `jpegBytes` (JPEG ad alta qualità,
+ * pronto per la consegna pratica) e `masterTiffBytes` (TIFF a 16 bit per
+ * canale, senza perdita, da conservare come originale sviluppato).
+ */
+data class FullResolutionExport(
+    val jpegBytes: ByteArray,
+    val masterTiffBytes: ByteArray,
 )
 
 /**

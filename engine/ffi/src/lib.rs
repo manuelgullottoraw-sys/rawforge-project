@@ -345,6 +345,80 @@ fn encode_preview_as_png(image: &image::DynamicImage) -> Result<Vec<u8>, EngineE
     Ok(png_bytes)
 }
 
+/// Qualità JPEG (0..100) usata per l'esportazione a piena risoluzione
+/// (`PhotoEditSession::render_full_resolution`, quindi sia il pulsante
+/// "Esporta" sia l'elaborazione in batch). Scelta esplicita dell'utente:
+/// prima l'esportazione produceva PNG (senza perdita, ma file enormi e non
+/// direttamente utilizzabili in molti flussi fotografici che si aspettano
+/// JPEG). 92 è il valore comunemente raccomandato come "visivamente senza
+/// perdita" per una JPEG a 3 canali (fonte: la stessa soglia usata da
+/// `libjpeg`/Lightroom per l'esportazione "Qualità: 100" percepita — oltre
+/// 90-92 la dimensione del file cresce molto più della qualità percepita) —
+/// qui deliberatamente ALTA (non il default 75 di molte librerie, pensato per
+/// il web, non per una consegna fotografica) proprio perché l'utente ha
+/// segnalato una qualità insoddisfacente sull'esportazione.
+const FULL_RESOLUTION_JPEG_QUALITY: u8 = 92;
+
+fn encode_full_resolution_as_jpeg(image: &image::DynamicImage) -> Result<Vec<u8>, EngineError> {
+    let mut jpeg_bytes = Vec::new();
+    let mut encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, FULL_RESOLUTION_JPEG_QUALITY);
+    // Il JPEG non supporta un canale alpha: `write_image` con `ExtendedColorType::Rgb8`
+    // su un buffer RGBA scarterebbe silenziosamente il canale alpha da solo se gli
+    // passassimo l'immagine RGBA con quel color type dichiarato male — qui invece
+    // convertiamo esplicitamente a RGB8 PRIMA di incodificare, così il colore
+    // dichiarato all'encoder corrisponde davvero ai bytes forniti.
+    //
+    // Questa è l'UNICA quantizzazione a 8 bit di tutta la catena (demosaic ->
+    // `look_render::render_full_resolution_with_look`, sempre `f32` fino a
+    // qui): `image.to_rgb8()` su un `ImageRgb32F` converte scalando 0.0..1.0
+    // -> 0..255 con arrotondamento, esattamente una volta, qui, non prima.
+    let rgb = image.to_rgb8();
+    encoder
+        .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .map_err(|e| EngineError::RawFileError {
+            reason: e.to_string(),
+        })?;
+    Ok(jpeg_bytes)
+}
+
+/// Master senza perdita a 16 bit per canale (TIFF), accanto al JPEG di
+/// consegna — richiesta esplicita dell'utente per un uso editoriale ("non è
+/// ammessa la minima imperfezione"): il JPEG a qualunque qualità resta
+/// comunque una compressione con perdita (anche se impercettibile a 92) e a
+/// 8 bit per canale; questo file preserva la piena precisione del rendering
+/// `f32` fino all'unico arrotondamento realmente inevitabile per un formato
+/// su disco — 16 bit per canale (65536 livelli, contro i 256 dell'8 bit: lo
+/// stesso arrotondamento qui è centinaia di volte più fine, praticamente
+/// invisibile anche al gradiente più ampio di cielo o pelle).
+///
+/// Convertito sempre da `image.to_rgb32f()` (non presuppone che l'input sia
+/// già `ImageRgb32F`): innocuo se lo è già (nessuna perdita aggiuntiva), ma
+/// rende questa funzione sicura da chiamare anche se un domani un percorso
+/// diverso da `render_full_resolution_with_look` la richiamasse con
+/// un'immagine 8 bit.
+fn encode_master_as_tiff16(image: &image::DynamicImage) -> Result<Vec<u8>, EngineError> {
+    let rgb32f = image.to_rgb32f();
+    let (width, height) = rgb32f.dimensions();
+    let mut pixels_u16 = Vec::with_capacity(rgb32f.as_raw().len());
+    for &v in rgb32f.as_raw() {
+        pixels_u16.push((v.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16);
+    }
+    let rgb16 = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(width, height, pixels_u16).ok_or_else(
+        || EngineError::RawFileError {
+            reason: "dimensioni non valide per il buffer del master TIFF".to_string(),
+        },
+    )?;
+
+    let mut tiff_bytes = Vec::new();
+    image::DynamicImage::ImageRgb16(rgb16)
+        .write_to(&mut std::io::Cursor::new(&mut tiff_bytes), image::ImageFormat::Tiff)
+        .map_err(|e| EngineError::RawFileError {
+            reason: e.to_string(),
+        })?;
+    Ok(tiff_bytes)
+}
+
 /// Decodifica un file RAW vero (bytes in memoria — niente path di filesystem,
 /// per funzionare sia da file picker Desktop sia da content:// URI Android) ed
 /// estrae l'anteprima incorporata dalla fotocamera più i metadati base.
@@ -391,6 +465,16 @@ pub fn is_known_raw_file_name(file_name: String) -> bool {
 /// riconoscimento RAW-vs-sviluppata usata da `Engine.importPhoto` lato Kotlin,
 /// centralizzata qui perché sia l'estrazione del Look sia il nuovo rendering
 /// ne hanno bisogno.
+///
+/// Per i file RAW, `raw_decode::decode_raw_preview` applica già da sola la
+/// correzione di orientamento EXIF (la legge dai metadati che `rawler` ha già
+/// interpretato). Per una foto già sviluppata (JPEG/PNG), invece, la libreria
+/// `image` decodifica i pixel così come sono memorizzati SENZA applicare
+/// l'orientamento — bug reale segnalato dall'utente con foto vere
+/// ("l'orientamento è completamente sballato"): qui lo leggiamo da soli con
+/// `kamadak-exif` (sugli stessi bytes originali, non sull'immagine già
+/// decodificata: il tag vive nei metadati del file, non nei pixel) e
+/// applichiamo la stessa correzione di `raw_decode::apply_exif_orientation`.
 fn decode_any_photo(bytes: &[u8], file_name: &str) -> Result<image::DynamicImage, EngineError> {
     if raw_decode::has_known_raw_extension(file_name) {
         let preview = raw_decode::decode_raw_preview(bytes).map_err(|e| EngineError::RawFileError {
@@ -398,10 +482,58 @@ fn decode_any_photo(bytes: &[u8], file_name: &str) -> Result<image::DynamicImage
         })?;
         Ok(preview.image)
     } else {
-        image::load_from_memory(bytes).map_err(|e| EngineError::DecodeError {
+        let image = image::load_from_memory(bytes).map_err(|e| EngineError::DecodeError {
             reason: e.to_string(),
-        })
+        })?;
+        let orientation = read_exif_orientation(bytes);
+        Ok(raw_decode::apply_exif_orientation(image, orientation))
     }
+}
+
+/// Come [`decode_any_photo`], ma per il file che verrà davvero consegnato
+/// all'utente (JPEG di esportazione + master TIFF), non per un'analisi/
+/// anteprima: per un file RAW vero esegue il demosaic COMPLETO
+/// (`raw_decode::decode_raw_full`, algoritmo PPG sul sensore Bayer reale —
+/// vedi il commento esteso lì per il perché) invece di limitarsi
+/// all'anteprima incorporata dalla fotocamera. Per una foto già sviluppata
+/// (JPEG/PNG) non cambia nulla rispetto a `decode_any_photo`: quei formati
+/// non hanno un "sensore" da ri-demosaicizzare, i pixel del file SONO già la
+/// piena risoluzione.
+///
+/// **Unico punto che la richiama**: `PhotoEditSession::new`, cioè quando
+/// l'utente apre una foto per modificarla — non la foto campione di "Incolla
+/// impostazioni" (`paste_look_from_sample` continua a usare
+/// `decode_any_photo`, l'anteprima veloce: è sufficiente per estrarre
+/// statistiche di tono/colore, e demosaicizzarla per intero raddoppierebbe
+/// il costo di ogni singola foto del batch senza migliorare la qualità del
+/// file consegnato, che dipende solo dal demosaic del TARGET).
+fn decode_any_photo_full(bytes: &[u8], file_name: &str) -> Result<image::DynamicImage, EngineError> {
+    if raw_decode::has_known_raw_extension(file_name) {
+        let full = raw_decode::decode_raw_full(bytes).map_err(|e| EngineError::RawFileError {
+            reason: e.to_string(),
+        })?;
+        Ok(full.image)
+    } else {
+        let image = image::load_from_memory(bytes).map_err(|e| EngineError::DecodeError {
+            reason: e.to_string(),
+        })?;
+        let orientation = read_exif_orientation(bytes);
+        Ok(raw_decode::apply_exif_orientation(image, orientation))
+    }
+}
+
+/// Legge il tag EXIF Orientation (0x0112) direttamente dai bytes originali di
+/// una foto già sviluppata (JPEG, e PNG dove presente — `kamadak-exif`
+/// supporta entrambi i contenitori). Nessun tag presente, un file che non lo
+/// supporta affatto, o bytes non validi: tutti gli stessi caso, `None` — mai
+/// un errore né un panic, per non far fallire l'intera importazione solo
+/// perché manca (o è illeggibile) un singolo metadato opzionale.
+fn read_exif_orientation(bytes: &[u8]) -> Option<u16> {
+    let exif = exif::Reader::new()
+        .read_from_container(&mut std::io::Cursor::new(bytes))
+        .ok()?;
+    let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
+    field.value.get_uint(0).map(|v| v as u16)
 }
 
 /// Esito di "incolla impostazioni": l'anteprima della foto target già
@@ -414,6 +546,17 @@ fn decode_any_photo(bytes: &[u8], file_name: &str) -> Result<image::DynamicImage
 pub struct AdaptedRenderFfi {
     pub rendered_preview_png_bytes: Vec<u8>,
     pub applied_look: HarmonicLookFfi,
+}
+
+/// Esito dell'esportazione a piena risoluzione: lo STESSO rendering `f32`
+/// (`look_render::render_full_resolution_with_look`, calcolato una sola
+/// volta) codificato in due formati — JPEG ad alta qualità per la consegna
+/// pratica, e un master TIFF a 16 bit senza perdita da conservare. Vedi
+/// `PhotoEditSession::render_full_resolution_export`.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FullResolutionExportFfi {
+    pub jpeg_bytes: Vec<u8>,
+    pub master_tiff_bytes: Vec<u8>,
 }
 
 /// Dimensione massima (lato lungo) della copia ridotta che [`PhotoEditSession`]
@@ -552,12 +695,15 @@ fn apply_hue_matching(
 /// dell'intera foto attraverso il confine Kotlin/JNI ad ogni tick di
 /// trascinamento invece che una volta sola all'apertura.
 ///
-/// Tiene DUE copie decodificate: `full_res` (l'anteprima incorporata dalla
-/// fotocamera per un RAW, o l'immagine originale per un JPEG/PNG — non
-/// ancora un demosaic RAW completo, limite già noto) per l'esportazione
-/// finale, e `interactive_preview` (ridotta a
-/// [`INTERACTIVE_PREVIEW_MAX_DIM`]) per il rendering dal vivo mentre si
-/// modifica.
+/// Tiene DUE copie decodificate: `full_res` — per un RAW vero, il demosaic
+/// COMPLETO del sensore (`decode_any_photo_full`, non più solo l'anteprima
+/// incorporata dalla fotocamera: cambio architetturale di questo giro,
+/// richiesto esplicitamente dall'utente per un uso editoriale) — e
+/// `interactive_preview` (ridotta a [`INTERACTIVE_PREVIEW_MAX_DIM`] a
+/// partire dalla STESSA immagine demosaicizzata, non da un'anteprima
+/// potenzialmente diversa: quello che l'utente vede mentre modifica è così
+/// garantito coerente con quello che riceverà) per il rendering dal vivo
+/// mentre si modifica.
 #[derive(uniffi::Object)]
 pub struct PhotoEditSession {
     full_res: image::DynamicImage,
@@ -566,13 +712,21 @@ pub struct PhotoEditSession {
 
 #[uniffi::export]
 impl PhotoEditSession {
-    /// Apre `target_bytes` per l'editing: decodifica una sola volta (RAW-aware)
-    /// e prepara la copia ridotta per il rendering interattivo. Va chiamata
-    /// quando l'utente importa/cambia la foto da modificare, non ad ogni
-    /// modifica di uno slider.
+    /// Apre `target_bytes` per l'editing: decodifica una sola volta (RAW-aware,
+    /// demosaic completo per un RAW vero) e prepara la copia ridotta per il
+    /// rendering interattivo. Va chiamata quando l'utente importa/cambia la
+    /// foto da modificare, non ad ogni modifica di uno slider.
+    ///
+    /// **Nota sulle prestazioni**: per un RAW vero questa chiamata ora
+    /// esegue un demosaic completo (algoritmo PPG su tutta la risoluzione
+    /// del sensore) invece di leggere solo l'anteprima JPEG incorporata —
+    /// più lenta della versione precedente, ma UNA sola volta per foto
+    /// (qui, non ad ogni tick di uno slider): il costo che serve pagare per
+    /// smettere di consegnare all'utente un JPEG di seconda generazione
+    /// generato dalla fotocamera stessa.
     #[uniffi::constructor]
     pub fn new(target_bytes: Vec<u8>, target_file_name: String) -> Result<Self, EngineError> {
-        let full_res = decode_any_photo(&target_bytes, &target_file_name)?;
+        let full_res = decode_any_photo_full(&target_bytes, &target_file_name)?;
         let interactive_preview = downscale_for_interactive_preview(&full_res);
         Ok(Self { full_res, interactive_preview })
     }
@@ -593,13 +747,28 @@ impl PhotoEditSession {
         })
     }
 
-    /// Rendering a piena risoluzione (dell'anteprima incorporata originale,
-    /// non ancora del RAW pieno — limite già noto), da usare solo per
-    /// l'esportazione finale: più lento, non va richiamato ad ogni modifica.
-    pub fn render_full_resolution(&self, look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError> {
+    /// Rendering a piena risoluzione — per un RAW vero, dal demosaic COMPLETO
+    /// del sensore (`self.full_res`, non più solo l'anteprima incorporata),
+    /// da usare solo per l'esportazione finale: più lento, non va richiamato
+    /// ad ogni modifica. Renderizza UNA sola volta con
+    /// `look_render::render_full_resolution_with_look` (pipeline `f32`
+    /// esclusiva, nessuna quantizzazione a 8 bit fino a qui) e incodifica il
+    /// risultato in DUE formati dallo stesso rendering: JPEG ad alta qualità
+    /// per la consegna (`encode_full_resolution_as_jpeg`) e un master TIFF a
+    /// 16 bit senza perdita (`encode_master_as_tiff16`) — richiesta esplicita
+    /// dell'utente per un uso editoriale ("non è ammessa la minima
+    /// imperfezione"), accanto al JPEG, non al suo posto: il JPEG resta
+    /// comunque il file pratico da consegnare/condividere, il TIFF è
+    /// l'originale sviluppato da conservare.
+    pub fn render_full_resolution_export(&self, look: HarmonicLookFfi) -> Result<FullResolutionExportFfi, EngineError> {
         let core_look: core_types::HarmonicLook = look.into();
-        let rendered = look_render::render_preview_with_look(&self.full_res, &core_look);
-        encode_preview_as_png(&rendered)
+        let rendered = look_render::render_full_resolution_with_look(&self.full_res, &core_look);
+        let jpeg_bytes = encode_full_resolution_as_jpeg(&rendered)?;
+        let master_tiff_bytes = encode_master_as_tiff16(&rendered)?;
+        Ok(FullResolutionExportFfi {
+            jpeg_bytes,
+            master_tiff_bytes,
+        })
     }
 
     /// "Incolla le impostazioni" ma sulla scena già decodificata e cacheiata
@@ -1070,9 +1239,11 @@ mod tests {
         let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
         let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
 
-        let full = session.render_full_resolution(look.clone()).unwrap();
-        let full_dims = image::load_from_memory(&full).unwrap().dimensions();
+        let full = session.render_full_resolution_export(look.clone()).unwrap();
+        let full_dims = image::load_from_memory(&full.jpeg_bytes).unwrap().dimensions();
         assert_eq!(full_dims, (big_size, big_size), "il rendering a piena risoluzione deve preservare le dimensioni originali");
+        let master_dims = image::load_from_memory(&full.master_tiff_bytes).unwrap().dimensions();
+        assert_eq!(master_dims, (big_size, big_size), "anche il master TIFF deve preservare le dimensioni originali");
 
         let preview = session.render_preview(look).unwrap();
         let preview_dims = image::load_from_memory(&preview.preview_png_bytes).unwrap().dimensions();
@@ -1103,5 +1274,221 @@ mod tests {
             "atteso highlight_clip_fraction basso, got {}",
             result.highlight_clip_fraction
         );
+    }
+
+    // --- Orientamento EXIF (bug reale segnalato dall'utente con foto vere:
+    // "l'orientamento è completamente sballato") + esportazione JPEG ad alta
+    // qualità (bug reale segnalato dallo stesso utente: qualità pessima e
+    // formato PNG invece di JPEG) ---
+
+    /// Costruisce un JPEG valido (incodificato per davvero, non bytes finti)
+    /// con un blocco APP1/EXIF minimale iniettato subito dopo il marcatore
+    /// SOI — la posizione standard, la stessa in cui una vera fotocamera lo
+    /// scrive — contenente UNA sola entry IFD: il tag Orientation (0x0112),
+    /// tipo SHORT, valore `orientation`. Serve a testare `read_exif_orientation`
+    /// e `decode_any_photo` contro un file realistico, non contro
+    /// un'approssimazione della struttura EXIF.
+    fn jpeg_bytes_with_exif_orientation(width: u32, height: u32, rgb: [u8; 3], orientation: u16) -> Vec<u8> {
+        use image::{ImageBuffer, Rgba};
+        let mut base = Vec::new();
+        let img = ImageBuffer::from_fn(width, height, |_, _| Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!(&base[0..2], &[0xFF, 0xD8], "il JPEG di base deve iniziare con SOI");
+
+        // Blocco TIFF minimale: header (byte order + magic + offset primo
+        // IFD) + un IFD con una entry (Orientation) + offset "nessun altro
+        // IFD" (0). Little-endian ("II"), per non dover gestire anche il
+        // caso big-endian nel test.
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // offset del primo (unico) IFD
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // numero di entry nell'IFD
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // tag: Orientation
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // tipo: SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count: 1
+        let mut value_field = [0u8; 4];
+        value_field[0..2].copy_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&value_field);
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // offset del prossimo IFD: nessuno
+
+        let mut app1_payload = Vec::new();
+        app1_payload.extend_from_slice(b"Exif\0\0");
+        app1_payload.extend_from_slice(&tiff);
+        // La lunghezza del segmento (2 byte, big-endian: convenzione JPEG)
+        // include se stessa, non il marcatore FF E1 che la precede.
+        let segment_length = (app1_payload.len() + 2) as u16;
+
+        let mut result = Vec::new();
+        result.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        result.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        result.extend_from_slice(&segment_length.to_be_bytes());
+        result.extend_from_slice(&app1_payload);
+        result.extend_from_slice(&base[2..]); // resto del JPEG di base, SOI escluso
+        result
+    }
+
+    #[test]
+    fn read_exif_orientation_returns_none_when_no_exif_present() {
+        let bytes = png_bytes_of_solid_color(4, [10, 20, 30]);
+        assert_eq!(read_exif_orientation(&bytes), None);
+    }
+
+    #[test]
+    fn read_exif_orientation_returns_none_on_garbage_bytes_not_panic() {
+        assert_eq!(read_exif_orientation(&[1, 2, 3, 4, 5]), None);
+        assert_eq!(read_exif_orientation(&[]), None);
+    }
+
+    #[test]
+    fn read_exif_orientation_reads_the_real_tag_value_from_a_real_jpeg() {
+        for value in [1u16, 2, 3, 4, 5, 6, 7, 8] {
+            let bytes = jpeg_bytes_with_exif_orientation(4, 3, [128, 64, 32], value);
+            assert_eq!(read_exif_orientation(&bytes), Some(value), "orientamento {value}");
+        }
+    }
+
+    #[test]
+    fn decode_any_photo_applies_exif_orientation_for_a_plain_jpeg() {
+        // Bug reale: senza questa correzione, `decode_any_photo` per un
+        // JPEG/PNG già sviluppato (a differenza del percorso RAW, che la
+        // applica già) ignorava del tutto il tag Orientation. Qui si verifica
+        // la catena INTERA (bytes -> lettura EXIF -> applicazione), non solo
+        // la funzione geometrica isolata (già testata a parte in
+        // `raw_decode`): un'immagine 3x2 con orientamento 6 deve arrivare
+        // decodificata come 2x3 (dimensioni scambiate).
+        use image::GenericImageView;
+        let bytes = jpeg_bytes_with_exif_orientation(3, 2, [90, 140, 60], 6);
+        let decoded = decode_any_photo(&bytes, "foto.jpg").unwrap();
+        assert_eq!(decoded.dimensions(), (2, 3));
+    }
+
+    #[test]
+    fn decode_any_photo_leaves_dimensions_untouched_without_an_orientation_tag() {
+        use image::GenericImageView;
+        // Nessuna regressione per il caso comune (foto senza tag Orientation,
+        // o già orientamento 1): non deve succedere nulla.
+        let bytes = png_bytes_of_solid_color_rect(5, 3, [200, 100, 50]);
+        let decoded = decode_any_photo(&bytes, "foto.png").unwrap();
+        assert_eq!(decoded.dimensions(), (5, 3));
+    }
+
+    #[test]
+    fn encode_full_resolution_as_jpeg_produces_valid_decodable_bytes_preserving_dimensions() {
+        use image::{GenericImageView, ImageBuffer, Rgba};
+        let img = ImageBuffer::from_fn(10, 6, |_, _| Rgba([180u8, 90, 40, 255]));
+        let dyn_img = image::DynamicImage::ImageRgba8(img);
+
+        let jpeg_bytes = encode_full_resolution_as_jpeg(&dyn_img).unwrap();
+        assert!(!jpeg_bytes.is_empty());
+        assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8], "deve essere un JPEG vero (marcatore SOI)");
+
+        let decoded = image::load_from_memory(&jpeg_bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (10, 6));
+    }
+
+    #[test]
+    fn encode_master_as_tiff16_produces_valid_decodable_16bit_bytes_preserving_dimensions() {
+        use image::{GenericImageView, ImageBuffer, Rgb};
+        let img = ImageBuffer::from_fn(10, 6, |_, _| Rgb([0.7f32, 0.3, 0.1]));
+        let dyn_img = image::DynamicImage::ImageRgb32F(img);
+
+        let tiff_bytes = encode_master_as_tiff16(&dyn_img).unwrap();
+        assert!(!tiff_bytes.is_empty());
+
+        let decoded = image::load_from_memory_with_format(&tiff_bytes, image::ImageFormat::Tiff).unwrap();
+        assert_eq!(decoded.dimensions(), (10, 6));
+        assert!(matches!(decoded, image::DynamicImage::ImageRgb16(_)), "deve restare a 16 bit per canale");
+    }
+
+    #[test]
+    fn decode_any_photo_full_applies_exif_orientation_for_a_plain_jpeg_just_like_decode_any_photo() {
+        // Per un JPEG/PNG già sviluppato la logica è identica a
+        // `decode_any_photo` (nessun sensore da ri-demosaicizzare) — questo
+        // test lo verifica esplicitamente per la nuova funzione, invece di
+        // presupporlo per somiglianza col nome.
+        use image::GenericImageView;
+        let bytes = jpeg_bytes_with_exif_orientation(3, 2, [90, 140, 60], 6);
+        let decoded = decode_any_photo_full(&bytes, "foto.jpg").unwrap();
+        assert_eq!(decoded.dimensions(), (2, 3));
+    }
+
+    #[test]
+    fn decode_any_photo_full_leaves_dimensions_untouched_without_an_orientation_tag() {
+        use image::GenericImageView;
+        let bytes = png_bytes_of_solid_color_rect(5, 3, [200, 100, 50]);
+        let decoded = decode_any_photo_full(&bytes, "foto.png").unwrap();
+        assert_eq!(decoded.dimensions(), (5, 3));
+    }
+
+    #[test]
+    fn render_full_resolution_export_returns_jpeg_bytes_not_png() {
+        // L'esportazione a piena risoluzione (pulsante "Esporta" e batch)
+        // deve produrre JPEG — richiesta esplicita dell'utente, prima
+        // produceva PNG. `render_preview` (l'anteprima interattiva, mai
+        // salvata su disco) resta invece PNG: non è cambiata e non deve
+        // esserlo.
+        let target_bytes = png_bytes_of_solid_color(6, [80, 80, 80]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+
+        let full = session.render_full_resolution_export(look).unwrap();
+        assert_eq!(
+            &full.jpeg_bytes[0..2],
+            &[0xFF, 0xD8],
+            "render_full_resolution_export deve produrre JPEG (SOI) in jpeg_bytes"
+        );
+    }
+
+    #[test]
+    fn render_full_resolution_export_master_tiff_is_a_valid_decodable_16bit_file() {
+        // Il master TIFF va oltre "non è vuoto": deve essere un TIFF vero
+        // (magic number "II*\0" o "MM\0*"), decodificabile, e a 16 bit per
+        // canale — non 8, altrimenti non offrirebbe alcun vantaggio di
+        // precisione sul JPEG accanto a cui viene consegnato.
+        let target_bytes = png_bytes_of_solid_color(6, [80, 120, 200]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+
+        let full = session.render_full_resolution_export(look).unwrap();
+        assert!(!full.master_tiff_bytes.is_empty());
+        let is_little_endian_tiff = &full.master_tiff_bytes[0..4] == b"II*\0";
+        let is_big_endian_tiff = &full.master_tiff_bytes[0..4] == [0x4D, 0x4D, 0x00, 0x2A];
+        assert!(
+            is_little_endian_tiff || is_big_endian_tiff,
+            "il master deve avere l'intestazione TIFF standard"
+        );
+
+        let decoded = image::load_from_memory_with_format(&full.master_tiff_bytes, image::ImageFormat::Tiff).unwrap();
+        assert!(
+            matches!(decoded, image::DynamicImage::ImageRgb16(_)),
+            "il master TIFF deve essere a 16 bit per canale, non 8"
+        );
+    }
+
+    #[test]
+    fn render_full_resolution_export_jpeg_and_tiff_agree_on_color_within_rounding() {
+        // Entrambi i file derivano dallo STESSO rendering f32: a meno
+        // dell'arrotondamento (8 bit per il JPEG, 16 bit per il TIFF), i
+        // colori devono corrispondere — non essere due render indipendenti
+        // che potrebbero scostarsi.
+        let target_bytes = png_bytes_of_solid_color(6, [80, 120, 200]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let mut look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+        look.exposure_ev = 0.4;
+
+        let full = session.render_full_resolution_export(look).unwrap();
+        let jpeg_px = image::load_from_memory(&full.jpeg_bytes).unwrap().to_rgb8().get_pixel(0, 0).0;
+        let tiff_px = image::load_from_memory_with_format(&full.master_tiff_bytes, image::ImageFormat::Tiff)
+            .unwrap()
+            .to_rgb8()
+            .get_pixel(0, 0)
+            .0;
+        for c in 0..3 {
+            let diff = (jpeg_px[c] as i32 - tiff_px[c] as i32).abs();
+            assert!(diff <= 2, "canale {c}: JPEG={} TIFF={} (troppo distanti per essere lo stesso rendering)", jpeg_px[c], tiff_px[c]);
+        }
     }
 }

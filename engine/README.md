@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (109 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 21, `look_render` 40, `metadata` 3, `raw_decode` 4, `ffi` 24, `smartbatch`
+Crate reali, compilati e testati (142 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 21, `look_render` 45, `metadata` 3, `raw_decode` 20, `ffi` 36, `smartbatch`
 5, `xmp` 3):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -17,8 +17,8 @@ Crate reali, compilati e testati (109 test, tutti verdi — `color_science` 6, `
 | `metadata` | Sidecar JSON non distruttivo (schema versionato, history di operazioni) | §3.1 |
 | `xmp` | Generatore di preset Lightroom `.xmp` dal `HarmonicLook` | §5 |
 | `gpu-pipe` | Sorgenti WGSL degli stage di color grading, validati con `naga` (nessuna GPU richiesta per i test) | §3.2, §6.2 |
-| `raw-decode` | Decodifica RAW vera (`rawler`, Rust puro): anteprima incorporata dalla fotocamera + metadati base | §2, §9 |
-| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza, riduzione del rumore luminanza/colore in Lab con protezione ai bordi, maschera automatica Soggetto/Sfondo derivata dalla salienza) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
+| `raw-decode` | Decodifica RAW vera (`rawler`, Rust puro): anteprima incorporata dalla fotocamera + metadati base (`decode_raw_preview`, veloce, per miniature/analisi), e demosaic COMPLETO del sensore Bayer RGB (`decode_raw_full`, algoritmo PPG, per il file consegnato all'utente) | §2, §9 |
+| `look-render` | Applica un `HarmonicLook` ai pixel su CPU — pipeline interna esclusivamente `f32` dall'ingresso all'uscita, mai un arrotondamento a 8 bit a metà catena (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza, riduzione del rumore luminanza/colore in Lab con protezione ai bordi, maschera automatica Soggetto/Sfondo derivata dalla salienza) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni", il pannello "Develop" (quantizza a 8 bit solo alla fine, per lo schermo) e l'esportazione a piena risoluzione (`render_full_resolution_with_look`, resta `f32`, mai quantizzata qui) | §3.2 |
 | `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` (vedi sotto) e `compute_subject_saliency_preview` (mappa di salienza ispezionabile, non collegata al color-matching automatico — vedi sotto) — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
 
 **Novità di questo giro**: lo Smart-Batch Contestuale (`smartbatch`) era già scritto e testato ma
@@ -601,7 +601,8 @@ stesso motivo già documentato più volte in questo file (comprimerebbe la chrom
 solo lightness e saturazione HSL, mai la tonalità, quindi la maschera non può introdurre dominanti di
 colore innaturali sul proprio bordo.
 
-6 nuovi test in `look-render` (109 test totali, workspace). Il più istruttivo: il primo tentativo di
+6 nuovi test in `look-render` (142 test totali, workspace, contando anche le aggiunte successive di
+questo file — al momento di questa nota specifica erano 109). Il più istruttivo: il primo tentativo di
 verificare il comportamento su un'immagine PIATTA assumendo salienza uniforme (media sull'intera
 immagine) falliva — perché `compute_saliency_map` NON è uniforme pixel-per-pixel nemmeno su
 un'immagine a tinta unita: il prior di centratura pesa ogni pixel in base alla propria posizione (non
@@ -804,6 +805,160 @@ barra laterale a blocco a piena larghezza sotto le foto, con il suo scroll verti
 da preservare, la foto e il pannello Develop si dividono lo spazio verticale a metà. **Non verificato
 da un compilatore** (limite noto di questo ambiente per tutta la parte Kotlin/Compose): verifica
 prevista alla prossima build su GitHub Actions.
+
+## Corretto (questo giro): orientamento EXIF ignorato, ed esportazione a piena risoluzione da PNG a JPEG alta qualità
+
+Segnalato dall'utente con foto vere del primo batch di prova (motociclette/dettagli meccanici, non
+immagini sintetiche di test): "l'orientamento è completamente sballato" e una qualità "disastro" su
+vegetazione/colori, con la richiesta esplicita di esportare "alla massima risoluzione possibile" in
+JPEG invece che PNG.
+
+**Causa dell'orientamento**: né `rawler` (file RAW) né la libreria `image` (JPEG/PNG già sviluppati)
+applicano da sole la rotazione/lo specchiamento richiesti dal tag EXIF Orientation (0x0112) — entrambe
+restituiscono i pixel esattamente come memorizzati nel file, lasciando il compito al chiamante. Questo
+motore non lo faceva affatto, per NESSUno dei due percorsi. **Corretto** con una nuova funzione
+pubblica, `raw_decode::apply_exif_orientation(image, orientation: Option<u16>)`, che implementa le 8
+trasformazioni standard del tag (tabella universale, es. https://exiftool.org/TagNames/EXIF.html) usando
+solo `fliph`/`flipv`/`rotate90`/`rotate180`/`rotate270` della libreria `image` — mai una "trasposizione"
+scritta a mano, per non rischiare di sbagliare la direzione oraria/antioraria. Applicata:
+- lato RAW, dentro `decode_raw_preview`, leggendo `metadata.exif.orientation` (già interpretato da
+  `rawler` per noi);
+- lato JPEG/PNG già sviluppato, dentro `rawforge-ffi::decode_any_photo`, leggendo il tag da soli con la
+  nuova dipendenza `kamadak-exif` (l'unico modo: la libreria `image` non espone questo dato, e il tag
+  vive nei metadati del file, non nei pixel già decodificati).
+
+**Verifica**: 16 nuovi test, deliberatamente in due livelli. (1) La funzione geometrica isolata (7 test
+in `raw-decode`): un'immagine 3x2 con i quattro angoli marcati da colori distinti, per verificare DOVE
+finisce ciascun angolo dopo ogni valore 1..8 — non solo che le dimensioni cambino. Per gli orientamenti
+6 e 8 (rotazioni di 90°/270°, dove la direzione oraria/antioraria è facile da confondere) il test non
+assume quale sia "giusta": verifica che le due siano reciprocamente inverse (90° + 270° = 360° =
+identità), una proprietà indipendente dalla convenzione. (2) La catena intera bytes -> lettura EXIF ->
+applicazione (7 test in `rawforge-ffi`): un vero JPEG con un vero segmento APP1/EXIF costruito byte per
+byte nel test (header TIFF + una entry IFD Orientation), non un'approssimazione — cosicché il test
+verifichi anche che `kamadak-exif` legga davvero il tag, non solo che la funzione geometrica sia
+corretta in isolamento.
+
+**Causa della qualità/"risoluzione massima"**: due problemi distinti, entrambi corretti. (1)
+`PhotoEditSession::render_full_resolution` incodificava PNG — senza perdita, ma "senza perdita" non
+vuol dire "massima risoluzione": la risoluzione era già quella massima disponibile (l'anteprima
+incorporata, limite architetturale già dichiarato altrove, NON eliminato da questa correzione), il PNG
+la rendeva solo enorme da salvare/condividere. Cambiato in JPEG a qualità 92 (`encode_full_resolution_as_jpeg`,
+soglia comunemente considerata "visivamente senza perdita" per una JPEG a 3 canali, non il 75 di
+default di molte librerie, pensato per il web) — l'anteprima interattiva (`render_preview`, mai salvata
+su disco) resta invece PNG, non è cambiata. (2) `raw_decode::decode_raw_preview` preferiva SEMPRE
+l'anteprima "preview" per nome, ripiegando sulla "thumbnail" solo se la preview mancava del tutto —
+corretto per tentare entrambe (quando il decoder le implementa) e tenere quella con più pixel: alcuni
+file hanno una preview presente ma più piccola della thumbnail (nomenclatura non standardizzata fra
+formati/fotocamere), e la scelta precedente avrebbe silenziosamente accettato un'anteprima più piccola
+del massimo disponibile.
+
+**Non eliminato, dichiarato**: se la grana/il rumore visibile sulle foto reali dell'utente non era
+dovuto a nessuno dei due problemi sopra ma era genuino rumore del sensore amplificato dall'adattamento
+di contrasto/vibrance di Smart-Batch (lecito: qualunque editor fotografico amplifica il rumore
+esistente aumentando contrasto/saturazione), l'unico rimedio è applicare riduzione rumore — per questo
+la schermata Batch (lato Kotlin, non qui) ha guadagnato due slider di riduzione rumore opzionale,
+applicati DOPO l'adattamento automatico: l'estrazione automatica del Look (Sintesi Armonica) non stima
+da sé quanto rumore ridurre, quindi senza un override esplicito il batch non ne applicherebbe MAI.
+
+## Corretto (questo giro): demosaic RAW vero al posto dell'anteprima incorporata, pipeline di rendering esclusivamente `f32`, master TIFF 16 bit
+
+Richiesta esplicita dell'utente, dopo la correzione precedente (sopra): *"se il limite è
+architetturale, cambiamo architettura. Cosa consigli per la massima qualità? il software serve per
+elaborare scatti editoriali, non è ammessa la minima imperfezione"*. La correzione precedente aveva
+dichiarato — non eliminato — il limite architetturale di fondo: l'esportazione a piena risoluzione
+usava solo l'anteprima JPEG incorporata dalla fotocamera nel file RAW, mai un vero demosaic del
+sensore. Questo giro elimina quel limite.
+
+**Scoperta chiave**: `rawler` (già una dipendenza di questo motore, usata finora solo per
+`preview_image()`/`thumbnail_image()`) include già una pipeline di sviluppo RAW completa e
+verificata — `decoder.raw_image()` restituisce i dati grezzi del sensore, e `RawDevelop::default()`
+li porta a un'immagine RGB attraverso gli stage `Rescale -> Demosaic -> FujiRotate ->
+CropActiveArea -> WhiteBalance -> Calibrate -> CropDefault -> SRgb`. Per il Bayer RGB (l'unico CFA
+delle fotocamere effettivamente in uso in questo progetto — Sony A7 IV, Canon EOS 77D, entrambe
+verificate presenti nel database interno di profili colore di `rawler`, `data/cameras/sony/a7m4.toml`
+e `data/cameras/canon/77d.toml`) l'algoritmo di demosaic usato è PPG (Patterned Pixel Grouping),
+della stessa famiglia usata da darktable/RawTherapee — ben più accurato del bilineare su bordi e
+transizioni di colore fini, esattamente il tipo di dettaglio (fogliame, gradienti) segnalato come
+"disastro" nella foto originale. Non serviva scrivere un demosaic: serviva smettere di ignorare
+quello già disponibile.
+
+**Tre cambi, un'unica catena f32**:
+
+1. **`raw_decode::decode_raw_full`** (nuova funzione, accanto — non al posto di —
+   `decode_raw_preview`, che resta per miniature di Libreria/foto campione dove la velocità conta
+   più della precisione assoluta): esegue il demosaic PPG completo, verifica che il sensore sia
+   Bayer RGB (altrimenti `RawDecodeError::UnsupportedSensorLayout`, con messaggio esplicito — X-Trans
+   Fujifilm e sensori monocromatici/4 canali sono supportati da `rawler` ma non testabili qui senza un
+   file vero di quelle fotocamere, quindi rifiutati esplicitamente invece di rischiare un risultato
+   sbagliato silenzioso), sanifica il buffer (`sanitize_float_buffer`: la calibrazione colore può
+   produrre NaN/negativi per pixel estremi fuori gamut — propagare un NaN attraverso `powf` della
+   gamma sRGB lo farebbe proliferare in tutta la pipeline a valle) e applica la stessa
+   `apply_exif_orientation` già usata da `decode_raw_preview`. Restituisce `DynamicImage::ImageRgb32F`
+   — **mai quantizzato a 8 bit in questa funzione**.
+2. **`look_render`: pipeline interna riscritta per essere esclusivamente `f32`** dall'ingresso
+   all'uscita — richiesta esplicita dell'utente ("f32 esclusivamente... per la massima qualità").
+   Prima, `apply_noise_reduction` scriveva il proprio risultato come `RgbaImage` a 8 bit PRIMA che il
+   loop principale di rendering lo rileggesse: un arrotondamento intermedio non necessario, che la
+   pipeline poi amplificava (contrasto, HSL per banda). Ora un'unica implementazione
+   (`render_look_core`, buffer `image::ImageBuffer<Rgba<f32>, Vec<f32>>`) è condivisa da DUE funzioni
+   pubbliche: `render_preview_with_look` (anteprima interattiva, invariata nella firma — quantizza a 8
+   bit solo alla fine, per lo schermo) e la nuova `render_full_resolution_with_look` (nessuna
+   quantizzazione, restituisce `ImageRgb32F`). La maschera di salienza (`harmonic::compute_saliency_map`,
+   che accetta solo un buffer 8 bit) resta l'unica eccezione dichiarata: deriva un peso 0..1, non un
+   colore finale, e propagare `f32` anche dentro `harmonic` non avrebbe un guadagno di qualità
+   misurabile per il costo di manutenzione che comporterebbe.
+3. **`rawforge-ffi`**: `PhotoEditSession::new` ora chiama una nuova `decode_any_photo_full` (demosaic
+   completo per un RAW vero) invece di `decode_any_photo` (anteprima veloce) — ma SOLO per la foto
+   TARGET. La foto campione di "Incolla impostazioni" (`paste_look_from_sample`) continua a usare il
+   percorso veloce: serve solo a estrarre statistiche di tono/colore, demosaicizzarla per intero
+   raddoppierebbe il costo di ogni foto del batch senza migliorare la qualità del file consegnato
+   (che dipende solo dal demosaic del target). L'anteprima interattiva (`interactive_preview`) ora
+   deriva da un downscale della STESSA immagine demosaicizzata invece che dall'anteprima incorporata:
+   quello che l'utente vede mentre modifica è garantito coerente con quello che riceverà, non
+   un'approssimazione della fotocamera che potrebbe differire nella resa colore. Il metodo
+   `render_full_resolution` (restituiva `Vec<u8>` JPEG) è stato sostituito da
+   `render_full_resolution_export`, che renderizza UNA sola volta in `f32`
+   (`look_render::render_full_resolution_with_look`) e incodifica il risultato in DUE file dallo
+   stesso rendering: `jpeg_bytes` (JPEG qualità 92, per la consegna pratica) e — **richiesta esplicita
+   dell'utente, "aggiungilo"** — `master_tiff_bytes` (TIFF a 16 bit per canale senza perdita,
+   `encode_master_as_tiff16`, da conservare come originale sviluppato). 16 bit per canale = 65536
+   livelli contro i 256 dell'8 bit: lo stesso arrotondamento finale, inevitabile per qualunque formato
+   su disco, qui è centinaia di volte più fine.
+
+**Perché non anche l'anteprima interattiva in `f32` end-to-end fino allo schermo**: lo È, fino
+all'ultimo passo — `render_preview_with_look` chiama lo stesso `render_look_core` in `f32`, quantizza
+a 8 bit SOLO alla fine per il PNG mostrato a schermo (che comunque non può rappresentare più di 256
+livelli per canale). Nessuna perdita di precisione avviene più a metà pipeline come prima; l'unica
+quantizzazione che resta lì è quella che qualunque schermo/formato PNG richiederebbe comunque.
+
+**Verifica**: workspace passato da 125 a 142 test (`raw_decode` 13 -> 20, `look_render` 40 -> 45,
+`ffi` 31 -> 36), tutti verdi. Non è stato possibile verificare il demosaic VERO su un file RAW reale
+in questo ambiente (nessun file Sony/Canon disponibile qui, né bundlato da `rawler` stessa) — limite
+onestamente dichiarato, non nascosto. Verificato invece: (a) gestione pulita di bytes non validi per
+`decode_raw_full` (stesso standard di `decode_raw_preview`); (b) la logica di riconoscimento Bayer-vs-
+altro (`is_supported_bayer_rgb`) in isolamento con un `CFAConfig` costruito a mano; (c) la
+sanificazione NaN/negativi (`sanitize_float_buffer`) con valori sintetici; (d) — il test più
+significativo per la richiesta dell'utente — che la pipeline `f32` NON arrotonda internamente a 8
+bit: un pixel il cui valore cade ESATTAMENTE a metà fra due livelli 8 bit (85.5/255) attraversa
+`render_full_resolution_with_look` con un Look neutro e torna quasi identico (differenza residua solo
+dall'errore in virgola mobile dei round-trip srgb<->lineare e HSL<->RGB, non da un arrotondamento a
+step fisso); (e) che i due file (JPEG e TIFF) derivano davvero dallo stesso rendering (stesso colore
+a meno dell'arrotondamento atteso, non due render indipendenti); (f) round-trip esatto delle
+conversioni u8<->f32 e Rgb32F<->RgbaF32 per ogni livello. La verifica end-to-end su scatti reali
+Sony A7 IV/Canon EOS 77D resta da fare alla prossima build con file dell'utente.
+
+**Prestazioni, dichiarato onestamente**: `PhotoEditSession::new` per un RAW vero ora esegue un
+demosaic completo (PPG su tutta la risoluzione del sensore) invece di leggere solo l'anteprima JPEG
+incorporata — più lento della versione precedente. Il costo si paga UNA sola volta per foto (apertura
+per l'editing singolo, o inizio dell'elaborazione di ciascuna foto del batch), non ad ogni tick di
+uno slider: è il prezzo per smettere di consegnare all'utente un JPEG di seconda generazione già
+compresso dalla fotocamera stessa.
+
+**Non eliminato, dichiarato**: solo Bayer RGB (coerente con le uniche fotocamere in uso in questo
+progetto) — X-Trans e altri layout CFA restano esplicitamente rifiutati, non silenziosamente
+mal gestiti. Le modifiche Kotlin (nuovo tipo `FullResolutionExport`, due selettori di destinazione in
+sequenza per JPEG+TIFF sulla foto singola, doppia scrittura per il batch) restano non verificate da
+un compilatore in questo ambiente, come sempre in questo progetto — verifica alla prossima build CI.
 
 ## Comandi
 

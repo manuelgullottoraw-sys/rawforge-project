@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 109 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 142 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -50,8 +50,9 @@ esattamente come ogni altro crate di questo workspace — **nessun toolchain NDK
 configurare per la libreria di decodifica**, che era il blocco tecnico più difficile rimasto
 aperto dopo la prima consegna. Il crate `raw-decode` estrae l'anteprima incorporata dalla
 fotocamera stessa (JPEG "embedded", livello di cache L0 dell'architettura, §2.1) e i metadati
-base (marca/modello); il demosaic completo a piena risoluzione (§3.2) resta il prossimo
-incremento, una volta verde questo giro su CI.
+base (marca/modello); il demosaic completo a piena risoluzione (§3.2) era il prossimo
+incremento — **aggiunto in un giro successivo** (vedi "niente più «limite architetturale»" più
+sotto): `raw-decode` sa ora anche sviluppare per intero il sensore, non solo leggerne l'anteprima.
 
 **Nota legale** (non ancora una valutazione legale vera e propria): `rawler` è LGPL-2.1 come
 LibRaw — lo stesso rischio di conformità già segnalato in `docs/ARCHITECTURE.md` §9 per una
@@ -252,11 +253,12 @@ finora.
 
 ## Cosa manca ancora (prossimo incremento)
 
-- **Demosaic completo** per l'export a piena risoluzione (oggi `raw-decode` estrae solo
-  l'anteprima incorporata dalla fotocamera, non l'immagine RAW "sviluppata" pixel per pixel) — il
-  rendering lavora quindi sull'anteprima, non sul RAW pieno; il bilanciamento del bianco, pur ora
-  reso, resta di conseguenza un'approssimazione da color grading e non un vero profilo colore
-  camera.
+- ~~**Demosaic completo** per l'export a piena risoluzione~~ — **fatto in un giro successivo**
+  (vedi "niente più «limite architetturale»" più sotto): `raw-decode::decode_raw_full` sviluppa ora
+  per intero il sensore Bayer RGB (Sony A7 IV, Canon EOS 77D — le uniche fotocamere in uso in
+  questo progetto), non solo l'anteprima incorporata; resta però da fare un vero profilo colore
+  camera/DCP per il bilanciamento del bianco (oggi ancora un guadagno per canale in stile color
+  grading, non colorimetrico — vedi `look-render`), e X-Trans/altri layout CFA restano fuori scope.
 - Collegare `gpu-pipe` (gli shader WGSL già validati) alla UI per il rendering a piena risoluzione
   in tempo reale, al posto della pipeline CPU attuale.
 - Libreria: fatta questo giro in versione v1 (catalogo persistente a singola cartella, non
@@ -823,8 +825,9 @@ accanto agli originali). Avviando l'elaborazione, per CIASCUNA foto della cartel
 sessione di editing, applica lo stesso adattamento intelligente Smart-Batch Contestuale già usato da
 "Incolla impostazioni" (stessa "Intensità adattamento", scelta una volta sola per l'intero batch), e
 scrive ENTRAMBI gli output per quel file — scelta dell'utente, "Entrambi" —: la foto renderizzata a
-piena risoluzione in PNG (`<nome>_rawforge.png`) e il preset Lightroom corrispondente
-(`<nome>_rawforge.xmp`), generato dallo stesso identico Look applicato al rendering (non ricalcolato
+piena risoluzione in JPEG ad alta qualità (`<nome>_rawforge.jpg` — vedi "Corretto" sotto: era PNG fino
+al giro precedente) e il preset Lightroom corrispondente (`<nome>_rawforge.xmp`), generato dallo
+stesso identico Look applicato al rendering (non ricalcolato
 separatamente: `Engine.generateXmpForLook`, nuova funzione comune che riusa
 `rawforge_ffi::generate_lightroom_preset_xmp` — nessuna modifica lato Rust è stata necessaria per
 questa funzionalità, il motore la esponeva già). Una barra di avanzamento mostra quante foto sono
@@ -840,6 +843,73 @@ file di output con lo stesso nome viene sovrascritto silenziosamente, su Android
 Access Framework) crea invece un documento con un nome alternativo — comportamento della piattaforma,
 non scelto da questo codice, documentato in `BatchExport`. Anche questa funzionalità usa solo le
 dipendenze Gradle già dichiarate.
+
+## Corretto (questo giro): orientamento delle foto sballato, ed esportazione JPEG ad alta qualità invece di PNG
+
+Segnalato dall'utente con foto vere del primo batch di prova: "l'orientamento è completamente
+sballato" e "guarda sulla vegetazione e sui colori che disastro […] l'esportazione deve avvenire alla
+massima risoluzione possibile" — due bug reali, non un limite già noto.
+
+**Orientamento.** Causa trovata: né la libreria `image` (per una foto già sviluppata, JPEG/PNG) né
+`rawler` (per un file RAW) applicano da sole la correzione secondo il tag EXIF Orientation (0x0112) —
+entrambe restituiscono i pixel esattamente come sono memorizzati nel file, lasciando all'applicazione
+il compito di ruotarli/specchiarli. Questo motore non lo faceva affatto: qualunque foto scattata con
+la fotocamera ruotata (praticamente ogni foto verticale, e molte foto d'azione/moto scattate di
+lato) usciva storta. Corretto con `raw_decode::apply_exif_orientation` (le 8 trasformazioni standard
+del tag, la stessa tabella usata da ogni editor fotografico), applicata sia al percorso RAW (leggendo
+`metadata.exif.orientation`, già interpretato da `rawler`) sia al percorso JPEG/PNG già sviluppato
+(letto da soli con la nuova dipendenza `kamadak-exif`, l'unico modo perché la libreria `image` non
+espone questo dato). Verificato con 16 nuovi test Rust: la funzione geometrica isolata (7 test — angoli
+marcati con colori distinti, proprietà di involuzione, rotazioni 90°/270° reciprocamente inverse — così
+da non dover indovinare la direzione oraria/antioraria) e la catena intera bytes -> lettura EXIF ->
+applicazione, con un vero JPEG con un vero segmento APP1/EXIF costruito nel test (7 test), non solo la
+funzione isolata.
+
+**Qualità/risoluzione.** Due cause trovate, entrambe corrette: (1) `render_full_resolution`
+incodificava PNG (senza perdita, ma niente a che fare con "massima risoluzione" — la risoluzione era
+già quella massima disponibile, il file era solo enorme) — cambiato in JPEG a qualità 92 (soglia
+comunemente considerata "visivamente senza perdita", non il 75 di default di molte librerie, pensato
+per il web) per il pulsante "Esporta" e per il batch; (2) `raw-decode` sceglieva l'anteprima incorporata
+di un file RAW preferendo quella chiamata "preview" per nome e ripiegando sulla "thumbnail" SOLO se la
+preview mancava del tutto — corretto per tentare entrambe (quando il decoder le implementa) e tenere
+quella con più pixel, invece di rischiare silenziosamente un'anteprima più piccola del massimo
+disponibile. **Onestà**: il vero limite di risoluzione resta quello già dichiarato (solo l'anteprima
+incorporata dalla fotocamera, non un demosaic RAW completo del sensore) — non eliminato da questa
+correzione, solo non peggiorato da una scelta di priorità preview/thumbnail sbagliata.
+
+**Batch**: aggiunta anche una riduzione rumore opzionale (0..100, due slider "Luminanza"/"Colore")
+nella schermata Batch, applicata a ogni foto DOPO l'adattamento automatico. Motivo: il Look che il
+batch applica viene sempre ricalcolato da zero con la Sintesi Armonica Automatica — mai dal pannello
+Develop della foto campione, quindi anche impostando lì una riduzione rumore a mano il batch non
+l'avrebbe mai applicata (l'estrazione automatica non stima da sé quanto rumore ridurre). Se la grana
+visibile sulle foto vere dell'utente derivava (anche solo in parte) da questo — foto reali possono
+avere rumore/grana genuini che nessuna correzione di colore rimuove da sola — questi due slider danno
+ora una leva diretta per attenuarla durante il batch stesso.
+
+## Corretto (questo giro): niente più "limite architetturale" — demosaic RAW vero, pipeline `f32`, master TIFF 16 bit
+
+Richiesta esplicita dell'utente, dopo la correzione precedente: *"se il limite è architetturale,
+cambiamo architettura. Cosa consigli per la massima qualità? il software serve per elaborare scatti
+editoriali, non è ammessa la minima imperfezione"*. La correzione precedente aveva dichiarato — non
+eliminato — che l'esportazione usava solo l'anteprima JPEG incorporata dalla fotocamera nel file RAW,
+mai un vero sviluppo del sensore. Questo giro elimina quel limite.
+
+**Cosa cambia per l'utente**: l'esportazione (foto singola e batch) ora sviluppa DAVVERO il sensore
+di un file RAW vero — non più la sola anteprima che la fotocamera aveva già compresso al proprio
+interno — usando lo stesso algoritmo di demosaic (PPG) delle applicazioni RAW professionali. La
+pipeline di editing (esposizione, contrasto, colore, tutto quanto già descritto sopra) ora lavora in
+virgola mobile a 32 bit dall'inizio alla fine per il file consegnato, senza arrotondare mai a 8 bit
+prima del salvataggio finale — la richiesta esplicita dell'utente per un uso editoriale. E accanto al
+JPEG di consegna, ogni esportazione produce anche ora un master TIFF a 16 bit per canale senza
+perdita, da conservare come originale sviluppato (65536 livelli di tono per canale, non 256).
+
+**Limite deliberato, dichiarato**: supportate solo le due fotocamere effettivamente in uso in questo
+progetto — Sony A7 IV e Canon EOS 77D, entrambe con sensore Bayer RGB classico. Un file da un sensore
+diverso (es. X-Trans Fujifilm) viene rifiutato con un errore chiaro invece di essere sviluppato male
+in silenzio. Il demosaic vero non è stato verificabile su uno scatto reale in questo ambiente (nessun
+file RAW disponibile qui) — verificato tutto il resto (gestione errori, precisione `f32` end-to-end,
+coerenza fra JPEG e master TIFF); la verifica finale arriva alla prossima build con file veri
+dell'utente. Dettagli tecnici completi in [`engine/README.md`](engine/README.md).
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

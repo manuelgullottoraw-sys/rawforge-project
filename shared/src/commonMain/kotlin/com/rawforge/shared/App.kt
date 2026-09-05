@@ -253,6 +253,15 @@ fun RawForgeApp() {
     var exportBusy by remember { mutableStateOf(false) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var exportError by remember { mutableStateOf<String?>(null) }
+    // Bytes/nome del master TIFF in attesa di essere salvati SUBITO DOPO che
+    // l'utente ha scelto la destinazione del JPEG (vedi `exportCurrentPhoto`
+    // sotto): incatenare i due selettori nativi di destinazione invece di
+    // lanciarli entrambi in un colpo solo evita di aprire due dialoghi di
+    // sistema sovrapposti (comportamento non garantito, specie su Android,
+    // dove il secondo `launch()` di un `ActivityResultLauncher` prima che il
+    // primo sia tornato non è un flusso supportato).
+    var pendingMasterTiffBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var pendingMasterTiffSuggestedName by remember { mutableStateOf<String?>(null) }
 
     // "Rileva soggetto" (vedi `engine/README.md`, sezione salienza): mappa in
     // scala di grigi ispezionabile, calcolata su richiesta esplicita
@@ -340,6 +349,18 @@ fun RawForgeApp() {
     // una cartella intera con un'unica intensità scelta prima di partire,
     // indipendente da quella eventualmente in uso nel pannello Develop.
     var batchOverrideStrength by remember { mutableStateOf(1f) }
+    // Riduzione del rumore da applicare a OGNI foto del batch (0..100,
+    // default 0 = comportamento invariato). Necessaria perché il Look che il
+    // batch applica viene sempre ricalcolato da zero con la Sintesi Armonica
+    // Automatica (`pasteLookFromSample`) — MAI dal pannello Develop della
+    // foto campione, anche se l'utente lì avesse già impostato una riduzione
+    // rumore a mano: un adattamento automatico non stima da solo QUANTO
+    // rumore ridurre, quindi senza questo override il batch non applicherebbe
+    // mai alcuna riduzione rumore, qualunque cosa l'utente avesse fatto nel
+    // Develop. Overridden qui SOLO per il batch, applicato dopo l'adattamento
+    // (vedi il ciclo sotto), non tocca in alcun modo l'editing manuale.
+    var batchNoiseReductionLuma by remember { mutableStateOf(0) }
+    var batchNoiseReductionColor by remember { mutableStateOf(0) }
     var batchRunning by remember { mutableStateOf(false) }
     var batchCancelRequested by remember { mutableStateOf(false) }
     var batchDone by remember { mutableStateOf(0) }
@@ -402,10 +423,32 @@ fun RawForgeApp() {
                             lookName = lookName,
                             overrideStrength = batchOverrideStrength,
                         ).getOrThrow()
-                        val fullResBytes = batchSession.renderFullResolution(adapted.appliedLook).getOrThrow()
+                        // Override di riduzione rumore (vedi il commento su
+                        // `batchNoiseReductionLuma`/`batchNoiseReductionColor`
+                        // sopra): applicato DOPO l'adattamento automatico,
+                        // sullo stesso Look che verrà sia renderizzato sia
+                        // esportato come preset — mai due Look diversi fra
+                        // PNG e .xmp per lo stesso file.
+                        val finalLook = adapted.appliedLook.copy(
+                            noiseReductionLuma = batchNoiseReductionLuma,
+                            noiseReductionColor = batchNoiseReductionColor,
+                        )
+                        // JPEG ad alta qualità (92) + master TIFF 16 bit
+                        // senza perdita, dallo STESSO rendering a piena
+                        // risoluzione — per un RAW vero, dal demosaic
+                        // completo del sensore (`Engine.openPhotoForEditing`
+                        // ora lo esegue sempre per il file target, non più
+                        // solo l'anteprima incorporata dalla fotocamera: vedi
+                        // `PhotoEditSession.renderFullResolutionExport` lato
+                        // Rust). Il master TIFF è la richiesta esplicita
+                        // dell'utente per un uso editoriale ("non è ammessa
+                        // la minima imperfezione"), qui applicata anche al
+                        // batch, non solo alla foto singola.
+                        val export = batchSession.renderFullResolutionExport(finalLook).getOrThrow()
                         val baseName = entry.displayName.substringBeforeLast('.').ifBlank { entry.displayName }
-                        BatchExport.writeBytes(outputFolder, "${baseName}_rawforge.png", fullResBytes).getOrThrow()
-                        val xmpText = Engine.generateXmpForLook(adapted.appliedLook.copy(name = baseName)).getOrThrow()
+                        BatchExport.writeBytes(outputFolder, "${baseName}_rawforge.jpg", export.jpegBytes).getOrThrow()
+                        BatchExport.writeBytes(outputFolder, "${baseName}_rawforge_master.tiff", export.masterTiffBytes).getOrThrow()
+                        val xmpText = Engine.generateXmpForLook(finalLook.copy(name = baseName)).getOrThrow()
                         BatchExport.writeBytes(outputFolder, "${baseName}_rawforge.xmp", xmpText.encodeToByteArray()).getOrThrow()
                     } finally {
                         batchSession.close()
@@ -565,9 +608,39 @@ fun RawForgeApp() {
     val launchBatchInputFolderPicker = rememberFolderPickerLauncher { folderId -> batchInputFolder = folderId }
     val launchBatchOutputFolderPicker = rememberFolderPickerLauncher { folderId -> batchOutputFolder = folderId }
 
-    val launchExport = rememberFileSaverLauncher(
-        onSaved = { destination -> exportMessage = "Foto esportata: $destination"; exportError = null; exportBusy = false },
+    // Master TIFF a 16 bit senza perdita, accanto al JPEG di consegna —
+    // richiesta esplicita dell'utente per un uso editoriale ("non è ammessa
+    // la minima imperfezione"). Selettore di destinazione separato (stesso
+    // principio di `launchExportXmp` accanto a `launchExport`), ma incatenato
+    // DOPO che l'utente ha scelto la destinazione del JPEG (`launchExport`
+    // sotto lo richiama dal proprio `onSaved`) invece di essere lanciato in
+    // parallelo: vedi il commento su `pendingMasterTiffBytes` sopra.
+    val launchExportMasterTiff = rememberMasterTiffSaverLauncher(
+        onSaved = { destination -> exportMessage = "Foto + master esportati (master: $destination)"; exportError = null; exportBusy = false },
         onError = { error -> exportError = error; exportMessage = null; exportBusy = false },
+    )
+    val launchExport = rememberFileSaverLauncher(
+        onSaved = { destination ->
+            val tiffBytes = pendingMasterTiffBytes
+            val tiffName = pendingMasterTiffSuggestedName
+            pendingMasterTiffBytes = null
+            pendingMasterTiffSuggestedName = null
+            if (tiffBytes != null && tiffName != null) {
+                exportMessage = "Foto esportata: $destination — scegli ora dove salvare il master TIFF"
+                launchExportMasterTiff(tiffBytes, tiffName)
+            } else {
+                exportMessage = "Foto esportata: $destination"
+                exportBusy = false
+            }
+            exportError = null
+        },
+        onError = { error ->
+            pendingMasterTiffBytes = null
+            pendingMasterTiffSuggestedName = null
+            exportError = error
+            exportMessage = null
+            exportBusy = false
+        },
     )
 
     // "Esporta preset .xmp": calcola il testo del preset e lo scrive subito
@@ -587,15 +660,25 @@ fun RawForgeApp() {
         val activeSession = session ?: return
         exportError = null
         exportBusy = true
-        // A piena risoluzione, non la copia ridotta usata per l'editing
-        // interattivo: qui la velocità non è più la priorità, la qualità sì.
-        activeSession.renderFullResolution(currentLook.scaledBy(editIntensity)).fold(
-            onSuccess = { bytes ->
-                val suggested = (targetState?.fileName ?: "foto")
-                    .substringBeforeLast('.') + "_rawforge.png"
-                launchExport(bytes, suggested)
+        // A piena risoluzione — per un RAW vero, dal demosaic completo del
+        // sensore, non più solo l'anteprima incorporata dalla fotocamera —
+        // non la copia ridotta usata per l'editing interattivo: qui la
+        // velocità non è più la priorità, la qualità sì. Un solo rendering
+        // f32 produce sia il JPEG di consegna sia il master TIFF a 16 bit
+        // (vedi `PhotoEditSession.renderFullResolutionExport` lato Rust).
+        activeSession.renderFullResolutionExport(currentLook.scaledBy(editIntensity)).fold(
+            onSuccess = { export ->
+                val baseName = (targetState?.fileName ?: "foto").substringBeforeLast('.')
+                // Il master TIFF viene salvato SUBITO DOPO che l'utente ha
+                // scelto la destinazione del JPEG (vedi `launchExport` sopra):
+                // qui prepariamo solo bytes e nome suggerito.
+                pendingMasterTiffBytes = export.masterTiffBytes
+                pendingMasterTiffSuggestedName = "${baseName}_rawforge_master.tiff"
+                launchExport(export.jpegBytes, "${baseName}_rawforge.jpg")
             },
             onFailure = { error ->
+                pendingMasterTiffBytes = null
+                pendingMasterTiffSuggestedName = null
                 exportError = error.message ?: "Errore durante il rendering per l'esportazione"
                 exportBusy = false
             }
@@ -666,6 +749,10 @@ fun RawForgeApp() {
                         listError = batchListError,
                         overrideStrength = batchOverrideStrength,
                         onOverrideStrengthChange = { batchOverrideStrength = it },
+                        noiseReductionLuma = batchNoiseReductionLuma,
+                        onNoiseReductionLumaChange = { batchNoiseReductionLuma = it },
+                        noiseReductionColor = batchNoiseReductionColor,
+                        onNoiseReductionColorChange = { batchNoiseReductionColor = it },
                         running = batchRunning,
                         done = batchDone,
                         total = batchTotal,
@@ -1264,6 +1351,10 @@ private fun BatchScreen(
     listError: String?,
     overrideStrength: Float,
     onOverrideStrengthChange: (Float) -> Unit,
+    noiseReductionLuma: Int,
+    onNoiseReductionLumaChange: (Int) -> Unit,
+    noiseReductionColor: Int,
+    onNoiseReductionColorChange: (Int) -> Unit,
     running: Boolean,
     done: Int,
     total: Int,
@@ -1363,6 +1454,49 @@ private fun BatchScreen(
                 Slider(
                     value = overrideStrength,
                     onValueChange = onOverrideStrengthChange,
+                    enabled = !running,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+
+        PanelCard(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    "4. Riduzione rumore (opzionale)",
+                    style = MaterialTheme.typography.subtitle2,
+                    color = TextPrimary,
+                )
+                Text(
+                    "L'adattamento automatico (sopra) non stima da sé quanto rumore ridurre — se le foto " +
+                        "target hanno grana visibile, alzare qui uno o entrambi i valori: si applicano a TUTTE " +
+                        "le foto del batch, in aggiunta al Look copiato dalla foto campione.",
+                    style = MaterialTheme.typography.caption,
+                    color = TextMuted,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Luminanza: $noiseReductionLuma",
+                    style = MaterialTheme.typography.caption,
+                    color = TextMuted,
+                )
+                Slider(
+                    value = noiseReductionLuma.toFloat(),
+                    onValueChange = { onNoiseReductionLumaChange(it.roundToInt()) },
+                    valueRange = 0f..100f,
+                    enabled = !running,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "Colore: $noiseReductionColor",
+                    style = MaterialTheme.typography.caption,
+                    color = TextMuted,
+                )
+                Slider(
+                    value = noiseReductionColor.toFloat(),
+                    onValueChange = { onNoiseReductionColorChange(it.roundToInt()) },
+                    valueRange = 0f..100f,
                     enabled = !running,
                     modifier = Modifier.fillMaxWidth(),
                 )

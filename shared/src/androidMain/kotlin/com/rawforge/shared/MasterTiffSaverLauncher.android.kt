@@ -11,23 +11,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 
 @Composable
-actual fun rememberFileSaverLauncher(
+actual fun rememberMasterTiffSaverLauncher(
     onSaved: (String) -> Unit,
     onError: (String) -> Unit,
 ): (ByteArray, String) -> Unit {
     val context = LocalContext.current
-    // `CreateDocument` chiede all'utente SOLO la destinazione: i bytes da
-    // scrivere non passano dall'Intent (potrebbero essere grandi), li teniamo
-    // in memoria qui e li scriviamo quando il callback torna con l'Uri scelto.
+    // Come `FileSaverLauncher.android.kt`, ma con mime type "image/tiff" (non
+    // "image/jpeg": il master non è un JPEG) — altrimenti il selettore di
+    // sistema (Storage Access Framework) proporrebbe un'estensione/
+    // associazione sbagliata per un file che in realtà è un TIFF a 16 bit.
     var pendingBytes by remember { mutableStateOf<ByteArray?>(null) }
-    // "image/jpeg": l'esportazione a piena risoluzione produce JPEG, non più
-    // PNG (scelta esplicita dell'utente — vedi `jpegBytes` in
-    // `PhotoEditSession.renderFullResolutionExport` lato Rust; il master TIFF
-    // accanto, `masterTiffBytes`, usa invece `MasterTiffSaverLauncher.android.kt`
-    // con MIME "image/tiff"). Il MIME dichiarato qui deve corrispondere ai
-    // bytes scritti, altrimenti il file arriva con estensione/tipo sbagliati
-    // anche se il contenuto è corretto.
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri: Uri? ->
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/tiff")) { uri: Uri? ->
         val bytes = pendingBytes
         pendingBytes = null
         if (uri == null) {
