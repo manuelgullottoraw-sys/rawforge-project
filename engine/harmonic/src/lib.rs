@@ -17,12 +17,6 @@ const HUE_BANDS: usize = 8;
 /// media di pochi pixel è rumore, non uno stile da copiare (stesso principio
 /// del guardrail su `min_band_pixels` più sotto).
 const MIN_BAND_PIXELS: u64 = 40;
-/// Saturazione HSL "tipica" attesa per una scena fotografica media (scala
-/// 0..1, NON la chroma Lab di [`BASELINE_CHROMA`] — spazi colore diversi):
-/// baseline empirica per il bias di saturazione per banda, da ricalibrare su
-/// un corpus reale come le altre baseline di questo file.
-const BASELINE_HSL_SATURATION: f32 = 0.35;
-
 /// Luminanza Lab "tipica" per un grigio medio (18%), usata come pivot per la
 /// stima (euristica) dell'esposizione relativa.
 const NEUTRAL_L: f32 = 50.0;
@@ -31,14 +25,24 @@ const NEUTRAL_L: f32 = 50.0;
 /// empirica da ricalibrare su un corpus reale.
 const BASELINE_CONTRAST_STD: f32 = 20.0;
 
-/// Chroma Lab media attesa per una scena fotografica "normale": baseline
-/// empirica per il bias di vibrance/saturation.
-const BASELINE_CHROMA: f32 = 18.0;
+/// Chroma Lab media attesa per una scena fotografica "normale": baseline per
+/// il bias GLOBALE di vibrance/saturation. **Ricalibrata in questo giro**: era
+/// 18.0, una stima "a occhio" mai verificata su una foto vera. Misurata ora su
+/// due foto reali fornite dall'utente: chroma media effettiva ~4.5 e ~8.5 —
+/// MENO DELLA METÀ della vecchia baseline in entrambi i casi. Con 18.0 anche
+/// una foto normale (non deliberatamente scarica di colore) risultava sempre
+/// giudicata "poco satura", producendo un `vibrance` fortemente negativo quasi
+/// sempre: una delle due cause (insieme al bug di `hsl_sat` qui sotto) per cui
+/// "Incolla impostazioni" desaturava la foto target ben oltre la foto
+/// campione stessa. 10.0 è ancora una stima (due foto non sono un corpus), ma
+/// ora ancorata a una misura reale invece che a un'ipotesi.
+const BASELINE_CHROMA: f32 = 10.0;
 
 /// Chroma Lab "tipica" attesa per la zona ombre o luci di una foto QUALUNQUE,
 /// anche senza alcuna intenzione di color grading — stessa logica di
-/// `BASELINE_HSL_SATURATION`, ma in scala Lab chroma (0..~100+) invece che
-/// saturazione HSL (0..1). **Bug reale scoperto e corretto in questo giro**:
+/// `BASELINE_CHROMA`, ma per una singola zona tonale (ombre O luci, non
+/// l'intera foto) invece che per l'immagine intera. **Bug reale scoperto e
+/// corretto in un giro precedente**:
 /// a differenza di `hsl_sat`/`vibrance` (entrambi già uno scarto RELATIVO a
 /// una baseline), `split_toning.shadow_sat`/`highlight_sat` usava la chroma
 /// Lab GREZZA della zona, senza sottrarre nulla — quindi anche una foto
@@ -120,6 +124,7 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
     let mut sum_chroma = 0f64;
     let mut hue_bands: [HueBandBucket; HUE_BANDS] = std::array::from_fn(|_| HueBandBucket::new());
     let mut sum_hsl_lum = 0f64;
+    let mut sum_hsl_sat = 0f64;
 
     for px in rgba.pixels() {
         let r = px[0] as f32 / 255.0;
@@ -144,6 +149,12 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
         // renderizzato in un'altra.
         let hsl_px = rgb_to_hsl([r, g, b]);
         sum_hsl_lum += hsl_px[2] as f64;
+        // A differenza di `bucket.sum_sat` più sotto (solo pixel cromatici,
+        // per il bias PER BANDA), questa somma è su TUTTI i pixel, pixel
+        // acromatici inclusi — serve a sapere quanto sia satura la foto nel
+        // suo COMPLESSO, il confronto giusto per "questa banda è più/meno
+        // satura del resto di QUESTA foto" (vedi `overall_hsl_sat` più sotto).
+        sum_hsl_sat += hsl_px[1] as f64;
         if hsl_px[1] > 0.02 {
             // Pixel quasi acromatici esclusi dalle bande: il loro hue non è
             // affidabile (rumore numerico attorno a un colore grigio), e
@@ -160,6 +171,7 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
 
     let n = l_values.len().max(1) as f64;
     let overall_hsl_lum = (sum_hsl_lum / n) as f32;
+    let overall_hsl_sat = (sum_hsl_sat / n) as f32;
 
     // --- Tone curve: percentili della luminanza come control point ---
     let mut sorted_l = l_values.clone();
@@ -264,34 +276,38 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
         let band_mean_hue = (bucket.sum_hue / n_band) as f32;
         let band_center_hue = band as f32 * 45.0 + 22.5;
 
-        // Range stretto (+-50, non +-100): **bug reale scoperto e corretto in
-        // questo giro**, causa della dominante magenta/viola diffusa segnalata
-        // dall'utente su un rendering "incolla impostazioni". `BASELINE_HSL_
-        // SATURATION` (0.35) è una stima di quanto sia "tipicamente satura" UNA
-        // banda di tonalità in una foto qualunque — ma nella grande maggioranza
-        // delle foto reali quasi tutte le 8 bande hanno una saturazione media
-        // MOLTO più bassa di 0.35 (gran parte della scena è pavimentazione,
-        // pelle, cielo, grigi quasi neutri con solo una leggerissima e
-        // involontaria dominante di colore), quindi quasi ogni banda finiva
-        // clampata al -100 estremo ("azzera del tutto questa tonalità"), mentre
-        // la sola banda che per caso intercettava un'area davvero satura (anche
-        // solo per una classificazione di hue vicina al confine, es. un rosso
-        // con una lieve componente blu che cade nella banda "Magenta" invece di
-        // "Rosso") finiva clampata al +100 opposto ("raddoppia questa
-        // tonalità"). Il risultato, con l'interpolazione circolare fra bande
-        // adiacenti (vedi `look-render::interpolate_hsl_band`), è che un'ampia
-        // porzione della ruota dei colori finiva o quasi completamente
-        // desaturata o vistosamente amplificata verso quell'unica tonalità
-        // "vincente" — non uno stile estratto dalla foto campione, un
-        // artefatto della formula. Dimezzare il range (+-50, moltiplicatore
-        // 0.5x-1.5x invece di 0x-2x) tiene il segnale (quali tonalità la foto
-        // campione enfatizza/desatura rispetto alle altre) senza più poter
-        // azzerare o raddoppiare un'intera banda da solo. Non tocca il range
-        // dello slider MANUALE nel pannello Develop (-100..100, in
-        // `look-render`): lì è una scelta deliberata dell'utente, non
-        // un'estrazione automatica da guardrail.
-        hsl_sat[band] = (((band_mean_sat - BASELINE_HSL_SATURATION) / BASELINE_HSL_SATURATION) * 100.0)
-            .clamp(-50.0, 50.0) as i32;
+        // **Secondo bug reale, più profondo del precedente, scoperto in questo
+        // giro confrontando il risultato con le foto vere dell'utente**:
+        // l'utente ha misurato (fuori da questo motore) che dopo "Incolla
+        // impostazioni" la foto target risultava MOLTO più desaturata della
+        // stessa foto campione che doveva copiare (saturazione HSL media:
+        // campione ~0.095, target dopo il paste ~0.017 — quasi 6 volte meno
+        // satura del campione). Causa: questa riga confrontava
+        // `band_mean_sat` con `BASELINE_HSL_SATURATION`, una costante FISSA
+        // (0.35) — un confronto ESTERNO, incoerente con `hsl_lum`/`hsl_hue`
+        // qui sotto, che invece confrontano ciascuna banda con la media
+        // dell'INTERA foto campione (`overall_hsl_lum`/`band_center_hue`) — un
+        // confronto INTERNO/relativo. Su una foto uniformemente poco satura
+        // (la normalità: gran parte di una scena è pavimentazione, pelle,
+        // cielo, grigi quasi neutri) questo spingeva PRATICAMENTE TUTTE le
+        // bande verso l'estremo negativo del clamp (misurato: 6 bande su 8 a
+        // -50 su una foto vera dell'utente) — e quel bias per-banda si
+        // SOMMAVA moltiplicativamente a `vibrance` (bias GLOBALE, calcolato
+        // dalla stessa identica caratteristica "la foto è poco colorata"): due
+        // meccanismi diversi che penalizzavano DUE VOLTE lo stesso fatto,
+        // portando la desaturazione finale ben oltre quella della foto
+        // campione stessa. **Corretto** rendendo `hsl_sat` internamente
+        // relativo come i suoi due fratelli, invece che ancorato a una
+        // costante esterna: una banda viene spinta solo se è più/meno satura
+        // del RESTO di QUESTA STESSA foto, non se la foto nel suo insieme è
+        // "poco satura in assoluto" (quel giudizio spetta solo a `vibrance`,
+        // così il segnale non viene più contato due volte). Scala (150.0,
+        // scelta perché uno scarto di banda "notevole" per una foto vera,
+        // ~0.3 su scala HSL 0..1, arrivi vicino al tetto del clamp) e range
+        // (+-50, invariato dal giro precedente) restano prudenti. Non tocca il
+        // range dello slider MANUALE nel pannello Develop (-100..100, in
+        // `look-render`): lì è una scelta deliberata dell'utente.
+        hsl_sat[band] = ((band_mean_sat - overall_hsl_sat) * 150.0).clamp(-50.0, 50.0) as i32;
         // Range stretto (+-30): un ritocco di luminanza per banda, non una
         // riesposizione mascherata per colore.
         hsl_lum[band] = ((band_mean_lum - overall_hsl_lum) * 200.0).clamp(-30.0, 30.0) as i32;
@@ -378,17 +394,19 @@ mod tests {
 
     #[test]
     fn saturated_band_gets_a_positive_saturation_bias_others_stay_at_zero() {
-        // Foto quasi interamente rossa satura, con un piccolo angolo neutro
-        // (altrimenti nessuna banda avrebbe l'hue definito quando l'immagine
-        // è un unico colore piatto... in realtà anche un solo colore basta,
-        // ma un angolo neutro verifica anche che i pixel acromatici vengano
-        // esclusi correttamente dal calcolo). Rosso puro (255,0,0) sRGB cade
-        // in banda 0 (hue 0).
-        let img = synthetic_image(|x, y| {
-            if x < 4 && y < 4 {
-                [128, 128, 128, 255] // angolo neutro: escluso dalle bande
+        // Da quando `hsl_sat` è RELATIVO al resto della stessa foto (non più
+        // ancorato a una costante fissa — vedi il commento sul bug reale
+        // sopra la formula), una banda ottiene un bias positivo solo se è
+        // più satura del RESTO della foto, non se è "satura in assoluto": per
+        // questo la foto qui sotto ha una metà genuinamente neutra (non solo
+        // un angolino) che tiene bassa `overall_hsl_sat`, e una metà rosso
+        // molto saturo (230,20,20 sRGB cade in banda 0) che deve risultare
+        // notevolmente più satura del resto.
+        let img = synthetic_image(|x, _| {
+            if x < 32 {
+                [128, 128, 128, 255] // metà neutra: esclusa dalle bande, ma abbassa overall_hsl_sat
             } else {
-                [230, 20, 20, 255] // rosso molto saturo: banda 0
+                [230, 20, 20, 255] // metà rosso molto saturo: banda 0
             }
         });
         let look = extract_look_from_reference(&img, "Red Test");
@@ -396,6 +414,18 @@ mod tests {
         // Una banda senza abbastanza pixel (es. la 4, Aqua) resta a zero: non
         // deve inventare uno stile per un colore assente dalla foto.
         assert_eq!(look.hsl.sat[4], 0, "banda assente dalla foto non deve avere bias, got {}", look.hsl.sat[4]);
+    }
+
+    #[test]
+    fn uniformly_saturated_photo_gives_no_per_band_bias_only_global_vibrance() {
+        // Il bug reale corretto in questo giro, isolato in un test: una foto
+        // interamente (non solo per metà) di un unico colore saturo non deve
+        // ricevere ALCUN bias per-banda — non c'è "resto della foto" più o
+        // meno saturo con cui confrontarsi, quindi il segnale è tutto e solo
+        // in `vibrance` (globale), mai duplicato anche per banda.
+        let img = synthetic_image(|_, _| [230, 20, 20, 255]);
+        let look = extract_look_from_reference(&img, "Uniform Red");
+        assert_eq!(look.hsl.sat, [0; 8], "foto uniformemente satura non deve avere bias PER BANDA, got {:?}", look.hsl.sat);
     }
 
     #[test]

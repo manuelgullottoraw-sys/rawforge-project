@@ -363,14 +363,46 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                     *c = (*c + lift).clamp(0.0, 1.0);
                 }
 
-                // Tone curve.
+                // Tone curve e contrasto: applicati alla LUMA, non canale per
+                // canale come prima. **Bug reale scoperto e corretto in
+                // questo giro**, segnalato dall'utente con due foto vere: il
+                // risultato di "Incolla impostazioni" risultava molto più
+                // desaturato/spento della foto campione stessa, "inutilizzabile".
+                // Isolando ogni stadio della pipeline sulle foto vere
+                // dell'utente (script di debug dedicato, non solo ipotesi):
+                // applicare la stessa LUT (o lo stesso riscalamento di
+                // contrasto) in modo indipendente su R, G e B comprime le
+                // DIFFERENZE fra i canali — cioè la chroma/saturazione — come
+                // effetto collaterale non voluto, anche quando la curva/il
+                // contrasto in sé sono miti: misurato, la tone curve da sola
+                // tagliava la chroma Lab media di circa il 40%, il contrasto
+                // da solo di un altro ~25%, e in sequenza (più il bias di
+                // vibrance/hsl per banda, tutti nella stessa direzione su
+                // questa foto) il risultato finale scendeva ben sotto la
+                // chroma della foto campione che doveva copiare. La lift
+                // ombre/luci qui sopra NON soffriva di questo problema perché
+                // è additiva e uguale su tutti e tre i canali (sposta la luma
+                // senza toccare le differenze fra i canali): stesso principio
+                // applicato ora anche qui. La luma è una combinazione lineare
+                // con pesi che sommano a 1 (0.2126+0.7152+0.0722=1.0): uno
+                // shift additivo identico su R/G/B sposta la luma esattamente
+                // di quello shift, lasciando intatte le differenze fra i
+                // canali — cioè hue e chroma — invece di comprimerle. Si
+                // ricalcola la luma dopo ogni stadio (non si riusa il valore
+                // teorico pre-clamp) per restare corretti anche quando un
+                // canale satura a 0 o 255.
+                let luma_before_curve = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
+                let luma_after_curve = sample_lut(&tone_curve_lut, luma_before_curve).clamp(0.0, 1.0);
+                let curve_delta = luma_after_curve - luma_before_curve;
                 for c in srgb.iter_mut() {
-                    *c = sample_lut(&tone_curve_lut, *c);
+                    *c = (*c + curve_delta).clamp(0.0, 1.0);
                 }
 
-                // Contrasto attorno al pivot 0.5.
+                let luma_before_contrast = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
+                let luma_after_contrast = ((luma_before_contrast - 0.5) * contrast_amount + 0.5).clamp(0.0, 1.0);
+                let contrast_delta = luma_after_contrast - luma_before_contrast;
                 for c in srgb.iter_mut() {
-                    *c = ((*c - 0.5) * contrast_amount + 0.5).clamp(0.0, 1.0);
+                    *c = (*c + contrast_delta).clamp(0.0, 1.0);
                 }
 
                 // HSL per banda + split toning + saturazione/vibrance globale.
@@ -450,6 +482,39 @@ mod tests {
         }
         let sum: f64 = hist.iter().enumerate().map(|(bin, &c)| bin as f64 * c as f64).sum();
         (sum / total as f64) as f32
+    }
+
+    #[test]
+    fn negative_contrast_and_a_real_tone_curve_do_not_collapse_saturation() {
+        // Bug reale scoperto e corretto in questo giro, segnalato dall'utente
+        // con due foto vere: applicare tone curve e contrasto CANALE PER
+        // CANALE (com'era prima) comprime le differenze fra i canali — cioè
+        // la saturazione — come effetto collaterale non voluto, anche con
+        // valori non estremi. Misurato sulle foto vere: solo la tone curve
+        // tagliava la chroma media di ~40%, il contrasto di un altro ~25%.
+        // Qui lo stesso principio isolato su un singolo pixel sintetico: un
+        // arancione moderatamente saturo, contrasto negativo (-40, la stessa
+        // direzione tipica di un campione "morbido") e una tone curve reale
+        // (non identità: schiarisce le ombre, scurisce leggermente le luci).
+        // La saturazione HSL del risultato deve restare vicina all'originale
+        // — non collassare verso il grigio — perché ora la curva/il
+        // contrasto si applicano solo alla luma (additivo, uguale su tutti i
+        // canali) e non più canale per canale.
+        let img = solid_image(4, 4, [180, 100, 60]);
+        let original_sat = rgb_to_hsl([180.0 / 255.0, 100.0 / 255.0, 60.0 / 255.0])[1];
+
+        let mut look = HarmonicLook::default();
+        look.contrast = -40;
+        look.tone_curve = vec![(0, 40), (64, 90), (128, 128), (192, 170), (255, 220)];
+
+        let rendered = render_preview_with_look(&img, &look).to_rgba8();
+        let px = rendered.get_pixel(0, 0);
+        let rendered_sat = rgb_to_hsl([px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0])[1];
+
+        assert!(
+            rendered_sat > original_sat * 0.8,
+            "la saturazione non deve crollare: originale={original_sat} dopo tone curve+contrasto={rendered_sat}"
+        );
     }
 
     #[test]

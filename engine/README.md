@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (72 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 10, `look_render` 24, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
+Crate reali, compilati e testati (74 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 11, `look_render` 25, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -348,6 +348,62 @@ produrre una dominante sproporzionata rispetto allo stile reale della foto campi
 guardrailato e verificato, sia isolatamente sia end-to-end. Se il problema dovesse ripresentarsi,
 condividere la foto campione e quella target permetterebbe di individuare la causa esatta invece
 di continuare a ipotizzare da uno screenshot.
+
+## Corretto (questo giro): "Incolla impostazioni" desaturava il target ben oltre il campione stesso
+
+L'utente ha fornito due foto vere e chiesto una verifica precisa: dopo "Incolla impostazioni" la
+foto target diventava troppo desaturata, con "artefatti" — non solo diversa dal target originale,
+ma molto più desaturata della STESSA foto campione che doveva riprodurre. Misurato con la chroma
+Lab media (indipendente dalla luminosità, a differenza della saturazione HSL grezza): campione
+~4.46, target originale ~8.39, target dopo il paste **~1.45** — un terzo della chroma del campione
+stesso. Isolando ogni stadio della pipeline sulle foto vere (script `cargo run --example` dedicati,
+non ipotesi), sono emerse due cause reali distinte:
+
+**1. `hsl_sat` ancora ancorato a una costante esterna, incoerente con `hsl_lum`/`hsl_hue`.** La
+correzione della sessione precedente aveva solo ristretto il range (±100 → ±50) senza cambiare il
+confronto: `band_mean_sat` restava confrontato con `BASELINE_HSL_SATURATION` (costante fissa),
+mentre `hsl_lum` confronta ogni banda con `overall_hsl_lum` (media dell'INTERA foto campione) e
+`hsl_hue` con `band_center_hue` — entrambi confronti INTERNI/relativi alla stessa foto, non esterni.
+Su una foto uniformemente poco satura questo spingeva quasi tutte le bande verso l'estremo negativo
+(misurato: 6 bande su 8 al -50 di clamp su una foto vera), e quel bias si sommava
+moltiplicativamente a `vibrance` (bias globale, calcolato dalla STESSA caratteristica "poca chroma
+media") — la foto veniva penalizzata due volte per lo stesso fatto invece che una volta sola più
+un'informazione nuova. **Corretto**: aggiunto un accumulatore `sum_hsl_sat` (su TUTTI i pixel, non
+solo quelli cromatici come `bucket.sum_sat`) e `overall_hsl_sat = sum_hsl_sat / n`; la formula
+diventa `((band_mean_sat - overall_hsl_sat) * 150.0).clamp(-50.0, 50.0)` — additiva e relativa alla
+stessa foto, esattamente come `hsl_lum`. Anche `BASELINE_CHROMA` (18.0, mai verificata) è stata
+ricalibrata a 10.0, misurata sulle due foto vere (chroma effettiva ~4.5 e ~8.5 in ciascuna).
+Il test `saturated_band_gets_a_positive_saturation_bias_others_stay_at_zero` è stato riscritto (la
+vecchia foto-quasi-tutta-un-colore non aveva più senso col confronto relativo: serve un "resto della
+foto" con cui confrontarsi) e un nuovo test
+`uniformly_saturated_photo_gives_no_per_band_bias_only_global_vibrance` verifica esplicitamente che
+una foto uniformemente satura non riceva PIÙ bias per banda, solo il bias globale di `vibrance`.
+
+**2. Tone curve e contrasto applicati per canale in `look-render`, non alla luminosità — la causa
+più grande.** `render_preview_with_look` applicava `sample_lut(&tone_curve_lut, *c)` e
+`(*c - 0.5) * contrast_amount + 0.5` a ciascun canale R/G/B indipendentemente. Applicare la stessa
+curva/riscalamento a ogni canale separatamente comprime le DIFFERENZE fra i canali — cioè la
+chroma/saturazione — come effetto collaterale, anche con valori non estremi: misurato isolando ogni
+stadio, la sola tone curve tagliava la chroma media di ~40%, il contrasto da solo di un altro ~25%.
+La lift ombre/luci preesistente non soffriva di questo perché è additiva e identica sui tre canali
+(sposta la luma senza toccare le differenze fra canali — la luma è una combinazione lineare con pesi
+che sommano a 1, quindi uno shift uguale su R/G/B sposta la luma di esattamente quello shift).
+**Corretto** applicando lo stesso principio a tone curve e contrasto: si calcola la luma del pixel,
+si applica la curva/il contrasto alla SOLA luma, si ricava il delta, e si sposta ogni canale di
+quel delta (ricalcolando la luma da zero dopo ogni stadio, non riusando il valore teorico pre-clamp,
+per restare corretti anche quando un canale satura a 0 o 255). Nuovo test
+`negative_contrast_and_a_real_tone_curve_do_not_collapse_saturation`: un pixel arancione
+moderatamente saturo, contrasto -40 e una tone curve reale (non identità) non devono far crollare
+la sua saturazione HSL sotto l'80% dell'originale.
+
+**Risultato combinato**, misurato sulle stesse foto vere: chroma del rendering finale da ~1.45 a
+**~6.24** — sopra la chroma del campione stesso (4.46), vicina all'originale del target (8.39).
+Ispezione visiva: sedili rossi vividi (non più smorti), pavimentazione con la tonalità calda del
+campione invece di un grigio spento, nessun artefatto. **Onestà**: due foto reali non sono un
+corpus — `BASELINE_CHROMA = 10.0` e il moltiplicatore `150.0` di `hsl_sat` restano stime, da
+ritarare con più foto di riferimento; il principio strutturale (curve sulla luminosità, non per
+canale; bias per-banda relativo alla stessa foto) è però una correzione solida, non solo un numero.
+Workspace completo: 74 test, tutti verdi.
 
 ## Comandi
 

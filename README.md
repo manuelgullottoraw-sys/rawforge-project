@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 72 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 74 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -477,6 +477,115 @@ userebbe a individuare la causa esatta invece di continuare a ipotizzare da uno 
 Due nuovi test in `look-render` (`positive_blacks_lifts_near_black_pixels_more_than_midtones`,
 `negative_whites_pulls_near_white_pixels_down_more_than_midtones`) verificano il punto 2, sul
 modello dell'analogo test già esistente per ombre/luci. Workspace completo: 72 test, tutti verdi.
+
+**Verifica finale sulle foto vere dell'utente**: per sicurezza, oltre alle scene sintetiche di cui
+sopra, le due correzioni sono state rieseguite sulle due foto reali fornite dall'utente (non un
+test isolato: l'intero algoritmo di `PhotoEditSession::paste_look_from_sample`, stessi parametri di
+default della UI — override_strength 100%, target ridotto a `INTERACTIVE_PREVIEW_MAX_DIM` come fa
+davvero l'app). In entrambe le direzioni (ciascuna foto come campione, l'altra come target) lo
+split toning estratto risulta `shadow_sat`/`highlight_sat` = 0 (nessun cast residuo da quel
+meccanismo) e il rendering risultante, ispezionato visivamente, non mostra alcuna dominante
+magenta/rosa: pavimentazione e carrozzeria restano in toni neutri, i sedili rossi restano rossi
+(colore reale della foto, non un artefatto). Uniche osservazioni honeste, non legate al bug
+segnalato: `vibrance` esce piuttosto negativo su entrambe le foto (-75/-53), quindi il risultato
+appare più desaturato/spento del previsto — un effetto collaterale della baseline di vibrance
+(`BASELINE_CHROMA`), non della dominante di colore ora corretta; se dovesse risultare eccessivo,
+è un candidato separato per un futuro ritocco della baseline, da ricalibrare su un corpus più
+ampio di foto reali (come già notato altrove in questo stesso file per le altre baseline
+euristiche).
+
+## Nuovo: zoom con rotella del mouse sulle foto, esportazione preset con scelta della cartella
+
+Due richieste dirette dell'utente, entrambe lato UI Kotlin (nessuna modifica al motore Rust):
+
+**Zoom sulle foto.** Ogni foto mostrata nell'app — il riquadro "Campione", il riquadro "Foto da
+modificare"/anteprima, e la foto grande nella modalità "Develop a schermo intero" — ora si
+ingrandisce/rimpicciolisce con la rotella del mouse quando il cursore è sopra di essa, tramite un
+nuovo componente condiviso `ZoomableImage` (in `App.kt`). Lo zoom è centrato (nessun trascinamento
+per spostarsi, non richiesto), limitato fra 1x (la dimensione "adatta al riquadro" originale, mai
+più piccola) e 6x, e si azzera automaticamente quando una foto DIVERSA viene importata nello stesso
+riquadro — ma NON ad ogni singolo fotogramma del rendering dal vivo mentre si trascina uno slider
+del pannello Develop (il bitmap mostrato cambia decine di volte al secondo in quel caso: azzerare
+lo zoom ad ogni fotogramma lo avrebbe reso di fatto inutilizzabile durante l'editing).
+
+**"Esporta preset .xmp" scrive davvero un file.** Prima di questa modifica, il pulsante calcolava
+il preset e ne mostrava solo un'anteprima di testo troncata nella UI — non veniva mai salvato su
+disco. Ora, subito dopo il calcolo, si apre lo stesso selettore nativo già usato per "Esporta
+foto…" (finestra di salvataggio AWT su Desktop, Storage Access Framework su Android), che lascia
+scegliere la cartella di destinazione (e il nome file, precompilato ma modificabile) — nuovo file
+`PresetSaverLauncher.kt` (+ le due implementazioni per piattaforma), analogo a
+`FileSaverLauncher.kt` già esistente ma con contenuto testuale/XML invece che un'immagine PNG.
+
+**Nota onesta sui limiti di questa verifica**: a differenza di tutte le correzioni Rust di questo
+progetto (verificate qui con `cargo test`/`cargo run` prima di ogni consegna), queste due modifiche
+sono Kotlin/Compose Multiplatform — in questo ambiente non è disponibile una toolchain
+Kotlin/Gradle per compilarle o testarle localmente (limite noto fin dall'inizio di questo
+progetto). Il codice segue pattern già presenti e funzionanti altrove in `App.kt` (stesso schema di
+`pointerInput`/`detectDragGestures` già usato dall'editor della tone curve, stesso schema di
+`rememberFileSaverLauncher` già usato per l'esportazione foto), ma la verifica definitiva resta la
+build reale via GitHub Actions CI, come per ogni modifica alla UI di questo progetto.
+
+## Corretto: "Incolla impostazioni" desaturava la foto target MOLTO oltre la foto campione stessa
+
+Segnalazione dell'utente, con screenshot dell'app e le stesse due foto reali della verifica
+precedente: il risultato di "Incolla impostazioni" diventava troppo desaturato, con "artefatti" che
+lo rendevano inutilizzabile — la richiesta esplicita era che il risultato dovesse restare
+visivamente fedele alla foto campione, non un'approssimazione spenta. Misurato con la chroma Lab
+media (una metrica di "quanto è colorata" un'immagine, indipendente dalla luminosità — più adatta
+di una saturazione HSL grezza, che invece dipende anche da quanto è chiara/scura l'immagine) sulle
+due foto vere dell'utente: campione (il "look" da copiare) chroma ~4.46, target originale ~8.39,
+target dopo "Incolla impostazioni" (prima di questa correzione) crollato a **~1.45** — un terzo
+della chroma della stessa foto campione che doveva riprodurre, non solo "diversa dal target
+originale". Isolando ogni stadio della pipeline uno alla volta su queste foto vere (script di
+debug dedicati, non ipotesi), sono emerse **due cause reali distinte**, non una sola:
+
+**1. `hsl_sat` ancora incoerente con `hsl_lum`/`hsl_hue`, nonostante la correzione precedente.** La
+correzione della sessione precedente aveva solo ristretto il RANGE del bias (±100 → ±50), lasciando
+il confronto ancorato a una costante fissa esterna (`BASELINE_HSL_SATURATION`) — a differenza dei
+suoi due "fratelli" `hsl_lum`/`hsl_hue`, che confrontano ogni banda con la media dell'INTERA foto
+campione (un confronto interno/relativo). Su una foto uniformemente poco satura (la normalità per
+gran parte di una scena reale) questo spingeva quasi tutte le bande verso l'estremo negativo — e
+quel bias, calcolato dalla STESSA caratteristica "la foto è poco colorata" già catturata da
+`vibrance` (bias globale), si sommava moltiplicativamente al bias globale invece di aggiungere
+informazione nuova: la foto veniva penalizzata due volte per lo stesso fatto. **Corretto**: `hsl_sat`
+ora confronta ogni banda con la saturazione media dell'INTERA foto campione, esattamente come
+`hsl_lum`/`hsl_hue` — una banda riceve un bias solo se è più/meno satura del resto di QUESTA foto,
+mai per il livello di colore assoluto della foto nel suo complesso (quel giudizio spetta solo a
+`vibrance`). Anche `BASELINE_CHROMA` (il bias globale di `vibrance`) è stata ricalibrata: era 18.0,
+una stima "a occhio" mai verificata — misurata ora sulle due foto vere, la chroma media effettiva
+era ~4.5 e ~8.5, meno della metà della vecchia baseline in entrambi i casi. Portata a 10.0.
+
+**2. Tone curve e contrasto applicati canale per canale, non alla luminosità.** La causa PIÙ
+GRANDE, e la più sottile: `render_preview_with_look` applicava sia la tone curve sia il contrasto
+in modo indipendente su ciascun canale R/G/B. Applicare la STESSA curva/riscalamento a ciascun
+canale separatamente comprime le differenze FRA i canali — cioè comprime la saturazione — come
+effetto collaterale non voluto, anche con valori non estremi: misurato sulle foto vere, la sola
+tone curve tagliava la chroma media di circa il 40%, il contrasto da solo di un altro ~25%, in
+sequenza. La lift di ombre/luci (già esistente) non soffriva di questo problema perché è additiva e
+identica su tutti e tre i canali — sposta la luminosità senza toccare le differenze fra i canali.
+**Corretto** applicando lo stesso principio anche a tone curve e contrasto: si calcola quanto la
+LUMINOSITÀ del pixel dovrebbe cambiare (secondo la curva o il contrasto), poi si sposta ogni canale
+di quello stesso ammontare — invece di ricalcolare ogni canale in modo indipendente. Il colore
+(hue e chroma) resta intatto, cambia solo la luminosità, esattamente come un vero editor fotografico
+professionale.
+
+**Risultato dopo entrambe le correzioni**, misurato sulle stesse foto vere: chroma del rendering
+finale passata da ~1.45 a **~6.24** — non più un terzo della chroma del campione, ma superiore alla
+chroma del campione stesso (4.46) e ragionevolmente vicina all'originale del target (8.39).
+Ispezionato visivamente: i sedili restano rossi vividi (non più smorti), la pavimentazione porta la
+tonalità calda della foto campione invece di un grigio spento, nessun artefatto visibile. Nuovo
+test in `look-render` (`negative_contrast_and_a_real_tone_curve_do_not_collapse_saturation`) isola
+esattamente questo meccanismo con un singolo pixel sintetico, e due nuovi test in `harmonic`
+(`saturated_band_gets_a_positive_saturation_bias_others_stay_at_zero`, riscritto per il nuovo
+confronto relativo, e `uniformly_saturated_photo_gives_no_per_band_bias_only_global_vibrance`)
+coprono il punto 1. Workspace completo: 74 test, tutti verdi.
+
+**Onestà su cosa resta**: due foto reali non sono un corpus — `BASELINE_CHROMA = 10.0` e il
+moltiplicatore `150.0` di `hsl_sat` restano stime, seppur ora ancorate a una misura vera invece che
+a un'ipotesi, e vanno probabilmente ritarate ulteriormente quando saranno disponibili più foto di
+riferimento. Il principio strutturale (curve/contrasto sulla luminosità, non per canale; bias
+per-banda relativo alla stessa foto, non a una costante esterna) è invece una correzione solida,
+non un numero da ritarare.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

@@ -15,12 +15,15 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -201,6 +204,8 @@ fun RawForgeApp() {
     var sampleError by remember { mutableStateOf<String?>(null) }
     var harmonicXmp by remember { mutableStateOf<String?>(null) }
     var harmonicError by remember { mutableStateOf<String?>(null) }
+    var presetSaveMessage by remember { mutableStateOf<String?>(null) }
+    var presetSaveError by remember { mutableStateOf<String?>(null) }
 
     var targetState by remember { mutableStateOf<ImportState?>(null) }
     var targetError by remember { mutableStateOf<String?>(null) }
@@ -312,6 +317,8 @@ fun RawForgeApp() {
         sampleError = null
         harmonicXmp = null
         harmonicError = null
+        presetSaveMessage = null
+        presetSaveError = null
         importInto(
             bytes,
             fileName,
@@ -333,6 +340,16 @@ fun RawForgeApp() {
     val launchExport = rememberFileSaverLauncher(
         onSaved = { destination -> exportMessage = "Foto esportata: $destination"; exportError = null; exportBusy = false },
         onError = { error -> exportError = error; exportMessage = null; exportBusy = false },
+    )
+
+    // "Esporta preset .xmp": calcola il testo del preset e lo scrive subito
+    // su un file vero, lasciando scegliere all'utente la cartella di
+    // destinazione (e il nome file, precompilato) tramite lo stesso
+    // selettore nativo già usato per l'esportazione della foto — prima non
+    // veniva mai scritto su disco, solo mostrato come anteprima di testo.
+    val launchExportXmp = rememberPresetSaverLauncher(
+        onSaved = { destination -> presetSaveMessage = "Preset salvato: $destination"; presetSaveError = null },
+        onError = { error -> presetSaveError = error; presetSaveMessage = null },
     )
 
     // Esporta a piena risoluzione la foto corrente con il Look attuale.
@@ -409,12 +426,21 @@ fun RawForgeApp() {
                                     onClick = {
                                         val sample = sampleState ?: return@Button
                                         harmonicError = null
+                                        presetSaveMessage = null
+                                        presetSaveError = null
                                         Engine.extractLookAndExportXmp(
                                             sample.rawBytes,
                                             sample.fileName,
                                             "Look da ${sample.fileName}"
                                         ).fold(
-                                            onSuccess = { xmp -> harmonicXmp = xmp },
+                                            onSuccess = { xmp ->
+                                                harmonicXmp = xmp
+                                                // Subito dopo aver calcolato il preset, chiede
+                                                // all'utente dove salvarlo — non solo
+                                                // un'anteprima di testo come prima.
+                                                val suggested = sample.fileName.substringBeforeLast('.') + "_look.xmp"
+                                                launchExportXmp(xmp, suggested)
+                                            },
                                             onFailure = { error -> harmonicError = error.message ?: "Errore sconosciuto" }
                                         )
                                     },
@@ -425,6 +451,14 @@ fun RawForgeApp() {
                                 harmonicError?.let {
                                     Spacer(Modifier.height(4.dp))
                                     Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                                }
+                                presetSaveError?.let {
+                                    Spacer(Modifier.height(4.dp))
+                                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                                }
+                                presetSaveMessage?.let {
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(it, style = MaterialTheme.typography.caption, color = TextMuted)
                                 }
                                 harmonicXmp?.let {
                                     Spacer(Modifier.height(4.dp))
@@ -622,10 +656,10 @@ private fun FullScreenDevelopView(
                 contentAlignment = Alignment.Center,
             ) {
                 if (bitmap != null) {
-                    Image(
+                    ZoomableImage(
                         bitmap = bitmap,
                         contentDescription = title,
-                        contentScale = ContentScale.Fit,
+                        resetKey = title,
                         modifier = Modifier.fillMaxSize(),
                     )
                 } else {
@@ -732,10 +766,10 @@ private fun PhotoPanel(
             ) {
                 val bitmap = overrideBitmap ?: photo?.bitmap
                 if (bitmap != null) {
-                    Image(
+                    ZoomableImage(
                         bitmap = bitmap,
                         contentDescription = title,
-                        contentScale = ContentScale.Fit,
+                        resetKey = photo?.fileName,
                         modifier = Modifier.fillMaxSize().clip(InnerShape),
                     )
                 } else if (photo != null) {
@@ -751,6 +785,67 @@ private fun PhotoPanel(
             }
             actions()
         }
+    }
+}
+
+/** Zoom minimo (sempre 1x: la dimensione "adatta al riquadro" di
+ * `ContentScale.Fit`, mai più piccola) e massimo consentito con la rotella
+ * del mouse — oltre 6x un'anteprima già ridotta per l'editing interattivo
+ * (vedi `INTERACTIVE_PREVIEW_MAX_DIM` lato Rust) mostrerebbe solo pixel
+ * ingranditi senza dettaglio utile in più. */
+private const val MIN_ZOOM = 1f
+private const val MAX_ZOOM = 6f
+
+/** Quanto una singola "tacca" di rotella cambia lo zoom: valore scelto per
+ * essere reattivo senza far scattare lo zoom in modo brusco. */
+private const val ZOOM_SENSITIVITY = 0.08f
+
+/**
+ * Un `Image` che si ingrandisce/rimpicciolisce con la rotella del mouse
+ * quando il cursore è sopra di esso (lo scroll è consegnato solo al
+ * componente sotto il puntatore, non serve altro per limitarlo "quando si
+ * passa sopra la foto col cursore"). Zoom centrato (nessun pan): scorrere in
+ * avanti (lontano da sé) ingrandisce, scorrere all'indietro rimpicciolisce,
+ * fino a tornare esattamente alla dimensione "adatta al riquadro" — mai più
+ * piccola. `resetKey` azzera lo zoom quando cambia (es. una foto diversa
+ * importata nello stesso riquadro): NON va legato al bitmap stesso, che
+ * cambia ad ogni singolo fotogramma durante il rendering dal vivo mentre si
+ * trascina uno slider — altrimenti lo zoom si azzererebbe continuamente
+ * durante l'editing invece di restare stabile.
+ */
+@Composable
+private fun ZoomableImage(
+    bitmap: ImageBitmap,
+    contentDescription: String,
+    resetKey: Any?,
+    modifier: Modifier = Modifier,
+) {
+    var zoom by remember(resetKey) { mutableStateOf(1f) }
+    Box(
+        modifier = modifier
+            .clipToBounds()
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.type == PointerEventType.Scroll) {
+                            val scrollDelta = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
+                            if (scrollDelta != 0f) {
+                                zoom = (zoom * (1f - scrollDelta * ZOOM_SENSITIVITY)).coerceIn(MIN_ZOOM, MAX_ZOOM)
+                                event.changes.forEach { it.consume() }
+                            }
+                        }
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Image(
+            bitmap = bitmap,
+            contentDescription = contentDescription,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = zoom, scaleY = zoom),
+        )
     }
 }
 
