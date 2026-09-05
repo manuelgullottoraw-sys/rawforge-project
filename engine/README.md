@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (75 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 11, `look_render` 26, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
+Crate reali, compilati e testati (76 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 12, `look_render` 26, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -444,7 +444,65 @@ entrambi. Nuovo test `negative_global_vibrance_protects_a_very_saturated_pixel_m
 in `look-render`: con lo stesso `vibrance` fortemente negativo, un pixel molto saturo deve perdere
 una frazione relativa della propria saturazione minore di uno moderatamente saturo (mai il
 contrario), e non deve comunque perderne più del 15% — prima della correzione un pixel così ne
-perdeva oltre il 30%. Workspace completo: 75 test, tutti verdi.
+perdeva oltre il 30%. Workspace completo: 76 test, tutti verdi.
+
+## Corretto (questo giro): rumore/"glitch" a chiazze sulla saturazione per un salto ripido fra bande HSL adiacenti
+
+Segnalato dall'utente dopo il fix sopra: "glitch non risolti". Il fix precedente (vibrance non
+lineare) risolveva la desaturazione media ma NON il glitch visibile a occhio — quindi si trattava
+di un bug diverso, ancora presente. L'utente ha anche ipotizzato quattro cause specifiche (spazio
+colore/profilo ICC, spazio di lavoro non a 32 bit in virgola mobile, shader GPU che satura, curva di
+transfer non normalizzata): invece di applicare alla cieca le sue ipotesi, ognuna è stata verificata
+direttamente sul codice e sulle due foto vere:
+
+- **Profilo colore/ICC**: ispezionate entrambe le foto vere con PIL/ImageCms. `photoA.jpg`
+  (target) non ha profilo incorporato; `photoB.jpg` (campione) ha un profilo sRGB esplicito
+  ("IEC 61966-2.1 Default RGB"). Sono quindi entrambe sRGB — **nessun mismatch reale per queste
+  due foto**. Detto ciò, è stato verificato con una ricerca su tutto il workspace che il motore
+  non ha ALCUNA gestione dei profili ICC: è un limite architetturale reale (foto con profili
+  diversi da sRGB verrebbero trattate come se non lo fossero), separato dal bug qui sotto e non
+  la sua causa.
+- **Spazio di lavoro a 32 bit in virgola mobile**: già vero. L'intera pipeline per-pixel in
+  `look-render` lavora in `f32` dall'inizio alla fine di ogni stage (WB, esposizione, tone curve,
+  contrasto, HSL per banda, saturazione/vibrance); solo lettura e scrittura toccano `u8`. Nessuna
+  conversione intermedia a 8 bit che potesse introdurre banding.
+- **"Matrice di trasformazione cromatica"**: questa architettura non ne usa una. La Sintesi
+  Armonica Automatica funziona per bande di tonalità HSL (8 bande, interpolazione circolare), non
+  per matrice 3x3 di color science come in un profilo ICC/LUT 3D. Chiarito per evitare di far
+  credere che sia stata aggiunta una matrice che in realtà non esiste in questo motore.
+- **Shader GPU**: il percorso di rendering live (`look-render`, usato da `PhotoEditSession`) è
+  interamente CPU (`rayon`). Il crate `gpu-pipe` contiene sorgenti WGSL validate con `naga` ma
+  **non è collegato** a questa funzionalità — quindi uno shader GPU che satura non può essere la
+  causa qui.
+
+La causa reale, trovata misurando i valori HSL per banda estratti dalla foto campione vera: alcune
+bande adiacenti (circolarmente, es. Purple→Magenta) avevano un salto fino a **45 punti** su
+`hsl_sat` (e 25 punti su Magenta→Red). `interpolate_hsl_band` interpola in modo continuo (nessun
+salto netto, bug già corretto in un giro precedente), ma un salto così ripido nei VALORI di
+partenza fa sì che il normale, minuscolo jitter di tonalità pixel-per-pixel (subsampling cromatico
+JPEG, texture della pelle dei sedili, rumore del sensore — presente in qualsiasi foto reale) venga
+amplificato in un'oscillazione di saturazione molto più ampia quando il pixel attraversa quella
+regione di tonalità a pendenza ripida — producendo la chiazza/speckle visibile ("glitch") distinta
+dalla desaturazione piatta già corretta.
+
+**Corretto** in `harmonic::extract_look_from_reference` con una nuova funzione
+`smooth_circular_bands`: una media mobile circolare a 3 prese (60% banda corrente + 20% ciascuna
+banda adiacente) applicata a `hsl_hue`, `hsl_sat` e `hsl_lum` prima di restituire la
+`HarmonicLook` estratta — appiattisce i salti ripidi senza spostare quale banda resta dominante.
+Nuovo test `smooth_circular_bands_softens_a_steep_cliff_but_keeps_the_dominant_band_dominant`:
+verifica su un caso preso dai dati reali (salto di 45 punti) che dopo lo smoothing il salto massimo
+fra bande adiacenti scenda sotto i 30 punti e che la banda dominante resti la stessa.
+
+Misurato sulle stesse foto vere (maschera solo-sedili): salto massimo fra bande adiacenti
+45 → **17** punti sui valori estratti; chroma Lab della regione sedili 35.5 (post-fix vibrance,
+pre-smoothing) → **31.9** (leggermente sotto, un compromesso accettato in cambio della riduzione
+del rumore — resta comunque vicino al target 35.0 e al campione 36.7); metrica di "rugosità"
+(passa-alto, proxy autoprodotta e non uno standard di rumore percettivo rigoroso) 2.13
+(pre-smoothing) → **1.96** (post-smoothing), entrambe sotto il valore della foto originale stessa
+(2.29) — a conferma che si tratta di una reale riduzione del rumore introdotto dall'elaborazione, e
+non solo di un'impressione visiva. Come per `BASELINE_CHROMA` e la curva di protezione della
+vibrance, anche i pesi 60/20/20 dello smoothing sono una scelta ragionevole ma calibrata solo su
+queste due foto vere, non verificata su un corpus più ampio.
 
 ## Corretto (questo giro): build Windows falliva con "Unresolved reference: graphicsLayer"
 

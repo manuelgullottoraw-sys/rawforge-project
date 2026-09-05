@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 75 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 76 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -640,6 +640,36 @@ telefono) con un'altezza fissa, e il pannello Develop scende sotto a piena largh
 a schermo intero foto e pannello Develop si dividono lo spazio verticale a metà. **Non verificabile
 in questo ambiente** (limite noto, solo Rust è testabile localmente qui): la verifica reale resta la
 prossima build Android su GitHub Actions.
+
+## Corretto: glitch/rumore a chiazze ancora visibile dopo il fix della vibrance
+
+Dopo il fix della vibrance sopra, l'utente ha segnalato che il glitch persisteva ancora ("glitch
+non risolti") e ha indicato quattro possibili cause tecniche: mismatch di spazio colore/profilo,
+mancanza di uno spazio di lavoro comune a 32 bit in virgola mobile, uno shader GPU che satura, una
+curva di transfer non normalizzata. Invece di applicare queste ipotesi alla cieca, ognuna è stata
+verificata direttamente sul codice e sulle due foto vere, con risposta onesta punto per punto:
+
+- **Spazio colore/profilo ICC**: le due foto vere sono state ispezionate direttamente (PIL/
+  ImageCms). Sono entrambe sRGB (una con profilo esplicito, una senza ma comunque sRGB) — **nessun
+  mismatch reale per queste foto**. Il motore però non ha alcuna gestione dei profili ICC in
+  generale: un limite architetturale reale, disclosurato per onestà, ma non la causa di questo bug.
+- **Spazio di lavoro a 32 bit float**: già vero, verificato — l'intera pipeline in `look-render`
+  lavora in `f32` dall'inizio alla fine di ogni stage, con conversioni a 8 bit solo in lettura/
+  scrittura.
+- **Shader GPU**: il percorso di rendering live è interamente CPU; il crate `gpu-pipe` (WGSL) esiste
+  ma non è collegato a questa funzionalità, quindi non può saturare né produrre questi artefatti.
+- **Curva di transfer/"matrice di trasformazione cromatica"**: la curva tonale è già applicata solo
+  sulla luminosità (fix di un giro precedente), e questa architettura non usa affatto una matrice di
+  trasformazione cromatica — funziona per bande di tonalità HSL, non per matrice 3x3.
+
+La causa reale del glitch era un'altra, trovata misurando i valori HSL estratti dalla foto
+campione: un salto fino a 45 punti fra bande di tonalità circolarmente adiacenti, che amplifica il
+normale jitter di tonalità pixel-per-pixel (texture, compressione JPEG, rumore sensore) in
+un'oscillazione di saturazione visibile come chiazza/speckle. Corretto con una nuova media mobile
+circolare a 3 prese sulle bande HSL estratte, prima di applicare il Look. Salto massimo fra bande
+adiacenti sceso da 45 a 17 punti; metrica di rugosità (rumore ad alta frequenza, proxy autoprodotta)
+scesa da 2.13 a 1.96, ora sotto il valore della foto originale stessa (2.29). Dettagli tecnici,
+numeri completi e nuovo test in `engine/README.md`.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

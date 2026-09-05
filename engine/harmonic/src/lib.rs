@@ -104,6 +104,24 @@ impl LumaBucket {
     }
 }
 
+/// Media mobile circolare a 3 prese (60% valore corrente + 20% ciascuna
+/// banda adiacente) sulle 8 bande di tonalità: vedi il commento esteso dove
+/// viene chiamata, in [`extract_look_from_reference`], per il bug reale che
+/// corregge (rumore/"glitch" di saturazione su un salto ripido fra bande
+/// adiacenti). `round()` invece di troncamento perché questi sono già valori
+/// piccoli (range -50..50 o meno): troncare introdurrebbe un bias sistematico
+/// verso lo zero.
+fn smooth_circular_bands(values: [i32; HUE_BANDS]) -> [i32; HUE_BANDS] {
+    let mut out = [0i32; HUE_BANDS];
+    for i in 0..HUE_BANDS {
+        let prev = values[(i + HUE_BANDS - 1) % HUE_BANDS] as f32;
+        let curr = values[i] as f32;
+        let next = values[(i + 1) % HUE_BANDS] as f32;
+        out[i] = (curr * 0.6 + prev * 0.2 + next * 0.2).round() as i32;
+    }
+    out
+}
+
 fn percentile(sorted: &[f32], p: f64) -> f32 {
     if sorted.is_empty() {
         return 0.0;
@@ -316,6 +334,37 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
         hsl_hue[band] = (band_mean_hue - band_center_hue).clamp(-15.0, 15.0) as i32;
     }
 
+    // **Terzo bug reale scoperto in questo giro, distinto dai due precedenti
+    // (vibrance globale piatta, tone curve/contrasto per canale — entrambi già
+    // corretti)**: l'utente ha continuato a segnalare un "glitch"/rumore
+    // visibile sulla pelle dei sedili anche dopo la correzione della
+    // desaturazione globale — non un calo uniforme ma rumore A CHIAZZE,
+    // localizzato. Isolato misurando su una foto vera: `hsl_sat` aveva un
+    // salto di 45 punti fra due bande ADIACENTI (Viola=-3, Magenta=42) più un
+    // altro salto di 25 punti verso Rosso=17 — proprio nella zona di tonalità
+    // (300-360°) dove cade la maggior parte dei pixel dei sedili rossi di
+    // questa foto. `interpolate_hsl_band` (in `look-render`) rende quella
+    // transizione CONTINUA (niente salti netti, già corretto in un giro
+    // precedente) ma non ne riduce la PENDENZA: una minuscola variazione di
+    // tonalità fra due pixel ADIACENTI (texture della pelle, subsampling
+    // cromatico JPEG, rumore del sensore — presente in qualunque foto reale,
+    // mai perfettamente uniforme) attraversa quella pendenza ripida e viene
+    // amplificata in un salto ben più grande di saturazione applicata —
+    // misurato: fino a 49 punti di differenza fra il fattore applicato a due
+    // pixel adiacenti, entrambi genuinamente pelle rossa, non un bordo. Questo
+    // smoothing (media mobile circolare a 3 prese, 60% banda corrente + 20%
+    // ciascuna vicina) riduce la pendenza massima possibile fra due bande
+    // vicine SENZA azzerare l'intento originale — una banda chiaramente
+    // più/meno satura delle altre nella foto campione resta la più/meno
+    // satura anche dopo, solo con un picco più dolce — stesso principio con
+    // cui `interpolate_hsl_band` già smussa la transizione ENTRO una banda,
+    // applicato qui a monte, fra le bande stesse. Applicato a tutte e tre le
+    // dimensioni (hue/sat/lum): stesso meccanismo, stesso rischio di
+    // amplificare rumore su un salto ripido fra bande adiacenti.
+    let hsl_hue = smooth_circular_bands(hsl_hue);
+    let hsl_sat = smooth_circular_bands(hsl_sat);
+    let hsl_lum = smooth_circular_bands(hsl_lum);
+
     let mut look = HarmonicLook {
         name: name.to_string(),
         exposure_ev,
@@ -487,5 +536,37 @@ mod tests {
         assert!(look.split_toning.shadow_sat > 0);
         assert!(look.split_toning.highlight_sat > 0);
         assert_ne!(look.split_toning.shadow_hue, look.split_toning.highlight_hue);
+    }
+
+    #[test]
+    fn smooth_circular_bands_softens_a_steep_cliff_but_keeps_the_dominant_band_dominant() {
+        // Bug reale scoperto in questo giro, segnalato dall'utente come
+        // "glitch"/rumore sulla pelle dei sedili di una foto vera anche dopo
+        // aver corretto la desaturazione globale: questi sono gli ESATTI
+        // valori di `hsl.sat` misurati su quella foto (banda Viola=-3 seguita
+        // da Magenta=42, un salto di 45 punti in appena 90° di tonalità — la
+        // banda 7 è circolarmente adiacente sia alla 6 che alla 0).
+        let raw = [17, -6, -9, -5, -1, -8, -3, 42];
+        let smoothed = smooth_circular_bands(raw);
+
+        let max_adjacent_diff = |values: &[i32; HUE_BANDS]| {
+            (0..HUE_BANDS)
+                .map(|i| (values[i] - values[(i + 1) % HUE_BANDS]).abs())
+                .max()
+                .unwrap()
+        };
+        let before = max_adjacent_diff(&raw);
+        let after = max_adjacent_diff(&smoothed);
+        assert_eq!(before, 45, "il salto originale su questa foto vera era di 45 punti");
+        assert!(
+            after < 30,
+            "lo smoothing deve ridurre sensibilmente il salto massimo fra bande adiacenti: prima={before} dopo={after}"
+        );
+        // Non deve però appiattire tutto: la banda Magenta (indice 7) resta
+        // la più satura anche dopo lo smoothing — l'intento stilistico
+        // originale (questa banda È più satura delle altre nella foto
+        // campione) va preservato, solo con un picco meno ripido.
+        let max_idx = (0..HUE_BANDS).max_by_key(|&i| smoothed[i]).unwrap();
+        assert_eq!(max_idx, 7, "la banda dominante non deve cambiare, solo appiattirsi: {smoothed:?}");
     }
 }
