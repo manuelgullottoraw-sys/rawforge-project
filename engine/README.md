@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (83 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 12, `look_render` 29, `metadata` 3, `raw_decode` 4, `ffi` 19, `smartbatch`
+Crate reali, compilati e testati (91 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 17, `look_render` 29, `metadata` 3, `raw_decode` 4, `ffi` 22, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -446,7 +446,62 @@ una frazione relativa della propria saturazione minore di uno moderatamente satu
 contrario), e non deve comunque perderne più del 15% — prima della correzione un pixel così ne
 perdeva oltre il 30%. Workspace completo: 83 test, tutti verdi.
 
-## Corretto (questo giro): "Intensità adattamento" non aveva ALCUN effetto su contrasto e tone curve — copiati letteralmente dal campione a qualunque valore dello slider
+## Corretto (questo giro): la tinta del target non convergeva verso quella del campione dopo "Incolla impostazioni", anche a contrasto/chroma ormai corretti
+
+Segnalato dall'utente dopo il fix del contrasto sopra: "resta un'ultima cosa da sistemare, ovvero i
+colori non corrispondono del tutto... la tinta anche è parecchio diversa". Misurato sui sedili rossi
+delle due foto vere (spazio Lab, zona sedili isolata via template matching): la chroma era già ben
+recuperata (94% dell'originale, 34.53 contro 36.39, vicina anche a quella del campione, 36.68) — ma
+la TONALITÀ restava sostanzialmente quella di partenza del target (invariata: 11.0° prima del paste,
+11.5° dopo), lontanissima dai 25.3° del campione che l'utente voleva copiare.
+
+Causa: `hsl_hue`, calcolato da `harmonic::extract_look_from_reference`, è per costruzione uno scarto
+RELATIVO — quanto la banda di tonalità del CAMPIONE si discosta dal proprio centro-banda canonico
+(un "vezzo stilistico" del campione), non un valore assoluto verso cui il target deve convergere.
+Applicare lo stesso piccolo scarto assoluto al target (che parte da una tonalità di partenza diversa)
+non fa convergere le due tinte: due foto dello stesso soggetto sotto luce diversa, entrambe già
+vicine al proprio hue canonico "a modo loro", restano diverse fra loro dopo il paste esattamente
+quanto lo erano prima — l'intensità dello slider "Adattamento" non aveva alcuna leva su questo, a
+differenza di esposizione/luci/ombre (già adattate da Smart-Batch) e contrasto/tone-curve (corretto
+nel fix precedente).
+
+**Corretto** con un meccanismo di hue-matching nuovo e complementare, non un rimpiazzo di `hsl_hue`:
+`harmonic::analyze_hue_bands` (generalizzazione pubblica dell'accumulo per banda già usato
+internamente dall'estrazione) misura la tonalità media per ciascuna delle 8 bande su un'immagine
+QUALUNQUE, non solo sul campione; `harmonic::hue_matching_deltas` confronta poi le bande di campione
+e target — richiedendo popolazione sufficiente in ENTRAMBE (stesso guardrail `MIN_BAND_PIXELS` già
+usato per `hsl_hue`, altrimenti la media di pochi pixel è rumore, non un colore da inseguire) — e
+calcola quanto la tonalità MISURATA del campione si discosta da quella MISURATA del target, nella
+stessa banda, con differenza circolare corretta (gestisce il wraparound 350°→10°) e un tetto
+(`MAX_HUE_MATCH_DELTA = 45°`, la larghezza di un'intera banda) contro shift innaturali quando le due
+foto non condividono davvero lo stesso soggetto in quella banda. `ffi::apply_hue_matching` applica
+questo delta pesato da `override_strength`, esattamente come gli altri delta adattivi di Smart-Batch:
+a 0% nessun hue-matching (Look letterale invariato), a 100% il massimo consentito dal guardrail.
+
+Sei nuovi test in `harmonic` (misura su immagine sintetica, guardrail di popolazione minima,
+riproduzione del gap reale misurato sulla foto dell'utente, clamping del guardrail, differenza
+circolare) e tre in `ffi` (nessun cambiamento a intensità 0%, shift non nullo a intensità 100%,
+verifica end-to-end che il Look applicato porti un delta di hue-matching).
+
+Rimisurato sulla stessa foto vera (tonalità HSL media della zona sedili, media circolare per gestire
+correttamente il wraparound — a differenza della chroma/hue in Lab usata sopra, qui la misura è
+nello stesso spazio in cui `look-render` applica davvero l'aggiustamento): campione 333.0°, target
+originale 340.2° (scarto 7.2°), target dopo "Incolla impostazioni" PRIMA di questo fix 339.7° (scarto
+6.7° — praticamente invariato, bug confermato), target dopo questo fix 334.3° (scarto **1.3°** dal
+campione — una riduzione dell'81% del divario). La saturazione HSL della stessa zona resta invariata
+prima/dopo (0.622 in entrambi i casi): questo fix tocca solo la tonalità, non introduce né corregge
+nulla sulla vividezza, che restava già ben recuperata dal fix precedente.
+
+**Onestà sui limiti**: questo è un confronto GLOBALE per banda fra le due foto intere, non un
+riconoscimento del soggetto (non sa che "i sedili" sono l'oggetto da abbinare) — funziona perché, per
+queste due foto, la banda di tonalità dei sedili (Magenta, 315-360°) è anche la banda dove entrambe
+le foto hanno popolazione sufficiente e comparabile. Se due foto condividessero un colore-soggetto
+sparso in una banda dove è una minoranza trascurabile del fotogramma in una delle due, il confronto
+per banda resta comunque un confronto "quello che c'è in questa banda in entrambe le foto", non
+necessariamente "lo stesso oggetto": un limite architetturale onesto, non nascosto — un vero
+abbinamento per soggetto richiederebbe segmentazione, fuori scope da questo fix.
+
+## Corretto (questo giro, giro precedente): "Intensità adattamento" non aveva ALCUN effetto su contrasto e tone curve — copiati letteralmente dal campione a qualunque valore dello slider
 
 Segnalato dall'utente con tre foto vere (una pulita, una fortemente "granulosa"): dopo aver
 verificato che la foto pulita non aveva alcun rumore di sensore vero (Sony A7IV, ISO 100), e dopo

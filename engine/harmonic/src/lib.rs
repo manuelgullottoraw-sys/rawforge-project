@@ -379,6 +379,124 @@ pub fn extract_look_from_reference(img: &DynamicImage, name: &str) -> HarmonicLo
     look
 }
 
+/// Descrittore di una singola banda di tonalità per un'immagine QUALUNQUE
+/// (non solo la foto campione): hue medio dei pixel cromatici di quella
+/// banda e quanti pixel l'hanno popolata. Generalizzazione pubblica dello
+/// stesso accumulo (`HueBandBucket`) già usato internamente da
+/// `extract_look_from_reference` — qui esposto perché il fix di hue-matching
+/// più sotto (`hue_matching_deltas`) ha bisogno di analizzare DUE foto
+/// (campione E target), non solo il campione.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandHue {
+    pub mean_hue: f32,
+    pub count: u64,
+}
+
+/// Analizza un'immagine e restituisce, per ciascuna delle 8 bande di
+/// tonalità, l'hue medio dei suoi pixel cromatici — stesso schema di bande e
+/// stessa soglia di croma (`hsl[1] > 0.02`) usati da
+/// `extract_look_from_reference`. Non applica qui alcun guardrail di
+/// popolazione minima: lo applica il chiamante (`hue_matching_deltas`),
+/// perché la soglia giusta dipende da COME le due foto vengono confrontate,
+/// non da una singola foto isolata.
+pub fn analyze_hue_bands(img: &DynamicImage) -> [BandHue; HUE_BANDS] {
+    let analysis = img.resize(ANALYSIS_MAX_DIM, ANALYSIS_MAX_DIM, image::imageops::FilterType::Triangle);
+    let rgba = analysis.to_rgba8();
+    let mut buckets: [HueBandBucket; HUE_BANDS] = std::array::from_fn(|_| HueBandBucket::new());
+    for px in rgba.pixels() {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let hsl_px = rgb_to_hsl([r, g, b]);
+        if hsl_px[1] > 0.02 {
+            let band = (((hsl_px[0] / 45.0) as usize) % HUE_BANDS).min(HUE_BANDS - 1);
+            let bucket = &mut buckets[band];
+            bucket.sum_hue += hsl_px[0] as f64;
+            bucket.count += 1;
+        }
+    }
+    std::array::from_fn(|i| {
+        let b = &buckets[i];
+        if b.count == 0 {
+            BandHue { mean_hue: 0.0, count: 0 }
+        } else {
+            BandHue { mean_hue: (b.sum_hue / b.count as f64) as f32, count: b.count }
+        }
+    })
+}
+
+/// Differenza circolare fra due angoli in gradi, nell'intervallo (-180, 180]:
+/// 350° verso 10° è uno scarto di +20 (attraverso lo zero), non -340 — senza
+/// questo, un colore vicino al confine 0°/360° (i rossi) produrrebbe un
+/// delta enorme e nel verso sbagliato.
+fn circular_hue_diff(from: f32, to: f32) -> f32 {
+    let mut d = (to - from) % 360.0;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d < -180.0 {
+        d += 360.0;
+    }
+    d
+}
+
+/// Massimo scostamento di hue (in gradi) applicabile da un singolo confronto
+/// campione/target per banda — un guardrail, non una misura: senza un tetto,
+/// due foto che per puro caso hanno soggetti diversi nella stessa banda
+/// (pochi pixel rosso-arancio sparsi, non lo stesso oggetto reale) potrebbero
+/// produrre uno shift innaturale. 45° è la larghezza di un'intera banda:
+/// oltre quella soglia il colore cambierebbe percettivamente famiglia (da
+/// rosso a arancio, per esempio), un effetto che "Incolla impostazioni" non
+/// deve mai produrre da solo, senza che l'utente lo scelga esplicitamente
+/// con lo slider manuale.
+const MAX_HUE_MATCH_DELTA: f32 = 45.0;
+
+/// **Sesto bug reale scoperto in questo giro, segnalato dall'utente dopo la
+/// correzione del contrasto/tone-curve**: con contrasto e chroma ormai ben
+/// preservati (misurato su una foto vera dell'utente: chroma Lab della zona
+/// sedili 34.53 dopo "Incolla impostazioni" contro 36.39 dell'originale, un
+/// recupero al 94% — vicino anche alla chroma della foto campione, 36.68), la
+/// tinta restava comunque sbagliata: hue Lab della stessa zona 11.5° dopo il
+/// paste, praticamente invariato rispetto agli 11.0° dell'originale, molto
+/// lontano dai 25.3° della foto campione che l'utente voleva copiare.
+///
+/// Causa: `hsl_hue` calcolato da `extract_look_from_reference` (vedi il
+/// commento lì) è uno scarto RELATIVO — quanto la banda della foto CAMPIONE
+/// si discosta dal proprio centro canonico di banda, cioè un "vezzo
+/// stilistico" del campione, non un valore assoluto verso cui il target deve
+/// convergere. Applicare lo stesso piccolo scarto assoluto al target (che
+/// parte da un hue di partenza diverso) non fa convergere le due tinte: due
+/// foto dello stesso soggetto (gli stessi sedili rossi) sotto luce diversa,
+/// entrambe già vicine al proprio hue canonico "a modo loro", restano
+/// diverse fra loro dopo il paste esattamente quanto lo erano prima.
+///
+/// Questa funzione calcola invece un delta di hue-matching ASSOLUTO e
+/// complementare: per ogni banda con popolazione sufficiente in ENTRAMBE le
+/// foto (`MIN_BAND_PIXELS`, stesso guardrail già usato per `hsl_hue` — la
+/// media di pochi pixel è rumore, non un colore da inseguire), quanto la
+/// tonalità MEDIA MISURATA della foto campione si discosta da quella MEDIA
+/// MISURATA della foto target, nella stessa banda — non dal centro canonico
+/// di nessuna delle due. È il confronto diretto che mancava. Chiamata da
+/// `ffi::paste_look_from_sample`, pesata da `override_strength` esattamente
+/// come i delta di Smart-Batch per esposizione/luci/ombre (0.0 = nessun
+/// hue-matching, Look letterale invariato; 1.0 = massimo consentito dal
+/// guardrail `MAX_HUE_MATCH_DELTA`).
+pub fn hue_matching_deltas(
+    sample_bands: &[BandHue; HUE_BANDS],
+    target_bands: &[BandHue; HUE_BANDS],
+) -> [i32; HUE_BANDS] {
+    let mut out = [0i32; HUE_BANDS];
+    for band in 0..HUE_BANDS {
+        let s = sample_bands[band];
+        let t = target_bands[band];
+        if s.count < MIN_BAND_PIXELS || t.count < MIN_BAND_PIXELS {
+            continue;
+        }
+        let delta = circular_hue_diff(t.mean_hue, s.mean_hue);
+        out[band] = delta.clamp(-MAX_HUE_MATCH_DELTA, MAX_HUE_MATCH_DELTA).round() as i32;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +686,72 @@ mod tests {
         // campione) va preservato, solo con un picco meno ripido.
         let max_idx = (0..HUE_BANDS).max_by_key(|&i| smoothed[i]).unwrap();
         assert_eq!(max_idx, 7, "la banda dominante non deve cambiare, solo appiattirsi: {smoothed:?}");
+    }
+
+    #[test]
+    fn analyze_hue_bands_measures_the_mean_hue_of_a_uniformly_colored_image() {
+        // Rosso puro (sRGB 230,20,20) cade in banda 0 (Red) con hue vicino a 0°.
+        let img = synthetic_image(|_, _| [230, 20, 20, 255]);
+        let bands = analyze_hue_bands(&img);
+        assert!(bands[0].count > 0, "la banda rossa deve avere pixel");
+        assert!(bands[0].mean_hue.abs() < 10.0 || bands[0].mean_hue > 350.0, "hue misurato inatteso: {}", bands[0].mean_hue);
+        assert_eq!(bands[4].count, 0, "una banda assente dalla foto (Aqua) non deve avere popolazione");
+    }
+
+    #[test]
+    fn hue_matching_deltas_ignores_bands_without_enough_population_in_either_photo() {
+        let mut sample = [BandHue { mean_hue: 0.0, count: 0 }; HUE_BANDS];
+        let mut target = [BandHue { mean_hue: 0.0, count: 0 }; HUE_BANDS];
+        // Banda 0: popolata a sufficienza in entrambe, hue diverso -> delta atteso.
+        sample[0] = BandHue { mean_hue: 25.0, count: 200 };
+        target[0] = BandHue { mean_hue: 11.0, count: 200 };
+        // Banda 1: popolata SOLO nel campione (il target non ha quel colore) -> nessun delta.
+        sample[1] = BandHue { mean_hue: 100.0, count: 200 };
+        target[1] = BandHue { mean_hue: 0.0, count: 5 };
+
+        let deltas = hue_matching_deltas(&sample, &target);
+        assert!(deltas[0] > 0, "banda 0 deve ricevere un delta positivo (campione più caldo del target), got {}", deltas[0]);
+        assert_eq!(deltas[1], 0, "banda 1 non ha popolazione sufficiente nel target: nessun delta va inventato, got {}", deltas[1]);
+    }
+
+    #[test]
+    fn hue_matching_deltas_reproduces_the_measured_gap_from_a_real_photo() {
+        // Valori reali misurati dall'utente (zona sedili, spazio Lab convertito
+        // in gradi hue): foto campione ~25.3°, foto target (dopo il fix del
+        // contrasto, prima di questo fix) ~11.5° — un gap di circa 14° che
+        // "Incolla impostazioni" non chiudeva affatto.
+        let mut sample = [BandHue { mean_hue: 0.0, count: 0 }; HUE_BANDS];
+        let mut target = [BandHue { mean_hue: 0.0, count: 0 }; HUE_BANDS];
+        sample[0] = BandHue { mean_hue: 25.3, count: 500 };
+        target[0] = BandHue { mean_hue: 11.5, count: 500 };
+
+        let deltas = hue_matching_deltas(&sample, &target);
+        assert!(
+            (deltas[0] as f32 - 13.8).abs() < 1.0,
+            "il delta deve avvicinare il target di circa 13.8° verso il campione, got {}",
+            deltas[0]
+        );
+    }
+
+    #[test]
+    fn hue_matching_deltas_are_clamped_by_the_guardrail() {
+        let mut sample = [BandHue { mean_hue: 0.0, count: 0 }; HUE_BANDS];
+        let mut target = [BandHue { mean_hue: 0.0, count: 0 }; HUE_BANDS];
+        // Gap enorme (170°), non plausibile per lo stesso soggetto reale.
+        sample[0] = BandHue { mean_hue: 170.0, count: 200 };
+        target[0] = BandHue { mean_hue: 0.0, count: 200 };
+
+        let deltas = hue_matching_deltas(&sample, &target);
+        assert_eq!(deltas[0], 45, "il delta deve essere clampato al guardrail MAX_HUE_MATCH_DELTA (45°), got {}", deltas[0]);
+    }
+
+    #[test]
+    fn circular_hue_diff_takes_the_short_path_across_the_zero_degree_boundary() {
+        // 350° -> 10° deve essere +20 (attraverso lo zero), non -340.
+        let d = circular_hue_diff(350.0, 10.0);
+        assert!((d - 20.0).abs() < 0.01, "atteso +20, got {d}");
+        // 10° -> 350° deve essere -20, simmetrico.
+        let d2 = circular_hue_diff(10.0, 350.0);
+        assert!((d2 + 20.0).abs() < 0.01, "atteso -20, got {d2}");
     }
 }

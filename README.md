@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 83 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 91 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -713,6 +713,29 @@ con lo strumento pensato apposta per farlo. **Corretto** sfumando anche questi d
 valore neutro in proporzione allo stesso slider, con lo stesso principio già usato per
 l'esposizione. Misurato sulla stessa foto vera: contrasto locale della pavimentazione tornato dal
 55% al 94% di quello originale. Dettagli tecnici e nuovi test in `engine/README.md`.
+
+## Corretto (questo giro): la tinta del target non convergeva verso quella del campione dopo "Incolla impostazioni"
+
+Dopo il fix del contrasto sopra, l'utente ha segnalato l'ultimo problema visibile: "i colori non
+corrispondono del tutto... la tinta anche è parecchio diversa". Misurato sui sedili rossi delle due
+foto vere dell'utente: la chroma era già ben recuperata (94% dell'originale, vicina anche a quella
+del campione), ma la tonalità restava sostanzialmente quella di partenza del target — praticamente
+invariata dopo "Incolla impostazioni" (340.2° → 339.7°, in gradi HSL), lontanissima dai 333.0° del
+campione.
+
+Causa reale: l'HSL per banda copiato dal campione è, per costruzione, uno scarto RELATIVO al
+proprio centro-banda (un "vezzo stilistico" del campione), non un valore assoluto verso cui il
+target deve convergere — due foto dello stesso soggetto sotto luce diversa restano quindi diverse
+fra loro dopo il paste esattamente quanto lo erano prima, e lo slider "Intensità adattamento" non
+aveva alcuna leva su questo. **Corretto** con un meccanismo di hue-matching nuovo e complementare:
+per ogni banda di tonalità con popolazione sufficiente in ENTRAMBE le foto, si confronta la
+tonalità MISURATA del campione con quella MISURATA del target (non il centro-banda canonico) e si
+applica la differenza, pesata dallo stesso slider "Intensità adattamento" (0% = nessun cambiamento,
+100% = massimo consentito da un guardrail di 45°). Rimisurato sulla stessa foto vera: tonalità del
+target dopo il fix 334.3°, a soli 1.3° dal campione (contro i 6.7° di prima) — una riduzione
+dell'81% del divario, con la saturazione già recuperata rimasta invariata. Dettagli tecnici, nuovi
+test e i limiti onesti di questo approccio (un confronto globale per banda, non un riconoscimento
+del soggetto) in `engine/README.md`.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

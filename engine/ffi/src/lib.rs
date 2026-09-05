@@ -395,6 +395,43 @@ fn taper_contrast_and_tone_curve_toward_neutral(
         .collect();
 }
 
+/// **Sesto bug reale, segnalato dall'utente dopo la correzione del
+/// contrasto/tone-curve**: "la foto target ha una saturazione meno viva
+/// rispetto alla foto sorgente... la tinta anche è parecchio diversa". Misura
+/// su una foto vera: la chroma della zona sedili era già ben recuperata (94%
+/// dell'originale, vicina a quella del campione), ma l'hue restava quasi
+/// invariato rispetto al target di partenza (11.5° contro gli 11.0°
+/// originali) e lontanissimo da quello del campione (25.3°) — vedi il
+/// commento esteso su `harmonic::hue_matching_deltas` per la causa esatta
+/// (`hsl_hue` estratto dal campione è uno scarto relativo al proprio centro
+/// di banda, non un valore assoluto verso cui il target deve convergere).
+///
+/// Chiamata DOPO `smartbatch::apply_deltas` (che non tocca `hsl` — solo
+/// esposizione/luci/ombre) per aggiungere, banda per banda, lo scostamento
+/// di tonalità MISURATO fra campione e target, pesato da `strength` come
+/// ogni altro delta adattivo di questa funzione: a 0.0 non cambia nulla (Look
+/// letterale invariato, coerente con "0.0 = applica il Look letterale"), a
+/// 1.0 applica per intero il delta (già clampato dal guardrail
+/// `MAX_HUE_MATCH_DELTA` dentro `hue_matching_deltas`). Il clamp finale
+/// (-100..100) è lo stesso range del campo `hsl.hue` esposto allo slider
+/// manuale in `look-render` — mai superarlo, qualunque sia la somma fra il
+/// bias di stile già presente e questo nuovo delta di matching.
+fn apply_hue_matching(
+    look: &mut core_types::HarmonicLook,
+    sample_image: &image::DynamicImage,
+    target_image: &image::DynamicImage,
+    strength: f32,
+) {
+    let strength = strength.clamp(0.0, 1.0);
+    let sample_bands = harmonic::analyze_hue_bands(sample_image);
+    let target_bands = harmonic::analyze_hue_bands(target_image);
+    let deltas = harmonic::hue_matching_deltas(&sample_bands, &target_bands);
+    for band in 0..deltas.len() {
+        let weighted = (deltas[band] as f32 * strength).round() as i32;
+        look.hsl.hue[band] = (look.hsl.hue[band] + weighted).clamp(-100, 100);
+    }
+}
+
 /// Una foto "da modificare" aperta per l'editing, con la sua decodifica già
 /// fatta e cacheiata in memoria (RAW-aware, via [`decode_any_photo`]) —
 /// un oggetto UniFFI vero e proprio (non solo funzioni), perché a differenza
@@ -499,7 +536,8 @@ impl PhotoEditSession {
         let mut adapted_base = base_look.clone();
         adapted_base.exposure_ev = base_look.exposure_ev * (1.0 - clamped_strength);
         taper_contrast_and_tone_curve_toward_neutral(&mut adapted_base, &base_look, clamped_strength);
-        let adapted_look = smartbatch::apply_deltas(&adapted_base, &deltas);
+        let mut adapted_look = smartbatch::apply_deltas(&adapted_base, &deltas);
+        apply_hue_matching(&mut adapted_look, &sample_image, &self.interactive_preview, clamped_strength);
 
         let rendered = look_render::render_preview_with_look(&self.interactive_preview, &adapted_look);
         let rendered_preview_png_bytes = encode_preview_as_png(&rendered)?;
@@ -781,6 +819,71 @@ mod tests {
             "il contrasto a intensità massima ({}) non deve superare in valore assoluto quello a intensità zero ({})",
             at_max.applied_look.contrast,
             at_zero.applied_look.contrast
+        );
+    }
+
+    fn png_bytes_of_solid_color_rect(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+        use image::{ImageBuffer, Rgba};
+        let mut buf = Vec::new();
+        let img = ImageBuffer::from_fn(width, height, |_, _| Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn apply_hue_matching_leaves_hue_untouched_at_zero_strength() {
+        // Campione rosso-arancio (hue misurato più alto), target rosso puro
+        // (hue misurato più basso): a intensità 0.0 nessun matching va
+        // applicato, il Look resta letterale.
+        let sample_img = image::load_from_memory(&png_bytes_of_solid_color_rect(8, 8, [230, 90, 20])).unwrap();
+        let target_img = image::load_from_memory(&png_bytes_of_solid_color_rect(8, 8, [230, 20, 20])).unwrap();
+        let mut look = core_types::HarmonicLook::default();
+        let before = look.hsl.hue;
+
+        apply_hue_matching(&mut look, &sample_img, &target_img, 0.0);
+
+        assert_eq!(look.hsl.hue, before, "a intensità 0 l'hue non deve cambiare");
+    }
+
+    #[test]
+    fn apply_hue_matching_shifts_hue_toward_the_sample_at_full_strength() {
+        let sample_img = image::load_from_memory(&png_bytes_of_solid_color_rect(8, 8, [230, 90, 20])).unwrap();
+        let target_img = image::load_from_memory(&png_bytes_of_solid_color_rect(8, 8, [230, 20, 20])).unwrap();
+        let mut look = core_types::HarmonicLook::default();
+
+        apply_hue_matching(&mut look, &sample_img, &target_img, 1.0);
+
+        assert!(
+            look.hsl.hue.iter().any(|&v| v != 0),
+            "a intensità massima almeno una banda deve ricevere un delta di hue-matching, got {:?}",
+            look.hsl.hue
+        );
+    }
+
+    #[test]
+    fn paste_look_from_sample_converges_target_hue_toward_sample_hue_at_full_strength() {
+        // Riproduce (in miniatura) il bug reale segnalato dall'utente:
+        // campione e target ritraggono lo "stesso soggetto" (stesso colore di
+        // base, rosso) ma con una tinta diversa — il campione più arancio, il
+        // target più puro. Prima di questo fix, `hsl.hue` restava lo scarto
+        // RELATIVO del campione dal proprio centro banda, che non fa
+        // convergere le due tinte. Dopo il fix, a intensità massima l'hue
+        // effettivamente applicato al render deve avvicinare il target verso
+        // il campione, non restare a zero.
+        let sample_bytes = png_bytes_of_solid_color_rect(8, 8, [230, 90, 20]);
+        let target_bytes = png_bytes_of_solid_color_rect(8, 8, [230, 20, 20]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+
+        let result = session
+            .paste_look_from_sample(sample_bytes, "campione.png".to_string(), "Look".to_string(), 1.0)
+            .unwrap();
+
+        assert!(
+            result.applied_look.hsl_hue.iter().any(|&v| v != 0),
+            "atteso un delta di hue-matching non nullo su almeno una banda, got {:?}",
+            result.applied_look.hsl_hue
         );
     }
 
