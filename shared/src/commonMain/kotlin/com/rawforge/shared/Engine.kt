@@ -209,4 +209,9 @@ data class EditableLook(
     val wbGradientVertical: Boolean = true,
     val wbGradientPosition: Int = 50,
     val wbGradientSpread: Int = 50,
+    /** Riduzione del rumore (0..100, 0 = nessun effetto): luminanza e colore,
+     * sfocati separatamente in Lab con protezione ai bordi — vedi
+     * `look-render::apply_noise_reduction` lato Rust. */
+    val noiseReductionLuma: Int = 0,
+    val noiseReductionColor: Int = 0,
 )

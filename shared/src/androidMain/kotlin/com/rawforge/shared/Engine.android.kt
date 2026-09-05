@@ -48,6 +48,8 @@ private fun EditableLook.toFfi(): HarmonicLookFfi = HarmonicLookFfi(
     wbGradientVertical = wbGradientVertical,
     wbGradientPosition = wbGradientPosition,
     wbGradientSpread = wbGradientSpread,
+    noiseReductionLuma = noiseReductionLuma,
+    noiseReductionColor = noiseReductionColor,
 )
 
 private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
@@ -80,6 +82,8 @@ private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
     wbGradientVertical = wbGradientVertical,
     wbGradientPosition = wbGradientPosition,
     wbGradientSpread = wbGradientSpread,
+    noiseReductionLuma = noiseReductionLuma,
+    noiseReductionColor = noiseReductionColor,
 )
 
 actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
@@ -152,6 +156,8 @@ actual object Engine {
             wbGradientVertical = true,
             wbGradientPosition = 50,
             wbGradientSpread = 50,
+            noiseReductionLuma = 0,
+            noiseReductionColor = 0,
         )
         return generateLightroomPresetXmp(look)
     }
