@@ -21,6 +21,66 @@ pub struct TonePointFfi {
     pub y: u8,
 }
 
+/// Controparte UniFFI di `core_types::MaskTarget` — vedi lì per la spiegazione.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaskTargetFfi {
+    Subject,
+    Background,
+}
+
+impl From<core_types::MaskTarget> for MaskTargetFfi {
+    fn from(target: core_types::MaskTarget) -> Self {
+        match target {
+            core_types::MaskTarget::Subject => MaskTargetFfi::Subject,
+            core_types::MaskTarget::Background => MaskTargetFfi::Background,
+        }
+    }
+}
+
+impl From<MaskTargetFfi> for core_types::MaskTarget {
+    fn from(target: MaskTargetFfi) -> Self {
+        match target {
+            MaskTargetFfi::Subject => core_types::MaskTarget::Subject,
+            MaskTargetFfi::Background => core_types::MaskTarget::Background,
+        }
+    }
+}
+
+/// Controparte UniFFI di `core_types::SubjectMask` — vedi lì per la
+/// spiegazione completa dei campi.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct SubjectMaskFfi {
+    pub enabled: bool,
+    pub target: MaskTargetFfi,
+    pub exposure_ev: f32,
+    pub contrast: i32,
+    pub saturation: i32,
+}
+
+impl From<core_types::SubjectMask> for SubjectMaskFfi {
+    fn from(mask: core_types::SubjectMask) -> Self {
+        Self {
+            enabled: mask.enabled,
+            target: mask.target.into(),
+            exposure_ev: mask.exposure_ev,
+            contrast: mask.contrast,
+            saturation: mask.saturation,
+        }
+    }
+}
+
+impl From<SubjectMaskFfi> for core_types::SubjectMask {
+    fn from(mask: SubjectMaskFfi) -> Self {
+        Self {
+            enabled: mask.enabled,
+            target: mask.target.into(),
+            exposure_ev: mask.exposure_ev,
+            contrast: mask.contrast,
+            saturation: mask.saturation,
+        }
+    }
+}
+
 /// Versione "piatta" (solo tipi primitivi/record, compatibile UniFFI) di
 /// `core_types::HarmonicLook`.
 ///
@@ -72,6 +132,8 @@ pub struct HarmonicLookFfi {
     /// Riduzione rumore (0..100 ciascuno) — vedi `core_types::HarmonicLook`.
     pub noise_reduction_luma: i32,
     pub noise_reduction_color: i32,
+    /// Maschera automatica Soggetto/Sfondo — vedi `core_types::SubjectMask`.
+    pub subject_mask: SubjectMaskFfi,
 }
 
 /// Adatta un `Vec<i32>` di lunghezza arbitraria a un array fisso di 8 elementi
@@ -123,6 +185,7 @@ impl From<core_types::HarmonicLook> for HarmonicLookFfi {
             wb_gradient_spread: look.wb_gradient_spread,
             noise_reduction_luma: look.noise_reduction_luma,
             noise_reduction_color: look.noise_reduction_color,
+            subject_mask: look.subject_mask.into(),
         }
     }
 }
@@ -170,6 +233,7 @@ impl From<HarmonicLookFfi> for core_types::HarmonicLook {
             wb_gradient_spread: look.wb_gradient_spread,
             noise_reduction_luma: look.noise_reduction_luma,
             noise_reduction_color: look.noise_reduction_color,
+            subject_mask: look.subject_mask.into(),
         }
     }
 }
@@ -706,6 +770,13 @@ mod tests {
         original.wb_gradient_spread = 20;
         original.noise_reduction_luma = 35;
         original.noise_reduction_color = 60;
+        original.subject_mask = core_types::SubjectMask {
+            enabled: true,
+            target: core_types::MaskTarget::Background,
+            exposure_ev: -0.8,
+            contrast: 22,
+            saturation: -30,
+        };
 
         let ffi: HarmonicLookFfi = original.clone().into();
         let round_tripped: core_types::HarmonicLook = ffi.into();
@@ -732,6 +803,11 @@ mod tests {
         assert_eq!(round_tripped.wb_gradient_spread, original.wb_gradient_spread);
         assert_eq!(round_tripped.noise_reduction_luma, original.noise_reduction_luma);
         assert_eq!(round_tripped.noise_reduction_color, original.noise_reduction_color);
+        assert_eq!(round_tripped.subject_mask.enabled, original.subject_mask.enabled);
+        assert_eq!(round_tripped.subject_mask.target, original.subject_mask.target);
+        assert_eq!(round_tripped.subject_mask.exposure_ev, original.subject_mask.exposure_ev);
+        assert_eq!(round_tripped.subject_mask.contrast, original.subject_mask.contrast);
+        assert_eq!(round_tripped.subject_mask.saturation, original.subject_mask.saturation);
     }
 
     fn png_bytes_of_solid_color(size: u32, rgb: [u8; 3]) -> Vec<u8> {

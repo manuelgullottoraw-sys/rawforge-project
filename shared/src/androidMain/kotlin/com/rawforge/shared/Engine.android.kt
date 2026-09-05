@@ -1,6 +1,8 @@
 package com.rawforge.shared
 
 import uniffi.rawforge_ffi.HarmonicLookFfi
+import uniffi.rawforge_ffi.MaskTargetFfi
+import uniffi.rawforge_ffi.SubjectMaskFfi
 import uniffi.rawforge_ffi.TonePointFfi
 import uniffi.rawforge_ffi.decodeRawFilePreview
 import uniffi.rawforge_ffi.engineVersion
@@ -9,6 +11,17 @@ import uniffi.rawforge_ffi.extractLookFromReferenceImage
 import uniffi.rawforge_ffi.generateLightroomPresetXmp
 import uniffi.rawforge_ffi.isKnownRawFileName
 import uniffi.rawforge_ffi.PhotoEditSession as NativePhotoEditSession
+import uniffi.rawforge_ffi.computeSubjectSaliencyPreview as nativeComputeSubjectSaliencyPreview
+
+private fun MaskTarget.toFfi(): MaskTargetFfi = when (this) {
+    MaskTarget.SUBJECT -> MaskTargetFfi.SUBJECT
+    MaskTarget.BACKGROUND -> MaskTargetFfi.BACKGROUND
+}
+
+private fun MaskTargetFfi.toCommon(): MaskTarget = when (this) {
+    MaskTargetFfi.SUBJECT -> MaskTarget.SUBJECT
+    MaskTargetFfi.BACKGROUND -> MaskTarget.BACKGROUND
+}
 
 /**
  * Converte da/verso `HarmonicLookFfi` (generato da UniFFI, esiste solo qui
@@ -50,6 +63,13 @@ private fun EditableLook.toFfi(): HarmonicLookFfi = HarmonicLookFfi(
     wbGradientSpread = wbGradientSpread,
     noiseReductionLuma = noiseReductionLuma,
     noiseReductionColor = noiseReductionColor,
+    subjectMask = SubjectMaskFfi(
+        enabled = subjectMaskEnabled,
+        target = subjectMaskTarget.toFfi(),
+        exposureEv = subjectMaskExposureEv,
+        contrast = subjectMaskContrast,
+        saturation = subjectMaskSaturation,
+    ),
 )
 
 private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
@@ -84,6 +104,11 @@ private fun HarmonicLookFfi.toEditable(): EditableLook = EditableLook(
     wbGradientSpread = wbGradientSpread,
     noiseReductionLuma = noiseReductionLuma,
     noiseReductionColor = noiseReductionColor,
+    subjectMaskEnabled = subjectMask.enabled,
+    subjectMaskTarget = subjectMask.target.toCommon(),
+    subjectMaskExposureEv = subjectMask.exposureEv,
+    subjectMaskContrast = subjectMask.contrast,
+    subjectMaskSaturation = subjectMask.saturation,
 )
 
 actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
@@ -158,8 +183,19 @@ actual object Engine {
             wbGradientSpread = 50,
             noiseReductionLuma = 0,
             noiseReductionColor = 0,
+            subjectMask = SubjectMaskFfi(
+                enabled = false,
+                target = MaskTargetFfi.SUBJECT,
+                exposureEv = 0f,
+                contrast = 0,
+                saturation = 0,
+            ),
         )
         return generateLightroomPresetXmp(look)
+    }
+
+    actual fun computeSubjectSaliencyPreview(imageBytes: ByteArray): Result<ByteArray> = runCatching {
+        nativeComputeSubjectSaliencyPreview(imageBytes)
     }
 
     actual fun importPhoto(bytes: ByteArray, fileName: String): Result<ImportedPhoto> = runCatching {
@@ -197,5 +233,9 @@ actual object Engine {
 
     actual fun openPhotoForEditing(bytes: ByteArray, fileName: String): Result<PhotoEditSession> = runCatching {
         PhotoEditSession(NativePhotoEditSession(bytes, fileName))
+    }
+
+    actual fun generateXmpForLook(look: EditableLook): Result<String> = runCatching {
+        generateLightroomPresetXmp(look.toFfi())
     }
 }

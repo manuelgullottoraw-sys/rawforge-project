@@ -20,11 +20,50 @@
 //! (luminanza + colore) è implementata qui sotto (`apply_noise_reduction`).
 
 use color_science::{hsl_to_rgb, linear_rgb_to_lab, lab_to_linear_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
-use core_types::HarmonicLook;
+use core_types::{HarmonicLook, MaskTarget};
+use harmonic::compute_saliency_map;
 use image::DynamicImage;
 use rayon::prelude::*;
 
 const HUE_BANDS: usize = 8;
+
+/// Soglia di salienza (0..1) sopra la quale un pixel è considerato parte del
+/// "Soggetto" da `apply_subject_mask` — sotto, parte dello "Sfondo". Scelta
+/// empiricamente sulla mappa di salienza di una foto vera (auto su asfalto,
+/// vedi `PROVA_saliency.png`, generata da `compute_subject_saliency_preview`):
+/// col prior di centratura attivo il grosso dello sfondo scende ben sotto
+/// 0.35, mentre il soggetto centrale resta sopra — non è una soglia
+/// "universale" (nessuna soglia fissa può esserlo per un'euristica globale
+/// per-immagine come questa, vedi i limiti dichiarati su
+/// `harmonic::compute_saliency_map`), ma un valore ragionevole di partenza.
+const SALIENCY_MASK_THRESHOLD: f32 = 0.35;
+/// Ampiezza (in valore di salienza) della transizione morbida intorno alla
+/// soglia: senza sfumatura, un confine netto sul valore di salienza
+/// produrrebbe un bordo di maschera visibilmente "a scalino" (lo stesso
+/// principio già applicato ai bordi di scena in `apply_noise_reduction`, qui
+/// applicato al bordo della maschera stessa invece che a un gradiente di
+/// luminanza).
+const SALIENCY_MASK_FEATHER: f32 = 0.15;
+
+/// Converte un valore di salienza grezzo (0..1) in un peso di maschera "verso
+/// il Soggetto" (0..1), con una transizione lineare morbida invece di un
+/// confine netto su `SALIENCY_MASK_THRESHOLD`. Il peso "verso lo Sfondo" è
+/// semplicemente `1.0 - `questo (vedi `mask_weight_for_target`).
+fn saliency_to_subject_weight(saliency: f32) -> f32 {
+    let lo = SALIENCY_MASK_THRESHOLD - SALIENCY_MASK_FEATHER;
+    let hi = SALIENCY_MASK_THRESHOLD + SALIENCY_MASK_FEATHER;
+    ((saliency - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+/// Peso finale (0..1) della maschera per un dato target, da moltiplicare per
+/// l'intensità della regolazione locale in `apply_subject_mask`.
+fn mask_weight_for_target(saliency: f32, target: MaskTarget) -> f32 {
+    let subject_weight = saliency_to_subject_weight(saliency);
+    match target {
+        MaskTarget::Subject => subject_weight,
+        MaskTarget::Background => 1.0 - subject_weight,
+    }
+}
 
 /// Istogramma di luminanza a 256 bin, nel formato atteso da
 /// `smartbatch::compute_scene_descriptors` — è il ponte tra un'immagine
@@ -482,16 +521,35 @@ fn apply_texture_bands(base: &image::RgbaImage, look: &HarmonicLook) -> image::R
 /// immagine della stessa dimensione. Ordine degli stage (docs/ARCHITECTURE.md
 /// §3.2): riduzione del rumore (luminanza + colore, in Lab) -> bilanciamento
 /// del bianco + esposizione -> highlights/shadows -> tone curve -> contrasto
-/// -> HSL per banda + split toning -> vibrance/saturazione globale -> texture.
+/// -> HSL per banda + split toning -> vibrance/saturazione globale ->
+/// maschera Soggetto/Sfondo (esposizione/contrasto/saturazione locali,
+/// `SubjectMask`) -> texture.
 /// La riduzione rumore va PRIMA di tutto il resto: è un'operazione spaziale
 /// (serve il vicinato del pixel, non un guadagno per-pixel) e i suoi
 /// benefici si perdono se applicata dopo che contrasto/HSL hanno già
-/// amplificato le differenze locali che genera il rumore stesso.
+/// amplificato le differenze locali che genera il rumore stesso. La maschera
+/// Soggetto/Sfondo va invece per ULTIMA fra gli stage per-pixel (prima solo
+/// della texture, anch'essa spaziale): è pensata come un raffinamento LOCALE
+/// sopra il Look già completo, non un sostituto delle regolazioni globali.
 pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> DynamicImage {
     let rgba = image.to_rgba8();
     let rgba = apply_noise_reduction(&rgba, look);
     let (width, height) = rgba.dimensions();
     let row_stride = 4 * width as usize;
+
+    // Mappa di salienza calcolata UNA volta sola (non per-pixel dentro il
+    // loop parallelo sotto) — stessa euristica di `compute_saliency_map`
+    // esposta all'utente da `compute_subject_saliency_preview`, qui applicata
+    // alla risoluzione reale di rendering (non ridotta a 512px come
+    // nell'anteprima diagnostica: qui serve una maschera da APPLICARE, non
+    // solo da mostrare). Calcolata solo se la maschera è attiva: è un costo
+    // non trascurabile (scansione completa dell'immagine più un confronto
+    // fra tutti i bin occupati) da evitare quando nessuna maschera è in uso.
+    let mask_weights: Option<Vec<f32>> = if look.subject_mask.enabled {
+        Some(compute_saliency_map(&rgba))
+    } else {
+        None
+    };
 
     let exposure_mul = 2f32.powf(look.exposure_ev);
     let tone_curve_lut = build_tone_curve_lut(&look.tone_curve);
@@ -729,6 +787,32 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                     );
                 }
 
+                // Maschera Soggetto/Sfondo: si calcola l'HSL "come se" la
+                // regolazione locale si applicasse a piena forza ovunque
+                // (`adjusted`), poi si sfuma UNA sola volta fra l'HSL
+                // originale e quello regolato con il peso di maschera del
+                // pixel — invece di applicare il peso separatamente a ogni
+                // singolo passo (esposizione, poi contrasto, poi
+                // saturazione), che comporrebbe tre sfumature indipendenti
+                // anziché una: più semplice da ragionare e da testare, e la
+                // hue non viene mai toccata (si sfumano solo lightness e
+                // saturazione HSL), quindi la maschera non può introdurre
+                // dominanti di colore innaturali sul bordo della sfumatura.
+                if let Some(weights) = mask_weights.as_ref() {
+                    let w = mask_weight_for_target(weights[y * width as usize + x], look.subject_mask.target);
+                    if w > 0.0 {
+                        let mut adjusted = hsl;
+                        let mask_exposure_gain = 2f32.powf(look.subject_mask.exposure_ev);
+                        adjusted[2] = (adjusted[2] * mask_exposure_gain).clamp(0.0, 1.0);
+                        let mask_contrast_amount = 1.0 + (look.subject_mask.contrast as f32 / 100.0);
+                        adjusted[2] = ((adjusted[2] - 0.5) * mask_contrast_amount + 0.5).clamp(0.0, 1.0);
+                        adjusted[1] =
+                            (adjusted[1] * (1.0 + look.subject_mask.saturation as f32 / 100.0)).clamp(0.0, 1.0);
+                        hsl[1] += (adjusted[1] - hsl[1]) * w;
+                        hsl[2] += (adjusted[2] - hsl[2]) * w;
+                    }
+                }
+
                 let final_rgb = hsl_to_rgb(hsl);
                 out_px[0] = (final_rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
                 out_px[1] = (final_rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -761,6 +845,7 @@ fn blend_toning(hsl: [f32; 3], tone_hue: f32, tone_sat_amount: f32, weight: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_types::SubjectMask;
     use image::{GenericImageView, ImageBuffer, Rgba};
 
     fn solid_image(width: u32, height: u32, rgb: [u8; 3]) -> DynamicImage {
@@ -776,6 +861,210 @@ mod tests {
         }
         let sum: f64 = hist.iter().enumerate().map(|(bin, &c)| bin as f64 * c as f64).sum();
         (sum / total as f64) as f32
+    }
+
+    /// Immagine di sfondo uniforme con una piccola patch centrata di un altro
+    /// colore — lo stesso scenario "piccolo soggetto colorato e centrato"
+    /// già usato per verificare `compute_saliency_map` in isolamento
+    /// (`harmonic::tests`), qui riusato per verificare che la maschera che ne
+    /// deriva colpisca davvero la patch (il "soggetto") più dello sfondo.
+    fn image_with_centered_patch(
+        width: u32,
+        height: u32,
+        background: [u8; 3],
+        patch: [u8; 3],
+        patch_size: u32,
+    ) -> DynamicImage {
+        let (px0, py0) = ((width - patch_size) / 2, (height - patch_size) / 2);
+        let img = ImageBuffer::from_fn(width, height, |x, y| {
+            if x >= px0 && x < px0 + patch_size && y >= py0 && y < py0 + patch_size {
+                Rgba([patch[0], patch[1], patch[2], 255])
+            } else {
+                Rgba([background[0], background[1], background[2], 255])
+            }
+        });
+        DynamicImage::ImageRgba8(img)
+    }
+
+    fn mean_luma_of_rect(image: &image::RgbaImage, x0: u32, y0: u32, w: u32, h: u32) -> f64 {
+        let mut sum = 0f64;
+        let mut count = 0u64;
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let px = image.get_pixel(x, y);
+                sum += 0.2126 * px[0] as f64 + 0.7152 * px[1] as f64 + 0.0722 * px[2] as f64;
+                count += 1;
+            }
+        }
+        sum / count as f64
+    }
+
+    #[test]
+    fn subject_mask_disabled_has_no_effect_even_with_a_nonzero_exposure_configured() {
+        // Guardrail base: `enabled = false` (il default) deve annullare
+        // completamente la maschera, qualunque sia il resto di `SubjectMask`
+        // — nessuna "fuga" di esposizione locale se l'utente non ha ancora
+        // attivato la sezione.
+        let img = solid_image(8, 8, [100, 100, 100]);
+        let mut look = HarmonicLook::default();
+        look.subject_mask.exposure_ev = 2.0;
+        look.subject_mask.contrast = 80;
+        look.subject_mask.saturation = -80;
+        assert!(!look.subject_mask.enabled);
+
+        let baseline = mean_luma(&render_preview_with_look(&img, &HarmonicLook::default()));
+        let with_disabled_mask = mean_luma(&render_preview_with_look(&img, &look));
+        assert!(
+            (baseline - with_disabled_mask).abs() < 0.01,
+            "baseline={baseline} con maschera (disattivata)={with_disabled_mask}"
+        );
+    }
+
+    #[test]
+    fn subject_mask_at_the_exact_image_center_of_a_flat_image_applies_at_full_strength_for_subject_and_not_at_all_for_background() {
+        // Anche su un'immagine perfettamente piatta, `compute_saliency_map`
+        // NON è uniforme pixel-per-pixel: il prior di centratura pesa ogni
+        // pixel in base alla propria posizione (non solo al proprio colore),
+        // e la mappa viene rinormalizzata al proprio massimo — quindi SOLO
+        // il pixel più vicino al centro geometrico tocca 1.0 esatto, mentre
+        // pixel più periferici (angoli inclusi) hanno già una salienza
+        // inferiore. Un limite onesto e già noto dell'euristica (vedi il
+        // commento esteso su `compute_saliency_map`): il primo tentativo di
+        // questo test misurava la media sull'intera immagine assumendo una
+        // salienza uniforme, ed è stato smentito da questa stessa
+        // rinormalizzazione (misurato: target Background dava comunque un
+        // effetto misurabile sulla media, ~133 invece di 100, per via degli
+        // angoli). Corretto misurando il pixel centrale ESATTO (8x8 -> centro
+        // geometrico (4.0, 4.0), che coincide con l'indice del pixel (4,4)),
+        // dove il comportamento è invece deterministico.
+        let img = solid_image(8, 8, [100, 100, 100]);
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+
+        let mut look_subject = HarmonicLook::default();
+        look_subject.subject_mask =
+            SubjectMask { enabled: true, target: MaskTarget::Subject, exposure_ev: 1.0, contrast: 0, saturation: 0 };
+        let mut look_background = HarmonicLook::default();
+        look_background.subject_mask = SubjectMask {
+            enabled: true,
+            target: MaskTarget::Background,
+            exposure_ev: 1.0,
+            contrast: 0,
+            saturation: 0,
+        };
+
+        let subject_rendered = render_preview_with_look(&img, &look_subject).to_rgba8();
+        let background_rendered = render_preview_with_look(&img, &look_background).to_rgba8();
+
+        let center_luma = |image: &image::RgbaImage| -> f64 {
+            let px = image.get_pixel(4, 4);
+            0.2126 * px[0] as f64 + 0.7152 * px[1] as f64 + 0.0722 * px[2] as f64
+        };
+        let baseline_center = center_luma(&baseline);
+        let subject_center = center_luma(&subject_rendered);
+        let background_center = center_luma(&background_rendered);
+
+        assert!(
+            subject_center > baseline_center + 5.0,
+            "target Subject nel pixel centrale esatto deve schiarire a piena forza: baseline={baseline_center} risultato={subject_center}"
+        );
+        assert!(
+            (background_center - baseline_center).abs() < 1.0,
+            "target Background nel pixel centrale esatto non deve avere alcun effetto: baseline={baseline_center} risultato={background_center}"
+        );
+    }
+
+    #[test]
+    fn subject_mask_targeting_subject_brightens_the_salient_patch_more_than_the_background() {
+        let img = image_with_centered_patch(32, 32, [80, 80, 80], [200, 40, 40], 8);
+        let mut look = HarmonicLook::default();
+        look.subject_mask =
+            SubjectMask { enabled: true, target: MaskTarget::Subject, exposure_ev: 1.0, contrast: 0, saturation: 0 };
+
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        let masked = render_preview_with_look(&img, &look).to_rgba8();
+
+        let patch_delta = mean_luma_of_rect(&masked, 12, 12, 8, 8) - mean_luma_of_rect(&baseline, 12, 12, 8, 8);
+        let background_delta = mean_luma_of_rect(&masked, 0, 0, 8, 8) - mean_luma_of_rect(&baseline, 0, 0, 8, 8);
+
+        assert!(
+            patch_delta > background_delta * 2.0,
+            "il soggetto (patch centrata e colorata) deve schiarire molto più dello sfondo: patch_delta={patch_delta} background_delta={background_delta}"
+        );
+        assert!(patch_delta > 5.0, "il soggetto deve effettivamente schiarire: patch_delta={patch_delta}");
+    }
+
+    #[test]
+    fn subject_mask_targeting_background_brightens_the_background_more_than_the_salient_patch() {
+        let img = image_with_centered_patch(32, 32, [80, 80, 80], [200, 40, 40], 8);
+        let mut look = HarmonicLook::default();
+        look.subject_mask = SubjectMask {
+            enabled: true,
+            target: MaskTarget::Background,
+            exposure_ev: 1.0,
+            contrast: 0,
+            saturation: 0,
+        };
+
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        let masked = render_preview_with_look(&img, &look).to_rgba8();
+
+        let patch_delta = mean_luma_of_rect(&masked, 12, 12, 8, 8) - mean_luma_of_rect(&baseline, 12, 12, 8, 8);
+        let background_delta = mean_luma_of_rect(&masked, 0, 0, 8, 8) - mean_luma_of_rect(&baseline, 0, 0, 8, 8);
+
+        assert!(
+            background_delta > patch_delta * 2.0,
+            "invertendo il target, deve schiarire di più lo sfondo del soggetto: patch_delta={patch_delta} background_delta={background_delta}"
+        );
+        assert!(background_delta > 5.0, "lo sfondo deve effettivamente schiarire: background_delta={background_delta}");
+    }
+
+    #[test]
+    fn subject_mask_saturation_only_desaturates_the_targeted_subject() {
+        let img = image_with_centered_patch(32, 32, [80, 80, 80], [200, 40, 40], 8);
+        let mut look = HarmonicLook::default();
+        look.subject_mask =
+            SubjectMask { enabled: true, target: MaskTarget::Subject, exposure_ev: 0.0, contrast: 0, saturation: -80 };
+
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        let masked = render_preview_with_look(&img, &look).to_rgba8();
+
+        let patch_px = masked.get_pixel(16, 16);
+        let baseline_px = baseline.get_pixel(16, 16);
+        let sat_masked = rgb_to_hsl([patch_px[0] as f32 / 255.0, patch_px[1] as f32 / 255.0, patch_px[2] as f32 / 255.0])[1];
+        let sat_baseline =
+            rgb_to_hsl([baseline_px[0] as f32 / 255.0, baseline_px[1] as f32 / 255.0, baseline_px[2] as f32 / 255.0])[1];
+
+        assert!(
+            sat_masked < sat_baseline * 0.9,
+            "saturazione -80 sul soggetto deve desaturare visibilmente la patch: baseline={sat_baseline} masked={sat_masked}"
+        );
+    }
+
+    #[test]
+    fn subject_mask_never_changes_hue() {
+        // La sfumatura di maschera tocca solo lightness e saturazione HSL
+        // (mai hsl[0]): anche con esposizione, contrasto e saturazione della
+        // maschera tutti spinti forte, la tonalità del pixel non deve
+        // spostarsi (altrimenti la maschera introdurrebbe una dominante di
+        // colore innaturale sul soggetto).
+        let img = image_with_centered_patch(32, 32, [80, 80, 80], [200, 40, 40], 8);
+        let mut look = HarmonicLook::default();
+        look.subject_mask =
+            SubjectMask { enabled: true, target: MaskTarget::Subject, exposure_ev: 1.0, contrast: 40, saturation: -50 };
+
+        let baseline = render_preview_with_look(&img, &HarmonicLook::default()).to_rgba8();
+        let masked = render_preview_with_look(&img, &look).to_rgba8();
+
+        let patch_px = masked.get_pixel(16, 16);
+        let baseline_px = baseline.get_pixel(16, 16);
+        let hue_masked = rgb_to_hsl([patch_px[0] as f32 / 255.0, patch_px[1] as f32 / 255.0, patch_px[2] as f32 / 255.0])[0];
+        let hue_baseline =
+            rgb_to_hsl([baseline_px[0] as f32 / 255.0, baseline_px[1] as f32 / 255.0, baseline_px[2] as f32 / 255.0])[0];
+
+        assert!(
+            (hue_masked - hue_baseline).abs() < 5.0,
+            "la maschera non deve alterare la tonalità: baseline={hue_baseline} masked={hue_masked}"
+        );
     }
 
     #[test]

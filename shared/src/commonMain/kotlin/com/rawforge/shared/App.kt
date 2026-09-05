@@ -4,8 +4,12 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -171,6 +175,17 @@ private fun EditableLook.scaledBy(intensity: Float): EditableLook {
         // "neutro" non avrebbe un significato analogo a scalare un colore.
         whiteBalanceBTemp = lerp(5500f, whiteBalanceBTemp.toFloat(), intensity).roundToInt().coerceIn(2000, 12000),
         whiteBalanceBTint = scaleInt(whiteBalanceBTint, -100..100),
+        noiseReductionLuma = scaleInt(noiseReductionLuma, 0..100),
+        noiseReductionColor = scaleInt(noiseReductionColor, 0..100),
+        // `subjectMaskEnabled`/`subjectMaskTarget` restano INVARIATI (stessa
+        // logica di `wbGradientEnabled`/`wbGradientVertical` sopra): sono
+        // scelte binarie di CONFIGURAZIONE della maschera (attiva/non attiva,
+        // quale regione), non un'intensità continua da scalare — a intensità
+        // 0 la maschera resta comunque innocua perché le TRE regolazioni
+        // sotto, quelle sì scalate, tendono a 0.
+        subjectMaskExposureEv = lerp(0f, subjectMaskExposureEv, intensity).coerceIn(-5f, 5f),
+        subjectMaskContrast = scaleInt(subjectMaskContrast, -100..100),
+        subjectMaskSaturation = scaleInt(subjectMaskSaturation, -100..100),
     )
 }
 
@@ -180,9 +195,11 @@ private fun EditableLook.scaledBy(intensity: Float): EditableLook {
  * si vedano entrambe senza dover scorrere, un pannello di editing manuale a
  * destra con gli slider che ri-renderizzano la foto DAL VIVO mentre si
  * trascina (non solo al rilascio), e un pulsante per esportare il risultato
- * a piena risoluzione. La libreria a griglia, le maschere locali e il batch
- * su centinaia di foto restano da costruire sopra questa base (vedi
- * `docs/ARCHITECTURE.md`).
+ * a piena risoluzione, più una sezione "Maschera Soggetto/Sfondo" che applica
+ * esposizione/contrasto/saturazione locali guidati da una mappa di salienza
+ * (vedi `engine/README.md` per l'euristica e i suoi limiti dichiarati). La
+ * libreria a griglia e il batch su centinaia di foto restano da costruire
+ * sopra questa base (vedi `docs/ARCHITECTURE.md`).
  *
  * Il feedback dal vivo è possibile perché la foto da modificare viene aperta
  * UNA VOLTA (`Engine.openPhotoForEditing`) in una `PhotoEditSession` che la
@@ -197,6 +214,11 @@ private fun EditableLook.scaledBy(intensity: Float): EditableLook {
  */
 @Composable
 fun RawForgeApp() {
+    // Va chiamata prima di qualunque uso di `LibraryStorage`/
+    // `rememberFolderPickerLauncher` (vedi il commento su
+    // `InitializeLibraryPlatform` in `PlatformContext.kt`).
+    InitializeLibraryPlatform()
+
     var engineInfo by remember { mutableStateOf<String?>(null) }
     var xmpPreview by remember { mutableStateOf<String?>(null) }
 
@@ -232,12 +254,176 @@ fun RawForgeApp() {
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var exportError by remember { mutableStateOf<String?>(null) }
 
+    // "Rileva soggetto" (vedi `engine/README.md`, sezione salienza): mappa in
+    // scala di grigi ispezionabile, calcolata su richiesta esplicita
+    // dell'utente (non ad ogni modifica: è un'analisi separata dal
+    // rendering dal vivo) — NON collegata di per sé a nessuna regolazione:
+    // è la sezione "Maschera Soggetto/Sfondo" del pannello Develop (dove
+    // l'utente sceglie target/esposizione/contrasto/saturazione) che la usa
+    // per davvero, lato motore, quando l'utente la attiva.
+    var saliencyBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
+    var saliencyBusy by remember { mutableStateOf(false) }
+    var saliencyError by remember { mutableStateOf<String?>(null) }
+
     // Modalità "Develop a schermo intero", in stile Lightroom: nasconde il
     // confronto affiancato con la foto campione e mostra solo la foto target,
     // grande, con il pannello Develop accanto — pensata per la fase di
     // editing fine, dopo un eventuale "Incolla impostazioni". `false` mostra
     // invece il confronto normale.
     var fullScreenEditing by remember { mutableStateOf(false) }
+
+    // Libreria (docs/ARCHITECTURE.md — vedi `LibraryStorage` per l'onestà sui
+    // limiti di questa prima versione: una sola cartella, non ricorsiva,
+    // nessuna cache miniature su disco). `showLibrary` sostituisce
+    // temporaneamente il confronto foto campione/target con la griglia,
+    // esattamente come `fullScreenEditing` la sostituisce con la vista a
+    // schermo intero — le due modalità non si aprono mai insieme.
+    var showLibrary by remember { mutableStateOf(false) }
+    var libraryFolder by remember { mutableStateOf<String?>(null) }
+    var libraryPhotos by remember { mutableStateOf<List<LibraryPhotoEntry>>(emptyList()) }
+    var libraryBusy by remember { mutableStateOf(false) }
+    var libraryError by remember { mutableStateOf<String?>(null) }
+    // Incrementato dal pulsante "Aggiorna": la Libreria non osserva il
+    // filesystem da sola (limite dichiarato in `LibraryStorage`), quindi
+    // rileggere l'elenco richiede un segnale esplicito — cambiare questo
+    // valore fa ripartire lo stesso `LaunchedEffect` che legge `libraryFolder`.
+    var libraryRefreshTick by remember { mutableStateOf(0) }
+
+    fun openLibraryFolder(folderId: String) {
+        LibraryStorage.rememberFolder(folderId)
+        libraryFolder = folderId
+    }
+
+    // Al primo avvio, riapre in automatico l'ultima cartella Libreria
+    // ricordata (persistenza fra riavvii — scelta dell'utente per un
+    // "catalogo persistente" invece di un elenco valido solo per la sessione).
+    LaunchedEffect(Unit) {
+        LibraryStorage.rememberedFolder()?.let { libraryFolder = it }
+    }
+
+    // Rilegge l'elenco delle foto ogni volta che cambia la cartella scelta, o
+    // che l'utente chiede esplicitamente un aggiornamento — non ad ogni
+    // apertura della schermata Libreria, per non ripetere il lavoro se
+    // l'utente la chiude e riapre senza che nulla sia cambiato sul disco.
+    LaunchedEffect(libraryFolder, libraryRefreshTick) {
+        val folder = libraryFolder ?: return@LaunchedEffect
+        libraryError = null
+        libraryBusy = true
+        val result = withContext(Dispatchers.Default) { LibraryStorage.listPhotos(folder) }
+        result.fold(
+            onSuccess = { photos -> libraryPhotos = photos },
+            onFailure = { error -> libraryPhotos = emptyList(); libraryError = error.message ?: "Errore durante la lettura della cartella" }
+        )
+        libraryBusy = false
+    }
+
+    // Elaborazione in batch (Smart-Batch Contestuale, docs/ARCHITECTURE.md
+    // §4.2): applica il Look di UNA foto campione, adattato per ciascuna
+    // foto target, a un'intera cartella insieme — a differenza di "Incolla
+    // impostazioni" sopra (una foto target alla volta). Per ciascun file
+    // produce SIA la foto renderizzata (PNG) SIA il preset `.xmp` — scelta
+    // esplicita dell'utente, "Entrambi". Cartella di INPUT e cartella di
+    // OUTPUT sono scelte separatamente (possono coincidere, vedi
+    // `onUseInputAsOutput` in `BatchScreen`) e non condividono lo stato con
+    // la Libreria: sono un catalogo di lavoro temporaneo per la singola
+    // sessione di batch, non ricordato fra riavvii.
+    var showBatch by remember { mutableStateOf(false) }
+    var batchSampleState by remember { mutableStateOf<ImportState?>(null) }
+    var batchSampleError by remember { mutableStateOf<String?>(null) }
+    var batchInputFolder by remember { mutableStateOf<String?>(null) }
+    var batchOutputFolder by remember { mutableStateOf<String?>(null) }
+    var batchPhotos by remember { mutableStateOf<List<LibraryPhotoEntry>>(emptyList()) }
+    var batchListBusy by remember { mutableStateOf(false) }
+    var batchListError by remember { mutableStateOf<String?>(null) }
+    // Stesso significato di `overrideStrength` sopra ("Intensità
+    // adattamento"), ma una variabile di stato SEPARATA: il batch elabora
+    // una cartella intera con un'unica intensità scelta prima di partire,
+    // indipendente da quella eventualmente in uso nel pannello Develop.
+    var batchOverrideStrength by remember { mutableStateOf(1f) }
+    var batchRunning by remember { mutableStateOf(false) }
+    var batchCancelRequested by remember { mutableStateOf(false) }
+    var batchDone by remember { mutableStateOf(0) }
+    var batchTotal by remember { mutableStateOf(0) }
+    var batchCurrentFileName by remember { mutableStateOf<String?>(null) }
+    var batchSuccessCount by remember { mutableStateOf(0) }
+    // Limitata alle ultime 20 (`takeLast`): "grandi quantità di file" può
+    // voler dire centinaia di foto — tenere un errore per ciascuna
+    // renderebbe la schermata inutilizzabile molto prima che diventi utile;
+    // il conteggio dei successi resta comunque esatto, solo il dettaglio
+    // degli errori più vecchi non viene mostrato.
+    var batchErrors by remember { mutableStateOf<List<String>>(emptyList()) }
+
+    LaunchedEffect(batchInputFolder) {
+        val folder = batchInputFolder ?: return@LaunchedEffect
+        batchListError = null
+        batchListBusy = true
+        val result = withContext(Dispatchers.Default) { LibraryStorage.listPhotos(folder) }
+        result.fold(
+            onSuccess = { photos -> batchPhotos = photos },
+            onFailure = { error -> batchPhotos = emptyList(); batchListError = error.message ?: "Errore durante la lettura della cartella" }
+        )
+        batchListBusy = false
+    }
+
+    // Il ciclo vero e proprio: parte quando `batchRunning` diventa vero
+    // (pulsante "Avvia elaborazione" in `BatchScreen`), elabora i file UNO
+    // ALLA VOLTA (non in parallelo — il motore Rust non è stato pensato per
+    // essere chiamato da più thread contemporaneamente sulla stessa sessione,
+    // e comunque su centinaia di foto il collo di bottiglia è la decodifica/
+    // il rendering CPU, non l'attesa fra un file e l'altro) e si ferma da
+    // sola a batch finito, o prima se l'utente annulla
+    // (`batchCancelRequested`, controllato fra un file e il successivo — non
+    // interrompe un file a metà, solo prima del prossimo).
+    LaunchedEffect(batchRunning) {
+        if (!batchRunning) return@LaunchedEffect
+        val sample = batchSampleState
+        val outputFolder = batchOutputFolder
+        if (sample == null || outputFolder == null) {
+            batchRunning = false
+            return@LaunchedEffect
+        }
+        val photosSnapshot = batchPhotos
+        batchDone = 0
+        batchTotal = photosSnapshot.size
+        batchSuccessCount = 0
+        batchErrors = emptyList()
+        val lookName = "Look da ${sample.fileName}"
+        withContext(Dispatchers.Default) {
+            for (entry in photosSnapshot) {
+                if (batchCancelRequested) break
+                batchCurrentFileName = entry.displayName
+                val outcome = runCatching {
+                    val targetBytes = LibraryStorage.readPhotoBytes(entry.id).getOrThrow()
+                    val batchSession = Engine.openPhotoForEditing(targetBytes, entry.displayName).getOrThrow()
+                    try {
+                        val adapted = batchSession.pasteLookFromSample(
+                            sampleBytes = sample.rawBytes,
+                            sampleFileName = sample.fileName,
+                            lookName = lookName,
+                            overrideStrength = batchOverrideStrength,
+                        ).getOrThrow()
+                        val fullResBytes = batchSession.renderFullResolution(adapted.appliedLook).getOrThrow()
+                        val baseName = entry.displayName.substringBeforeLast('.').ifBlank { entry.displayName }
+                        BatchExport.writeBytes(outputFolder, "${baseName}_rawforge.png", fullResBytes).getOrThrow()
+                        val xmpText = Engine.generateXmpForLook(adapted.appliedLook.copy(name = baseName)).getOrThrow()
+                        BatchExport.writeBytes(outputFolder, "${baseName}_rawforge.xmp", xmpText.encodeToByteArray()).getOrThrow()
+                    } finally {
+                        batchSession.close()
+                    }
+                }
+                outcome.fold(
+                    onSuccess = { batchSuccessCount++ },
+                    onFailure = { error ->
+                        batchErrors = (batchErrors + "${entry.displayName}: ${error.message ?: "errore sconosciuto"}").takeLast(20)
+                    }
+                )
+                batchDone++
+            }
+        }
+        batchCurrentFileName = null
+        batchRunning = false
+        batchCancelRequested = false
+    }
 
     // Chiude sempre la sessione precedente prima di sostituirla: la foto
     // decodificata che tiene in memoria lato Rust va liberata esplicitamente
@@ -254,6 +440,9 @@ fun RawForgeApp() {
         renderError = null
         exportMessage = null
         exportError = null
+        saliencyBitmap = null
+        saliencyBusy = false
+        saliencyError = null
         if (target != null) {
             Engine.openPhotoForEditing(target.rawBytes, target.fileName).fold(
                 onSuccess = { opened -> session = opened },
@@ -337,6 +526,45 @@ fun RawForgeApp() {
         )
     }
 
+    val launchFolderPicker = rememberFolderPickerLauncher { folderId -> openLibraryFolder(folderId) }
+
+    // Apre una foto scelta dalla griglia della Libreria esattamente come
+    // `launchTargetPicker` apre una foto scelta dal selettore di file: stessa
+    // `importInto`, stesso `resetEditingStateFor`, così la Libreria è solo
+    // un modo alternativo di arrivare alla stessa foto target, non un
+    // percorso di editing separato.
+    fun openLibraryPhoto(entry: LibraryPhotoEntry) {
+        libraryError = null
+        libraryBusy = true
+        LibraryStorage.readPhotoBytes(entry.id).fold(
+            onSuccess = { bytes ->
+                targetError = null
+                importInto(
+                    bytes,
+                    entry.displayName,
+                    onDone = { state -> targetState = state; resetEditingStateFor(state); showLibrary = false; libraryBusy = false },
+                    onError = { error -> targetError = error; targetState = null; resetEditingStateFor(null); libraryBusy = false }
+                )
+            },
+            onFailure = { error ->
+                libraryError = error.message ?: "Errore durante la lettura della foto"
+                libraryBusy = false
+            }
+        )
+    }
+
+    val launchBatchSamplePicker = rememberFilePickerLauncher { bytes, fileName ->
+        batchSampleError = null
+        importInto(
+            bytes,
+            fileName,
+            onDone = { state -> batchSampleState = state },
+            onError = { error -> batchSampleError = error; batchSampleState = null }
+        )
+    }
+    val launchBatchInputFolderPicker = rememberFolderPickerLauncher { folderId -> batchInputFolder = folderId }
+    val launchBatchOutputFolderPicker = rememberFolderPickerLauncher { folderId -> batchOutputFolder = folderId }
+
     val launchExport = rememberFileSaverLauncher(
         onSaved = { destination -> exportMessage = "Foto esportata: $destination"; exportError = null; exportBusy = false },
         onError = { error -> exportError = error; exportMessage = null; exportBusy = false },
@@ -374,6 +602,29 @@ fun RawForgeApp() {
         )
     }
 
+    // "Rileva soggetto": lavora sulla stessa anteprima già decodificata
+    // dall'import (`previewImageBytes`), MAI sui byte grezzi del file target
+    // — `compute_subject_saliency_preview` lato Rust si aspetta byte già
+    // decodificabili (JPEG/PNG), non un file RAW originale (vedi il commento
+    // su quella funzione in `engine/ffi`); `previewImageBytes` è già nella
+    // forma corretta per entrambi i casi (RAW e non), esattamente come per
+    // `extractLookAndExportXmp`.
+    fun detectSubject() {
+        val target = targetState ?: return
+        saliencyError = null
+        saliencyBusy = true
+        Engine.computeSubjectSaliencyPreview(target.previewImageBytes).fold(
+            onSuccess = { bytes ->
+                saliencyBitmap = decodeImageBitmapOrNull(bytes)
+                saliencyBusy = false
+            },
+            onFailure = { error ->
+                saliencyError = error.message ?: "Errore durante il rilevamento del soggetto"
+                saliencyBusy = false
+            }
+        )
+    }
+
     MaterialTheme(colors = RawForgeDarkColors) {
         Surface(modifier = Modifier.fillMaxSize(), color = PanelBackground) {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -382,12 +633,51 @@ fun RawForgeApp() {
                     xmpPreview = xmpPreview,
                     onCheckEngine = { engineInfo = Engine.versionInfo() },
                     onGenerateSampleXmp = { xmpPreview = Engine.generateSampleXmpPreset() },
+                    onOpenLibrary = { showLibrary = true; showBatch = false },
+                    onOpenBatch = { showBatch = true; showLibrary = false },
                 )
                 // Sottile filo di colore al posto del solito `Divider` piatto:
                 // è l'unico accento "vivo" nella barra in alto.
                 Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(AccentGradient))
 
-                if (fullScreenEditing && targetState != null && session != null) {
+                if (showLibrary) {
+                    LibraryScreen(
+                        folder = libraryFolder,
+                        photos = libraryPhotos,
+                        busy = libraryBusy,
+                        error = libraryError,
+                        onPickFolder = { launchFolderPicker() },
+                        onRefresh = { libraryRefreshTick++ },
+                        onSelect = { entry -> openLibraryPhoto(entry) },
+                        onClose = { showLibrary = false },
+                    )
+                } else if (showBatch) {
+                    BatchScreen(
+                        sampleFileName = batchSampleState?.fileName,
+                        sampleError = batchSampleError,
+                        onPickSample = { launchBatchSamplePicker() },
+                        inputFolder = batchInputFolder,
+                        outputFolder = batchOutputFolder,
+                        onPickInputFolder = { launchBatchInputFolderPicker() },
+                        onPickOutputFolder = { launchBatchOutputFolderPicker() },
+                        onUseInputAsOutput = { batchInputFolder?.let { batchOutputFolder = it } },
+                        photosCount = batchPhotos.size,
+                        listBusy = batchListBusy,
+                        listError = batchListError,
+                        overrideStrength = batchOverrideStrength,
+                        onOverrideStrengthChange = { batchOverrideStrength = it },
+                        running = batchRunning,
+                        done = batchDone,
+                        total = batchTotal,
+                        currentFileName = batchCurrentFileName,
+                        successCount = batchSuccessCount,
+                        errors = batchErrors,
+                        canStart = !batchRunning && batchSampleState != null && batchOutputFolder != null && batchPhotos.isNotEmpty(),
+                        onStart = { batchCancelRequested = false; batchRunning = true },
+                        onCancel = { batchCancelRequested = true },
+                        onClose = { showBatch = false },
+                    )
+                } else if (fullScreenEditing && targetState != null && session != null) {
                     FullScreenDevelopView(
                         title = targetState?.fileName ?: "Foto",
                         bitmap = preview?.bitmap,
@@ -622,6 +912,10 @@ fun RawForgeApp() {
                                     onEditIntensityChange = { editIntensity = it },
                                     shadowClipFraction = preview?.shadowClipFraction,
                                     highlightClipFraction = preview?.highlightClipFraction,
+                                    onDetectSubject = { detectSubject() },
+                                    saliencyBitmap = saliencyBitmap,
+                                    saliencyBusy = saliencyBusy,
+                                    saliencyError = saliencyError,
                                 )
                             }
                         }
@@ -697,6 +991,10 @@ fun RawForgeApp() {
                                     shadowClipFraction = preview?.shadowClipFraction,
                                     highlightClipFraction = preview?.highlightClipFraction,
                                     shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
+                                    onDetectSubject = { detectSubject() },
+                                    saliencyBitmap = saliencyBitmap,
+                                    saliencyBusy = saliencyBusy,
+                                    saliencyError = saliencyError,
                                 )
                             }
                         }
@@ -833,12 +1131,299 @@ private fun FullScreenDevelopView(
     }
 }
 
+/**
+ * Griglia della Libreria (vedi `LibraryStorage` per l'architettura e i
+ * limiti dichiarati di questa prima versione). Sostituisce il confronto
+ * foto campione/target finché `onClose` non viene invocato — proprio come
+ * `FullScreenDevelopView` fa per `fullScreenEditing`.
+ */
+@Composable
+private fun LibraryScreen(
+    folder: String?,
+    photos: List<LibraryPhotoEntry>,
+    busy: Boolean,
+    error: String?,
+    onPickFolder: () -> Unit,
+    onRefresh: () -> Unit,
+    onSelect: (LibraryPhotoEntry) -> Unit,
+    onClose: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize().background(PanelBackground).padding(20.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Libreria", style = MaterialTheme.typography.h6, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Spacer(Modifier.width(4.dp))
+            Text(
+                folder ?: "Nessuna cartella scelta",
+                style = MaterialTheme.typography.caption,
+                color = TextMuted,
+                modifier = Modifier.weight(1f),
+            )
+            if (busy) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            }
+            TextButton(onClick = onPickFolder) { Text("Scegli cartella", style = MaterialTheme.typography.caption) }
+            if (folder != null) {
+                TextButton(onClick = onRefresh) { Text("Aggiorna", style = MaterialTheme.typography.caption) }
+            }
+            TextButton(onClick = onClose) { Text("Chiudi", style = MaterialTheme.typography.caption) }
+        }
+        error?.let {
+            Spacer(Modifier.height(4.dp))
+            Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+        }
+        Spacer(Modifier.height(16.dp))
+        when {
+            folder == null -> Text(
+                "Scegli una cartella per popolare la Libreria.",
+                style = MaterialTheme.typography.body2,
+                color = TextMuted,
+            )
+            photos.isEmpty() && !busy -> Text(
+                "Nessuna foto riconosciuta in questa cartella.",
+                style = MaterialTheme.typography.body2,
+                color = TextMuted,
+            )
+            else -> LazyVerticalGrid(
+                columns = GridCells.Adaptive(minSize = 130.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                items(photos, key = { it.id }) { entry ->
+                    Column(
+                        modifier = Modifier
+                            .clickable { onSelect(entry) }
+                            .clip(RoundedCornerShape(6.dp)),
+                    ) {
+                        LibraryThumbnail(
+                            entry = entry,
+                            modifier = Modifier.fillMaxWidth().height(96.dp),
+                        )
+                        Text(
+                            entry.displayName,
+                            style = MaterialTheme.typography.caption,
+                            color = TextPrimary,
+                            maxLines = 1,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Miniatura di una foto della Libreria: decodifica la propria anteprima in
+ * background al primo utilizzo (nessuna cache — vedi i limiti dichiarati in
+ * `LibraryStorage`), passando per `Engine.importPhoto` esattamente come
+ * `importInto` — è l'unico modo per ottenere un'immagine mostrabile anche
+ * per un file RAW, che `decodeImageBitmapOrNull` da solo non sa decodificare.
+ */
+@Composable
+private fun LibraryThumbnail(entry: LibraryPhotoEntry, modifier: Modifier = Modifier) {
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, entry.id) {
+        value = withContext(Dispatchers.Default) {
+            LibraryStorage.readPhotoBytes(entry.id).getOrNull()?.let { bytes ->
+                Engine.importPhoto(bytes, entry.displayName).getOrNull()?.previewImageBytes?.let(::decodeImageBitmapOrNull)
+            }
+        }
+    }
+    Box(modifier = modifier.background(PanelSurfaceRaised), contentAlignment = Alignment.Center) {
+        val currentBitmap = bitmap
+        if (currentBitmap != null) {
+            Image(
+                bitmap = currentBitmap,
+                contentDescription = entry.displayName,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        } else {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+
+/**
+ * Schermata dell'elaborazione in batch (vedi il commento su `showBatch` in
+ * `RawForgeApp` per l'architettura completa). Tutta la logica vive lì
+ * dentro (stato + `LaunchedEffect`); questo composable è solo la UI.
+ */
+@Composable
+private fun BatchScreen(
+    sampleFileName: String?,
+    sampleError: String?,
+    onPickSample: () -> Unit,
+    inputFolder: String?,
+    outputFolder: String?,
+    onPickInputFolder: () -> Unit,
+    onPickOutputFolder: () -> Unit,
+    onUseInputAsOutput: () -> Unit,
+    photosCount: Int,
+    listBusy: Boolean,
+    listError: String?,
+    overrideStrength: Float,
+    onOverrideStrengthChange: (Float) -> Unit,
+    running: Boolean,
+    done: Int,
+    total: Int,
+    currentFileName: String?,
+    successCount: Int,
+    errors: List<String>,
+    canStart: Boolean,
+    onStart: () -> Unit,
+    onCancel: () -> Unit,
+    onClose: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxSize().background(PanelBackground).padding(20.dp).verticalScroll(rememberScrollState()),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Elaborazione in batch", style = MaterialTheme.typography.h6, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onClose, enabled = !running) { Text("Chiudi", style = MaterialTheme.typography.caption) }
+        }
+        Text(
+            "Applica il Look di UNA foto campione, adattato foto per foto (Smart-Batch), a tutte le foto " +
+                "di una cartella — per ciascuna produce sia il PNG renderizzato sia il preset .xmp.",
+            style = MaterialTheme.typography.caption,
+            color = TextMuted,
+        )
+        Spacer(Modifier.height(16.dp))
+
+        PanelCard(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("1. Foto campione (da cui copiare il Look)", style = MaterialTheme.typography.subtitle2, color = TextPrimary)
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = onPickSample, enabled = !running, colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised)) {
+                        Text("Scegli foto campione", style = MaterialTheme.typography.caption)
+                    }
+                    Text(
+                        sampleFileName ?: "Nessuna foto scelta",
+                        style = MaterialTheme.typography.caption,
+                        color = TextMuted,
+                    )
+                }
+                sampleError?.let {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+
+        PanelCard(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("2. Cartelle", style = MaterialTheme.typography.subtitle2, color = TextPrimary)
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = onPickInputFolder, enabled = !running, colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised)) {
+                        Text("Cartella di input", style = MaterialTheme.typography.caption)
+                    }
+                    Text(inputFolder ?: "Nessuna cartella scelta", style = MaterialTheme.typography.caption, color = TextMuted)
+                    if (listBusy) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    }
+                }
+                listError?.let {
+                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                }
+                if (inputFolder != null && !listBusy) {
+                    Text(
+                        "$photosCount foto riconosciute in questa cartella.",
+                        style = MaterialTheme.typography.caption,
+                        color = TextMuted,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = onPickOutputFolder, enabled = !running, colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised)) {
+                        Text("Cartella di output", style = MaterialTheme.typography.caption)
+                    }
+                    Text(outputFolder ?: "Nessuna cartella scelta", style = MaterialTheme.typography.caption, color = TextMuted)
+                    if (inputFolder != null) {
+                        TextButton(onClick = onUseInputAsOutput, enabled = !running) {
+                            Text("Come input", style = MaterialTheme.typography.caption)
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+
+        PanelCard(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    "3. Intensità adattamento: ${(overrideStrength * 100).roundToInt()}% " +
+                        "(0% = impostazioni identiche alla foto campione, 100% = massimo adattamento intelligente per scena)",
+                    style = MaterialTheme.typography.caption,
+                    color = TextMuted,
+                )
+                Slider(
+                    value = overrideStrength,
+                    onValueChange = onOverrideStrengthChange,
+                    enabled = !running,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                shape = PillShape,
+                onClick = onStart,
+                enabled = canStart,
+            ) {
+                Text(if (running) "Elaborazione in corso…" else "Avvia elaborazione", style = MaterialTheme.typography.caption)
+            }
+            if (running) {
+                Button(
+                    shape = PillShape,
+                    onClick = onCancel,
+                    colors = ButtonDefaults.buttonColors(backgroundColor = PanelSurfaceRaised),
+                ) {
+                    Text("Annulla", style = MaterialTheme.typography.caption)
+                }
+            }
+        }
+
+        if (running || total > 0) {
+            Spacer(Modifier.height(16.dp))
+            val progress = if (total > 0) done.toFloat() / total.toFloat() else 0f
+            LinearProgressIndicator(progress = progress, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "$done / $total elaborate — $successCount riuscite" +
+                    (currentFileName?.let { " — in corso: $it" } ?: ""),
+                style = MaterialTheme.typography.caption,
+                color = TextMuted,
+            )
+        }
+
+        if (errors.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Errori (ultimi ${errors.size}):",
+                style = MaterialTheme.typography.caption,
+                color = MaterialTheme.colors.error,
+            )
+            errors.forEach {
+                Text(it, style = MaterialTheme.typography.caption, color = MaterialTheme.colors.error)
+            }
+        }
+    }
+}
+
 @Composable
 private fun TopBar(
     engineInfo: String?,
     xmpPreview: String?,
     onCheckEngine: () -> Unit,
     onGenerateSampleXmp: () -> Unit,
+    onOpenLibrary: () -> Unit,
+    onOpenBatch: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().background(PanelSurface).padding(horizontal = 20.dp, vertical = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -854,6 +1439,8 @@ private fun TopBar(
                 color = TextMuted,
             )
             Spacer(Modifier.weight(1f))
+            TextButton(onClick = onOpenLibrary) { Text("Libreria", style = MaterialTheme.typography.caption) }
+            TextButton(onClick = onOpenBatch) { Text("Batch", style = MaterialTheme.typography.caption) }
             TextButton(onClick = onCheckEngine) { Text("Stato motore", style = MaterialTheme.typography.caption) }
             TextButton(onClick = onGenerateSampleXmp) { Text("Preset XMP demo", style = MaterialTheme.typography.caption) }
         }
@@ -1017,6 +1604,15 @@ private fun DevelopPanel(
     // chiamante passa una forma diversa (arrotondata solo in alto) — da qui
     // il parametro invece di una forma fissa.
     shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp),
+    // "Rileva soggetto" (sezione Maschera più sotto): tutti opzionali con
+    // default `null`/`false` in modo che nessuna delle chiamate esistenti a
+    // `DevelopPanel` debba cambiare — il pulsante/anteprima compaiono solo
+    // dove il chiamante passa `onDetectSubject` (le due schermate con una
+    // foto target aperta), non nelle altre.
+    onDetectSubject: (() -> Unit)? = null,
+    saliencyBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    saliencyBusy: Boolean = false,
+    saliencyError: String? = null,
 ) {
     // "Slider sicuri" (idea approvata, vedi README.md): solo un avviso sul
     // valore CORRENTE — quanto di QUESTO rendering sta bruciando le luci o
@@ -1146,6 +1742,100 @@ private fun DevelopPanel(
             IntSlider("Fine", look.textureFine, -100..100) { onEdit { l -> l.copy(textureFine = it) } }
             IntSlider("Media", look.textureMedium, -100..100) { onEdit { l -> l.copy(textureMedium = it) } }
             IntSlider("Grossa", look.textureCoarse, -100..100) { onEdit { l -> l.copy(textureCoarse = it) } }
+        }
+
+        DevelopSection("Riduzione del rumore") {
+            IntSlider("Luminanza", look.noiseReductionLuma, 0..100) { onEdit { l -> l.copy(noiseReductionLuma = it) } }
+            IntSlider("Colore", look.noiseReductionColor, 0..100) { onEdit { l -> l.copy(noiseReductionColor = it) } }
+        }
+
+        DevelopSection("Maschera Soggetto/Sfondo") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Attiva maschera", style = MaterialTheme.typography.caption, color = TextPrimary)
+                Switch(
+                    checked = look.subjectMaskEnabled,
+                    onCheckedChange = { onEdit { l -> l.copy(subjectMaskEnabled = it) } },
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+
+            if (onDetectSubject != null) {
+                // "Rileva soggetto": calcola/mostra la mappa di salienza —
+                // NON attiva da sola la maschera (l'utente decide comunque
+                // con lo `Switch` sopra), è solo l'anteprima ispezionabile
+                // di dove il motore "guarderebbe" (vedi `engine/README.md`
+                // per i limiti onesti dell'euristica: un'analisi globale per
+                // colore + centratura, non una segmentazione vera).
+                TextButton(
+                    onClick = onDetectSubject,
+                    shape = PillShape,
+                    colors = ButtonDefaults.textButtonColors(backgroundColor = PanelSurfaceRaised),
+                    enabled = !saliencyBusy,
+                ) {
+                    Text(
+                        if (saliencyBusy) "Rilevamento…" else "Rileva soggetto",
+                        style = MaterialTheme.typography.caption,
+                    )
+                }
+                saliencyError?.let {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Errore: $it", color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                }
+                saliencyBitmap?.let { bitmap ->
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Mappa di salienza (bianco = alta, nero = bassa)",
+                        style = MaterialTheme.typography.caption,
+                        color = TextMuted,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Image(
+                        bitmap = bitmap,
+                        contentDescription = "Mappa di salienza del soggetto",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxWidth().height(160.dp).clip(InnerShape),
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf(
+                    MaskTarget.SUBJECT to "Soggetto",
+                    MaskTarget.BACKGROUND to "Sfondo",
+                ).forEach { (candidate, label) ->
+                    val selected = look.subjectMaskTarget == candidate
+                    TextButton(
+                        onClick = { onEdit { l -> l.copy(subjectMaskTarget = candidate) } },
+                        shape = PillShape,
+                        colors = ButtonDefaults.textButtonColors(
+                            backgroundColor = if (selected) PanelSurfaceRaised else Color.Transparent,
+                        ),
+                    ) {
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.caption,
+                            color = if (selected) AccentBlue else TextMuted,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            FloatSlider(
+                "Esposizione maschera (EV)", look.subjectMaskExposureEv, -2f..2f,
+                onChange = { onEdit { l -> l.copy(subjectMaskExposureEv = it) } },
+            ) { "%.2f".format(it) }
+            IntSlider("Contrasto maschera", look.subjectMaskContrast, -100..100) {
+                onEdit { l -> l.copy(subjectMaskContrast = it) }
+            }
+            IntSlider("Saturazione maschera", look.subjectMaskSaturation, -100..100) {
+                onEdit { l -> l.copy(subjectMaskSaturation = it) }
+            }
         }
 
         DevelopSection("Viraggio (Split Toning)") {

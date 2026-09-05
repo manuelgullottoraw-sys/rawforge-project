@@ -913,6 +913,7 @@ version = "0.1.0"
 dependencies = [
  "color-science",
  "core-types",
+ "harmonic",
  "image",
  "rayon",
 ]

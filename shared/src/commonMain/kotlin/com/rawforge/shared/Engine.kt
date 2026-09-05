@@ -52,6 +52,35 @@ expect object Engine {
      * lato Rust.
      */
     fun openPhotoForEditing(bytes: ByteArray, fileName: String): Result<PhotoEditSession>
+
+    /**
+     * Anteprima ispezionabile del "probabile soggetto" (`compute_subject_saliency_preview`
+     * lato Rust, `engine/README.md` per la spiegazione completa e i limiti
+     * dichiarati dell'euristica): una mappa in scala di grigi (bianco = alta
+     * salienza) alla stessa risoluzione di analisi usata dal motore, PENSATA
+     * come mostra-e-basta — la sezione "Maschera Soggetto/Sfondo" del
+     * pannello Develop (`EditableLook.subjectMask*`) è quella che usa
+     * davvero questa stessa mappa lato motore per applicare regolazioni
+     * locali, non questa funzione. `imageBytes` deve essere già
+     * un'immagine decodificabile (JPEG/PNG) — la stessa `previewImageBytes`
+     * di `ImportedPhoto`, mai i byte grezzi di un file RAW originale.
+     */
+    fun computeSubjectSaliencyPreview(imageBytes: ByteArray): Result<ByteArray>
+
+    /**
+     * Genera il testo di un preset Lightroom `.xmp` per un `EditableLook` già
+     * pronto (`rawforge_ffi::generate_lightroom_preset_xmp`, la stessa
+     * funzione dietro `generateSampleXmpPreset`/`extractLookAndExportXmp`),
+     * SENZA ripartire dall'estrazione automatica su una foto — a differenza
+     * di `extractLookAndExportXmp`, che estrae un Look da bytes grezzi,
+     * questa riusa un Look già calcolato altrove (tipicamente
+     * `AdaptedPreview.appliedLook` restituito da
+     * `PhotoEditSession.pasteLookFromSample`). È la funzione dietro
+     * l'elaborazione in batch (vedi `BatchExport`/`App.kt`): per ciascuna
+     * foto target produce sia il rendering sia il preset, dallo stesso Look
+     * adattato — mai due calcoli separati che potrebbero divergere.
+     */
+    fun generateXmpForLook(look: EditableLook): Result<String>
 }
 
 /**
@@ -160,6 +189,15 @@ data class RenderedPreview(
 data class TonePoint(val x: Int, val y: Int)
 
 /**
+ * Controparte comune (plain Kotlin, nessun tipo generato da UniFFI) di
+ * `uniffi.rawforge_ffi.MaskTargetFfi` — stessa ragione di `EditableLook`
+ * rispetto a `HarmonicLookFfi`: un tipo UniFFI non può comparire in una
+ * firma `expect`/in `EditableLook`. La conversione avviene solo dentro
+ * `toFfi()`/`toEditable()` in `Engine.desktop.kt`/`Engine.android.kt`.
+ */
+enum class MaskTarget { SUBJECT, BACKGROUND }
+
+/**
  * Controparte comune (solo tipi primitivi, niente tipi generati da UniFFI) di
  * `HarmonicLookFfi`. Esiste apposta perché un tipo generato da UniFFI vive
  * solo nelle copie platform-specific dei binding Kotlin (`androidMain`/
@@ -214,4 +252,18 @@ data class EditableLook(
      * `look-render::apply_noise_reduction` lato Rust. */
     val noiseReductionLuma: Int = 0,
     val noiseReductionColor: Int = 0,
+    /**
+     * Maschera automatica "Soggetto"/"Sfondo" (`look-render::apply_subject_mask`
+     * lato Rust, derivata dalla stessa mappa di salienza di
+     * `computeSubjectSaliencyPreview`): quando `subjectMaskEnabled` è vero,
+     * esposizione/contrasto/saturazione locali si applicano SOLO sulla
+     * regione scelta da `subjectMaskTarget`, in aggiunta alle stesse
+     * regolazioni globali sopra. Disattivata di default (`false`): nessun
+     * comportamento esistente cambia finché l'utente non la attiva.
+     */
+    val subjectMaskEnabled: Boolean = false,
+    val subjectMaskTarget: MaskTarget = MaskTarget.SUBJECT,
+    val subjectMaskExposureEv: Float = 0f,
+    val subjectMaskContrast: Int = 0,
+    val subjectMaskSaturation: Int = 0,
 )

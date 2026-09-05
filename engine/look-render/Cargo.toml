@@ -7,5 +7,6 @@ description = "Applica un HarmonicLook ai pixel di un'immagine su CPU, per un'an
 [dependencies]
 core-types = { path = "../core-types" }
 color-science = { path = "../color-science" }
+harmonic = { path = "../harmonic" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rayon = "1"

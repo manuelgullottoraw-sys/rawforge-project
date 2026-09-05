@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 103 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 109 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -259,8 +259,12 @@ finora.
   camera.
 - Collegare `gpu-pipe` (gli shader WGSL già validati) alla UI per il rendering a piena risoluzione
   in tempo reale, al posto della pipeline CPU attuale.
-- `cache`, `catalog` (libreria/grid multi-foto), `job-scheduler` (batch reale su centinaia di
-  foto insieme, non una alla volta) — oggi il flusso è a una foto campione + una foto target.
+- Libreria: fatta questo giro in versione v1 (catalogo persistente a singola cartella, non
+  ricorsivo, senza cache miniature — vedi sopra); resta da fare una vera `catalog`/`cache` se
+  servisse gestire più cartelle o cartelle con migliaia di foto.
+- `job-scheduler`: una prima versione sequenziale (una foto alla volta, non in parallelo) è fatta
+  questo giro — vedi sopra, "elaborazione in batch"; resterebbe da fare una coda vera con priorità/
+  ripresa se servisse elaborare in parallelo o riprendere un batch interrotto.
 - Maschere locali (pennello/gradiente/radiale) copiabili nei preset.
 - **"Coerenza di Set"** (idea originale, discussa e approvata con l'utente, da pianificare insieme
   alla fase libreria/batch): data un'intera cartella di uno shooting, raggruppare automaticamente
@@ -762,6 +766,80 @@ riconoscimento del soggetto come funzione indipendente e ispezionabile
 (`compute_subject_saliency_preview`, restituisce una mappa in scala di grigi), pronta per un futuro
 utilizzo guidato dall'utente in UI ma non ancora collegata a nessuna regolazione automatica. Dettagli
 tecnici completi, inclusa la causa della regressione, in `engine/README.md`.
+
+## Nuovo (questo giro): gli slider di riduzione rumore ora si vedono, "Rileva soggetto" ha un pulsante vero, e la salienza guida per la prima volta una maschera Soggetto/Sfondo
+
+Richiesta dell'utente: collegare gli slider di riduzione del rumore alla UI, aggiungere un pulsante
+"Rileva soggetto", e usare la rilevazione per costruire una sezione maschere — poi, in un secondo
+tempo, libreria e batch (vedi sotto per lo stato di questi ultimi due).
+
+I due slider di riduzione rumore (già nel motore dal giro precedente ma senza alcun controllo in UI)
+ora sono nel pannello Develop. Il pulsante "Rileva soggetto" mostra la mappa di salienza direttamente
+nell'app. La novità più grande è la sezione "Maschera Soggetto/Sfondo": per la prima volta la mappa di
+salienza non è solo un'anteprima ispezionabile, ma un vero input del rendering — attivandola, esposizione/
+contrasto/saturazione si applicano SOLO alla regione scelta (il soggetto rilevato, o il suo complementare),
+con un bordo sfumato invece che netto. Limiti dichiarati: una sola maschera per foto (non un numero
+arbitrario di selezioni indipendenti), nessun pennello manuale per correggerne il confine, e la maschera
+non viene ancora esportata nel preset `.xmp` (resta un effetto solo dentro l'app). Dettagli tecnici
+completi, inclusa la scoperta interessante che ha portato a correggere il primo test scritto per questa
+funzione (la salienza NON è uniforme nemmeno su un'immagine a tinta piatta), in `engine/README.md`.
+
+**Libreria e batch**: scope chiarito con l'utente prima di costruire — Libreria come catalogo
+persistente (non solo un elenco valido per la sessione), batch con esportazione sia della foto
+renderizzata sia del preset `.xmp` per ciascun file. La Libreria è realizzata questo giro (sotto);
+il batch resta il prossimo incremento.
+
+## Nuovo (questo giro): Libreria foto (catalogo persistente a cartella singola)
+
+Richiesta dell'utente, seconda parte: "creazione libreria". Un pulsante "Libreria" nella barra in alto
+apre una griglia a miniature della cartella scelta dall'utente — su Desktop un selettore di cartelle
+nativo (`JFileChooser`), su Android il selettore di sistema (Storage Access Framework,
+`ACTION_OPEN_DOCUMENT_TREE`) con permesso persistente richiesto subito dopo la scelta, così l'accesso
+sopravvive al riavvio dell'app. La cartella scelta viene ricordata (preferenze JDK su Desktop,
+`SharedPreferences` su Android) e riaperta automaticamente al prossimo avvio — la scelta di scope
+confermata dall'utente ("catalogo persistente", non un elenco solo per la sessione corrente). Toccare
+una foto della griglia la apre direttamente nel flusso di editing esistente, esattamente come farebbe
+il selettore di file "Apri foto target".
+
+Limiti dichiarati di questa prima versione (non nascosti, da rivedere se servisse di più):
+una sola cartella alla volta, non una collezione di più cartelle; l'elenco non è ricorsivo (non scende
+nelle sottocartelle); nessuna cache miniature su disco — ogni apertura della schermata Libreria
+ridecodifica l'anteprima di ogni foto (accettabile per cartelle di dimensioni normali; da rivedere se
+una cartella con migliaia di file risultasse lenta); nessun indicizzatore in background — la lista si
+aggiorna solo alla scelta di una cartella o al pulsante "Aggiorna" esplicito, non da sola se il
+contenuto della cartella cambia sul disco. Implementata solo con dipendenze già dichiarate in
+`shared/build.gradle.kts` più API di piattaforma standard (nessuna nuova dipendenza Gradle aggiunta,
+per restare verificabile senza una build Kotlin locale — vedi la nota sotto su cosa ho potuto
+verificare qui e cosa no).
+
+## Nuovo (questo giro): elaborazione in batch di grandi quantità di file
+
+Ultima richiesta rimasta dal messaggio originale dell'utente: "processo in batch di grandi quantità
+di file". Un pulsante "Batch" nella barra in alto apre una schermata dedicata: si sceglie UNA foto
+campione (da cui copiare il Look, come per "Incolla impostazioni"), una cartella di INPUT (le foto da
+elaborare — stesso riconoscimento non ricorsivo della Libreria) e una cartella di OUTPUT (dove
+scrivere i risultati; un pulsante "Come input" copia la cartella di input se si preferisce scrivere lì
+accanto agli originali). Avviando l'elaborazione, per CIASCUNA foto della cartella di input: apre una
+sessione di editing, applica lo stesso adattamento intelligente Smart-Batch Contestuale già usato da
+"Incolla impostazioni" (stessa "Intensità adattamento", scelta una volta sola per l'intero batch), e
+scrive ENTRAMBI gli output per quel file — scelta dell'utente, "Entrambi" —: la foto renderizzata a
+piena risoluzione in PNG (`<nome>_rawforge.png`) e il preset Lightroom corrispondente
+(`<nome>_rawforge.xmp`), generato dallo stesso identico Look applicato al rendering (non ricalcolato
+separatamente: `Engine.generateXmpForLook`, nuova funzione comune che riusa
+`rawforge_ffi::generate_lightroom_preset_xmp` — nessuna modifica lato Rust è stata necessaria per
+questa funzionalità, il motore la esponeva già). Una barra di avanzamento mostra quante foto sono
+state elaborate e il nome di quella in corso; un pulsante "Annulla" ferma il batch prima del
+prossimo file (non a metà di quello in corso).
+
+Limiti dichiarati di questa prima versione: elaborazione sequenziale, un file alla volta, non in
+parallelo (il motore Rust non è pensato per essere richiamato da più thread contemporaneamente sulla
+stessa foto, e il collo di bottiglia reale è comunque la decodifica/il rendering CPU per singolo
+file); nessuna ripresa automatica se il batch viene interrotto o l'app chiusa a metà — va rilanciato da
+capo; un'unica intensità di adattamento per l'intero batch, non regolabile foto per foto; su Desktop un
+file di output con lo stesso nome viene sovrascritto silenziosamente, su Android il sistema (Storage
+Access Framework) crea invece un documento con un nome alternativo — comportamento della piattaforma,
+non scelto da questo codice, documentato in `BatchExport`. Anche questa funzionalità usa solo le
+dipendenze Gradle già dichiarate.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

@@ -17,6 +17,48 @@ pub struct HslAdjustments {
     pub lum: [i32; 8],
 }
 
+/// A quale regione applicare la maschera "Soggetto"/"Sfondo" (vedi
+/// `SubjectMask`): `Subject` = dove la mappa di salienza è ALTA (il probabile
+/// soggetto principale), `Background` = il complementare (dove la salienza è
+/// BASSA). La mappa stessa (`harmonic::compute_saliency_map`) è la stessa
+/// euristica esposta all'utente da `compute_subject_saliency_preview` — qui
+/// diventa per la prima volta un vero input per il rendering, non solo
+/// un'anteprima ispezionabile (vedi `look-render::apply_subject_mask` per
+/// come viene sogliata/sfumata in un peso 0..1).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MaskTarget {
+    Subject,
+    Background,
+}
+
+impl Default for MaskTarget {
+    fn default() -> Self {
+        MaskTarget::Subject
+    }
+}
+
+/// Regolazione locale, ristretta a una maschera automatica derivata dalla
+/// salienza (vedi `MaskTarget`) invece che all'intera foto. Deliberatamente
+/// solo tre controlli (non l'intero set di un `HarmonicLook`): esposizione,
+/// contrasto e saturazione sono i tre che più spesso servono per "staccare"
+/// il soggetto dallo sfondo (es. scurire leggermente lo sfondo, o
+/// desaturarlo) senza la complessità di un secondo Look completo — un set
+/// più ampio è un'estensione naturale futura, non preclusa da questa scelta
+/// (vedi `look-render::apply_subject_mask` per i limiti onesti dell'approccio
+/// attuale: una sola maschera, nessun pennello manuale, nessun raffinamento
+/// dei bordi oltre la sfumatura di soglia della salienza).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct SubjectMask {
+    pub enabled: bool,
+    pub target: MaskTarget,
+    /// EV, come `HarmonicLook::exposure_ev` ma ristretto alla maschera.
+    pub exposure_ev: f32,
+    /// -100..100, come `HarmonicLook::contrast` ma ristretto alla maschera.
+    pub contrast: i32,
+    /// -100..100, come `HarmonicLook::saturation` ma ristretto alla maschera.
+    pub saturation: i32,
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct SplitToning {
     pub shadow_hue: i32,
@@ -79,6 +121,11 @@ pub struct HarmonicLook {
     /// pratica tollera un raggio di sfocatura maggiore prima di risultare
     /// visibile come perdita di nitidezza.
     pub noise_reduction_color: i32,
+    /// Maschera automatica "Soggetto"/"Sfondo" derivata dalla salienza
+    /// (vedi `SubjectMask`): quando `enabled` è vero, `look-render` applica
+    /// esposizione/contrasto/saturazione locali SOLO sulla regione scelta,
+    /// oltre alle stesse regolazioni globali sopra.
+    pub subject_mask: SubjectMask,
 }
 
 impl Default for HarmonicLook {
@@ -108,6 +155,7 @@ impl Default for HarmonicLook {
             wb_gradient_spread: 50,
             noise_reduction_luma: 0,
             noise_reduction_color: 0,
+            subject_mask: SubjectMask::default(),
         }
     }
 }

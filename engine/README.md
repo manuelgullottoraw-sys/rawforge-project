@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (103 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 21, `look_render` 34, `metadata` 3, `raw_decode` 4, `ffi` 24, `smartbatch`
+Crate reali, compilati e testati (109 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 21, `look_render` 40, `metadata` 3, `raw_decode` 4, `ffi` 24, `smartbatch`
 5, `xmp` 3):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -18,7 +18,7 @@ Crate reali, compilati e testati (103 test, tutti verdi — `color_science` 6, `
 | `xmp` | Generatore di preset Lightroom `.xmp` dal `HarmonicLook` | §5 |
 | `gpu-pipe` | Sorgenti WGSL degli stage di color grading, validati con `naga` (nessuna GPU richiesta per i test) | §3.2, §6.2 |
 | `raw-decode` | Decodifica RAW vera (`rawler`, Rust puro): anteprima incorporata dalla fotocamera + metadati base | §2, §9 |
-| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza, riduzione del rumore luminanza/colore in Lab con protezione ai bordi) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
+| `look-render` | Applica un `HarmonicLook` ai pixel su CPU (bilanciamento del bianco anche a gradiente, esposizione, tone curve, contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza, riduzione del rumore luminanza/colore in Lab con protezione ai bordi, maschera automatica Soggetto/Sfondo derivata dalla salienza) più le frazioni di clipping per "slider sicuri" — l'anteprima "incolla impostazioni" e il pannello "Develop" | §3.2 |
 | `ffi` | Superficie **UniFFI** che espone tutti i crate sopra a Kotlin, incluso l'oggetto stateful `PhotoEditSession` (vedi sotto) e `compute_subject_saliency_preview` (mappa di salienza ispezionabile, non collegata al color-matching automatico — vedi sotto) — è questo il crate che la pipeline CI compila per Android (via `cargo-ndk`) e Windows (nativo), generando anche i binding Kotlin usati da `shared/` | §1, §7 |
 
 **Novità di questo giro**: lo Smart-Batch Contestuale (`smartbatch`) era già scritto e testato ma
@@ -569,6 +569,63 @@ collegamento al color-matching per-banda, non nella qualità della mappa.
 4 nuovi test in `harmonic` (netto: +5 nuovi, -1 invalidato = +4), 2 nuovi in `ffi`
 (`saliency_preview_reports_error_on_bad_bytes`,
 `saliency_preview_returns_a_valid_grayscale_png_at_analysis_resolution`).
+
+## Nuovo (questo giro): slider di riduzione rumore/maschera nella UI, e la salienza diventa per la prima volta un INPUT del rendering (`SubjectMask`)
+
+Richiesta dell'utente, dopo aver visto il round precedente: collegare gli slider di riduzione del
+rumore alla UI, aggiungere un pulsante "Rileva soggetto", e — usando la rilevazione del soggetto —
+costruire una sezione "maschere". Questo giro copre le prime due richieste per intero e la terza con
+uno scope dichiaratamente contenuto (vedi "Onestà sui limiti" sotto).
+
+**Slider riduzione rumore**: due `IntSlider` (Luminanza, Colore, 0..100) nella nuova sezione
+"Riduzione del rumore" del pannello Develop, collegati a `EditableLook.noiseReductionLuma`/
+`noiseReductionColor` (già esistenti lato motore dal giro precedente, ma orfani in UI — nessuno
+slider li toccava). Inclusi anche nello scaling di "Intensità edit" (`EditableLook.scaledBy`), come
+gli altri controlli numerici.
+
+**Pulsante "Rileva soggetto"**: chiama la funzione FFI già esistente `compute_subject_saliency_preview`
+sulla stessa `previewImageBytes` già usata per l'import (mai sui byte grezzi di un file RAW, che quella
+funzione non sa decodificare) e mostra la mappa di salienza risultante (scala di grigi, bianco = alta
+salienza) direttamente nel pannello Develop, con lo stato di caricamento/errore nello stesso stile
+delle altre chiamate al motore in questa UI.
+
+**Sezione "Maschera Soggetto/Sfondo" — la salienza diventa per la prima volta un input di rendering,
+non solo un'anteprima**: nuovo campo `SubjectMask` su `HarmonicLook` (`enabled`, `target`
+[`Subject`/`Background`], `exposure_ev`, `contrast`, `saturation`). In `look-render`, quando attiva,
+si calcola `harmonic::compute_saliency_map` una sola volta sull'immagine (non per ogni pixel), la si
+soglia con una transizione morbida (`SALIENCY_MASK_THRESHOLD = 0.35`, sfumata di ±0.15 — lo stesso
+principio di "niente bordi a scalino" già usato per la protezione ai bordi della riduzione rumore) in
+un peso 0..1 per il target scelto, e si sfuma UNA sola volta fra l'HSL del pixel così com'è e l'HSL
+con esposizione/contrasto/saturazione applicati a piena forza — mai canale RGB per canale, per lo
+stesso motivo già documentato più volte in questo file (comprimerebbe la chroma): la sfumatura tocca
+solo lightness e saturazione HSL, mai la tonalità, quindi la maschera non può introdurre dominanti di
+colore innaturali sul proprio bordo.
+
+6 nuovi test in `look-render` (109 test totali, workspace). Il più istruttivo: il primo tentativo di
+verificare il comportamento su un'immagine PIATTA assumendo salienza uniforme (media sull'intera
+immagine) falliva — perché `compute_saliency_map` NON è uniforme pixel-per-pixel nemmeno su
+un'immagine a tinta unita: il prior di centratura pesa ogni pixel in base alla propria posizione (non
+solo al colore), e la mappa viene rinormalizzata al proprio massimo, quindi anche su un'immagine
+piatta gli angoli hanno salienza misurabilmente più bassa del centro. Corretto misurando il
+comportamento nel pixel centrale ESATTO (dove è invece deterministico), non la media sull'intera
+immagine — un altro esempio, come altre volte in questo progetto, di un test che ha scoperto un limite
+reale dell'euristica prima che finisse silenziosamente in produzione. Gli altri test verificano: la
+maschera disattivata non ha alcun effetto anche con valori diversi da zero configurati; su una patch
+colorata centrata (il "soggetto"), il target Soggetto la schiarisce più dello sfondo e viceversa per
+il target Sfondo; la saturazione della maschera desatura solo il soggetto; la maschera non altera mai
+la tonalità.
+
+**Onestà sui limiti (dichiarati, non nascosti)**: (1) una sola maschera per foto, non un numero
+arbitrario di regioni indipendenti come un vero pennello di selezione; (2) nessun pennello manuale —
+la regione è sempre e solo quella che la salienza produce, con la stessa soglia fissa per tutte le
+foto (nessun controllo per allargare/restringere il confine oltre lo `Switch` Soggetto/Sfondo); (3) la
+maschera NON viene esportata nel preset `.xmp` — le "Correzioni Locali" di Lightroom sono una
+struttura XML sostanzialmente più complessa (poligoni/pennellate serializzate) che questo motore non
+genera: il preset esportato resta solo il Look globale, la maschera resta un effetto solo-in-app; (4)
+la mappa di salienza per il rendering è calcolata alla risoluzione REALE del rendering (non ridotta a
+512px come l'anteprima diagnostica), quindi il suo costo cresce con la risoluzione dell'immagine —
+accettabile per l'anteprima interattiva (già ridotta), da tenere presente per un futuro export a piena
+risoluzione.
 
 ## Corretto (questo giro, giro precedente): "Intensità adattamento" non aveva ALCUN effetto su contrasto e tone curve — copiati letteralmente dal campione a qualunque valore dello slider
 
