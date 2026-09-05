@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (76 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 12, `look_render` 26, `metadata` 3, `raw_decode` 4, `ffi` 15, `smartbatch`
+Crate reali, compilati e testati (83 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 12, `look_render` 29, `metadata` 3, `raw_decode` 4, `ffi` 19, `smartbatch`
 5, `xmp` 2):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -444,9 +444,96 @@ entrambi. Nuovo test `negative_global_vibrance_protects_a_very_saturated_pixel_m
 in `look-render`: con lo stesso `vibrance` fortemente negativo, un pixel molto saturo deve perdere
 una frazione relativa della propria saturazione minore di uno moderatamente saturo (mai il
 contrario), e non deve comunque perderne più del 15% — prima della correzione un pixel così ne
-perdeva oltre il 30%. Workspace completo: 76 test, tutti verdi.
+perdeva oltre il 30%. Workspace completo: 83 test, tutti verdi.
 
-## Corretto (questo giro): rumore/"glitch" a chiazze sulla saturazione per un salto ripido fra bande HSL adiacenti
+## Corretto (questo giro): "Intensità adattamento" non aveva ALCUN effetto su contrasto e tone curve — copiati letteralmente dal campione a qualunque valore dello slider
+
+Segnalato dall'utente con tre foto vere (una pulita, una fortemente "granulosa"): dopo aver
+verificato che la foto pulita non aveva alcun rumore di sensore vero (Sony A7IV, ISO 100), e dopo
+un chiarimento dell'utente su quale build stesse testando, il problema reale non era rumore ma
+— testuale — "i rettangoli grigi che si creano e la mancanza totale di contrasto": i lastroni
+rettangolari della pavimentazione (texture/variazione tonale reale, ben visibile nella foto
+originale) diventavano piatti e privi di dettaglio dopo "Incolla impostazioni".
+
+Misurato: il contrasto locale della pavimentazione (deviazione standard in una finestra 15×15,
+foto vera a piena risoluzione) crollava da 8.23 a 4.56 — **il 55% del contrasto originale, quindi
+un calo reale del 45%** — a QUALUNQUE valore dello slider "Intensità adattamento" (0%, 50%, 100%,
+nessuna differenza). Causa: `contrast` e `tone_curve` — a differenza di `exposure_ev`, `highlights`
+e `shadows`, tutti e tre già tarati in base a questo slider — venivano presi sempre e solo dal
+valore LETTERALE estratto dalla foto campione, per intero, quale che fosse la posizione dello
+slider. Lo slider prometteva "0% = impostazioni identiche alla foto campione, 100% = massimo
+adattamento intelligente alla scena", ma per questi due campi non faceva letteralmente nulla — a
+100% (il valore usato dall'utente in tutti i test) l'utente si aspettava MENO copiatura letterale
+del campione, non la stessa identica copia di uno slider a 0%. La foto campione aveva una tone
+curve che alza le ombre e abbassa le luci più un contrasto già negativo (-23): una piattezza
+volutamente scelta per quella foto, trasferita in blocco sul target senza che l'utente avesse alcun
+modo di attenuarla.
+
+**Corretto** in `ffi::taper_contrast_and_tone_curve_toward_neutral` (nuova funzione, chiamata da
+`paste_look_from_sample`): `contrast` e ogni punto di `tone_curve` vengono ora sfumati verso il
+loro valore neutro (0, e curva identità x=y) in proporzione allo stesso `override_strength` già
+usato per `exposure_ev` — stesso principio, stessa direzione. A intensità 0% il comportamento resta
+identico a prima (copia letterale, come promesso); a intensità 100% contrasto e tone curve tornano
+completamente neutri, lasciando il target con la propria tonalità originale invece di quella
+(potenzialmente molto piatta) del campione. Quattro nuovi test: tre unitari sulla funzione di
+sfumatura (intensità 0 = invariato, intensità 1.0 = completamente neutro, intensità 0.5 = a metà
+strada, verificato punto per punto sulla tone curve) e uno end-to-end
+(`paste_look_from_sample_flattens_less_at_full_adaptation_strength_than_at_zero`) che verifica che
+il contrasto applicato a intensità massima non superi mai, in valore assoluto, quello a intensità
+zero.
+
+Misurato di nuovo sulla stessa foto vera con lo stesso "Incolla impostazioni" (intensità 100%,
+come nei test dell'utente): contrasto locale della pavimentazione 4.56 → **7.76**, cioè dal 55% al
+94% del contrasto originale (8.23) — praticamente ripristinato. Ispezionato visivamente a piena
+risoluzione: i lastroni della pavimentazione mostrano di nuovo la loro texture naturale invece di
+un grigio piatto uniforme.
+
+## Corretto (questo giro, giro precedente): aggiustamento HSL per banda applicato a piena forza anche su pixel quasi neri, dove la tonalità è inaffidabile
+
+Segnalato dall'utente dopo tutti i fix sopra, con due screenshot: "non ci siamo per niente...
+trova la causa di questo schifo". Indagando pixel per pixel una zona molto scura di una foto vera
+(la presa d'aria/griglia sotto il paraurti) è emerso un **quarto bug reale**, distinto dal "salto
+ripido fra bande" già corretto: l'aggiustamento hue-selettivo per banda (`interpolate_hsl_band`)
+viene scelto in base alla TONALITÀ del pixel, ma per un pixel quasi grigio (poco o nulla colorato)
+la tonalità è numericamente instabile — quando R, G e B sono tutti vicini fra loro e vicini a zero,
+il minimo rumore di sensore/JPEG (presente in QUALUNQUE foto reale) fa oscillare selvaggiamente
+quale canale risulti max/min, quindi la tonalità calcolata può saltare di decine o centinaia di
+gradi da un pixel al successivo pur essendo i due pixel visivamente identici.
+
+Un primo tentativo di correzione — pesare l'aggiustamento in base alla SATURAZIONE HSL del pixel
+(bassa saturazione = poco effetto) — è stato scartato dopo aver misurato che non funzionava:
+la formula classica della saturazione HSL, `s = d / (1 - |2L-1|)`, ha un polo esattamente a L=0 e
+L=1. Vicino al nero il denominatore tende a zero, quindi anche una croma assoluta minuscola (rumore
+vero, pochi millesimi) produce una saturazione HSL riportata vicina a 1.0 — l'OPPOSTO di "poco
+saturo". Pesare su quella saturazione avrebbe lasciato questi pixel a piena forza proprio dove
+serviva proteggerli di più. **Corretto** pesando invece sulla CROMA ASSOLUTA (`d = max(R,G,B) -
+min(R,G,B)`, sempre in 0..1, senza poli), ricavata algebricamente da saturazione e luminosità già
+disponibili (`d = s · (1 - |2L-1|)`) invece di ricalcolarla da capo. Sotto una soglia di croma
+(0.05) il peso dell'aggiustamento per banda sale con uno smoothstep invece di un taglio netto,
+esattamente come già fatto per i confini fra bande. Due nuovi test in `look-render`:
+`hue_band_weight_is_low_for_a_near_black_pixel_even_when_its_hsl_saturation_reads_high` (verifica
+diretta del motivo per cui il tentativo basato sulla saturazione HSL non bastava) e
+`near_black_pixels_are_shielded_from_per_band_hsl_noise_even_across_opposite_hue_bands`
+(end-to-end: due pixel quasi neri con la stessa saturazione HSL "ingannevole" ma tonalità agli
+antipodi, con un Look che ha un bias di banda molto diverso da un lato all'altro, non devono più
+divergere in croma finale).
+
+**Onestà su cosa questo fix cambia e cosa no**: è una correzione reale e verificata (un pixel quasi
+nero non riceve più un bias di saturazione arbitrario e diverso da quello del pixel accanto solo
+per rumore di tonalità), ma indagando a fondo la STESSA zona scura mostrata dall'utente
+(paraurti/griglia) è emerso che la "grana"/speckle visibile lì non è causata né amplificata da
+questo bug né da nessun'altra parte della pipeline: renderizzando la stessa foto vera con il Look
+completo di "Incolla impostazioni" e, per confronto, con un Look reso quasi nullo (solo il lift
+minimo, esposizione/bilanciamento del bianco/tone curve/contrasto/vibrance/bande HSL tutti
+azzerati o a identità), la grana in quella zona risulta IDENTICA nei due render — ed è già presente
+anche nell'anteprima ridotta SENZA alcun Look applicato. È rumore di sensore/compressione JPEG già
+presente nella foto originale, reso più visibile solo dallo zoom elevato usato per ispezionarlo, non
+qualcosa che questo motore introduce o amplifica. Una vera riduzione del rumore (già segnalata come
+limite noto e pianificata per una fase successiva della roadmap, vedi il commento di modulo in
+`look-render/src/lib.rs`) resta l'unico modo per attenuare ATTIVAMENTE quella grana specifica — non
+ancora implementata in questo giro.
+
+## Corretto (questo giro, giro precedente): rumore/"glitch" a chiazze sulla saturazione per un salto ripido fra bande HSL adiacenti
 
 Segnalato dall'utente dopo il fix sopra: "glitch non risolti". Il fix precedente (vibrance non
 lineare) risolveva la desaturazione media ma NON il glitch visibile a occhio — quindi si trattava

@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 76 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 83 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -670,6 +670,49 @@ circolare a 3 prese sulle bande HSL estratte, prima di applicare il Look. Salto 
 adiacenti sceso da 45 a 17 punti; metrica di rugosità (rumore ad alta frequenza, proxy autoprodotta)
 scesa da 2.13 a 1.96, ora sotto il valore della foto originale stessa (2.29). Dettagli tecnici,
 numeri completi e nuovo test in `engine/README.md`.
+
+## Corretto (questo giro): aggiustamento HSL per banda a piena forza su pixel quasi neri, e verifica seria della "grana" nel paraurti
+
+Dopo tutti i fix precedenti l'utente ha risposto con due screenshot: "non ci siamo per niente...
+trova la causa di questo schifo e risolvilo una volta per tutte", chiedendo esplicitamente di non
+rispondere finché la causa non fosse trovata. Ispezionando pixel per pixel la zona più scura delle
+sue foto vere (la presa d'aria/griglia sotto il paraurti) è emerso un bug reale distinto da tutti
+quelli già corretti: un pixel quasi grigio ha una tonalità numericamente instabile (il minimo
+rumore di sensore o compressione JPEG, presente in qualunque foto reale, fa oscillare selvaggiamente
+quale canale risulti max/min), ma l'aggiustamento hue-selettivo per banda veniva comunque applicato
+a piena forza, ignorando quanto fosse davvero colorato il pixel. Un primo tentativo di correzione
+(pesare in base alla saturazione HSL) è stato scartato dopo aver misurato che non funzionava — la
+formula della saturazione HSL ha un polo matematico vicino al nero puro che fa apparire "molto
+saturo" anche un pixel quasi nero con solo rumore minimo. **Corretto** pesando invece sulla croma
+assoluta (la vera differenza fra i canali, senza quel polo). Dettagli tecnici, formula e nuovi test
+in `engine/README.md`.
+
+**Verifica seria e onesta della grana visibile nel paraurti**: oltre al fix sopra, è stato
+verificato empiricamente SE la grana visibile in quella zona scura fosse causata dalla pipeline di
+elaborazione — renderizzando la stessa foto vera sia con il Look completo di "Incolla impostazioni"
+sia con un Look reso quasi nullo (tutti i controlli azzerati o a identità). La grana in quella zona
+è risultata IDENTICA nei due casi, ed è già presente anche nell'anteprima ridotta senza alcun Look
+applicato: è rumore di sensore/compressione JPEG già presente nella foto originale, reso più
+visibile solo dallo zoom elevato usato per ispezionarlo — non qualcosa che questo motore introduce o
+amplifica. Una vera riduzione del rumore (limite già noto e pianificato per una fase successiva
+della roadmap) resta l'unico modo per attenuare attivamente quella grana specifica, e non è ancora
+stata implementata in questo giro.
+
+## Corretto (questo giro): "Intensità adattamento" non attenuava affatto il contrasto/tone curve del campione
+
+Dopo il giro precedente l'utente ha inviato tre foto, chiarendo che il problema reale non era
+"grana" ma — testuale — "i rettangoli grigi che si creano e la mancanza totale di contrasto":
+la pavimentazione della foto (lastroni rettangolari con texture reale) diventava piatta e senza
+dettaglio dopo "Incolla impostazioni", a qualunque valore dello slider "Intensità adattamento".
+
+Causa reale: `contrast` e `tone_curve` — a differenza di esposizione/luci/ombre, già tarati in
+base a quello slider — venivano sempre copiati LETTERALMENTE dalla foto campione, ignorando
+completamente la posizione dello slider. Se il campione ha una grana volutamente piatta (come in
+questo caso), quella piattezza finiva sul target senza che l'utente avesse alcun modo di attenuarla
+con lo strumento pensato apposta per farlo. **Corretto** sfumando anche questi due campi verso un
+valore neutro in proporzione allo stesso slider, con lo stesso principio già usato per
+l'esposizione. Misurato sulla stessa foto vera: contrasto locale della pavimentazione tornato dal
+55% al 94% di quello originale. Dettagli tecnici e nuovi test in `engine/README.md`.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 

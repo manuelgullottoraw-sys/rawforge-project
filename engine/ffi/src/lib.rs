@@ -343,6 +343,58 @@ pub struct RenderedPreviewFfi {
     pub highlight_clip_fraction: f32,
 }
 
+/// **Bug reale scoperto e corretto in questo giro**: segnalato dall'utente
+/// come "rettangoli grigi" (i lastroni rettangolari della pavimentazione di
+/// una foto vera, appiattiti senza più la loro texture/variazione tonale) e
+/// "mancanza totale di contrasto" — misurato: il contrasto locale della
+/// pavimentazione crollava di circa il 45% dopo "Incolla impostazioni", A
+/// QUALUNQUE valore dello slider "Intensità adattamento". La causa:
+/// `contrast` e `tone_curve` (a differenza di `exposure_ev`, `highlights` e
+/// `shadows`, tutti e tre già tarati da chi chiama questa funzione in base
+/// allo stesso slider) venivano presi sempre e solo dal valore LETTERALE
+/// estratto dalla foto campione, per intero, quale che fosse la posizione
+/// dello slider — che quindi, per questi due campi, non faceva assolutamente
+/// nulla, in contraddizione con quanto promette la UI stessa ("0% =
+/// impostazioni identiche alla foto campione, 100% = massimo adattamento
+/// intelligente alla scena"): a 100% l'utente si aspetta MENO copiatura
+/// letterale del campione, non la stessa identica copia di uno slider a 0%.
+/// Se la foto campione ha una grana/palette scelta per un mood volutamente
+/// piatto (tone curve che alza le ombre e abbassa le luci, contrasto
+/// negativo), quella piattezza veniva trasferita in blocco sul target senza
+/// alcun modo per l'utente di attenuarla — l'unico slider pensato apposta
+/// per farlo (Intensità adattamento) non aveva alcun effetto su questi due
+/// campi.
+///
+/// Corretto sfumando ANCHE `contrast` e `tone_curve` verso il loro valore
+/// neutro (0 e curva identità, cioè "nessuna correzione") in proporzione a
+/// `strength` — stesso principio, stessa direzione di come `exposure_ev`
+/// viene già sfumato da chi chiama: più il cursore si sposta verso "massimo
+/// adattamento", meno letteralmente viene copiata la grana del campione. A
+/// `strength=0.0` il comportamento resta identico a prima (copia letterale
+/// del campione, come promesso); a `strength=1.0` contrasto e tone curve
+/// tornano completamente neutri, lasciando il target con la propria
+/// tonalità originale invece di quella (potenzialmente molto piatta) del
+/// campione. Modifica `adapted_base` sul posto; `original` è il Look
+/// letterale da cui sfumare (di solito lo stato di `adapted_base` prima di
+/// qualunque altra modifica, passato separatamente perché il chiamante può
+/// già aver cambiato `adapted_base.exposure_ev` nel frattempo).
+fn taper_contrast_and_tone_curve_toward_neutral(
+    adapted_base: &mut core_types::HarmonicLook,
+    original: &core_types::HarmonicLook,
+    strength: f32,
+) {
+    let strength = strength.clamp(0.0, 1.0);
+    adapted_base.contrast = (original.contrast as f32 * (1.0 - strength)).round() as i32;
+    adapted_base.tone_curve = original
+        .tone_curve
+        .iter()
+        .map(|&(x, y)| {
+            let blended = x as f32 + (y as f32 - x as f32) * (1.0 - strength);
+            (x, blended.round().clamp(0.0, 255.0) as u8)
+        })
+        .collect();
+}
+
 /// Una foto "da modificare" aperta per l'editing, con la sua decodifica già
 /// fatta e cacheiata in memoria (RAW-aware, via [`decode_any_photo`]) —
 /// un oggetto UniFFI vero e proprio (non solo funzioni), perché a differenza
@@ -446,6 +498,7 @@ impl PhotoEditSession {
 
         let mut adapted_base = base_look.clone();
         adapted_base.exposure_ev = base_look.exposure_ev * (1.0 - clamped_strength);
+        taper_contrast_and_tone_curve_toward_neutral(&mut adapted_base, &base_look, clamped_strength);
         let adapted_look = smartbatch::apply_deltas(&adapted_base, &deltas);
 
         let rendered = look_render::render_preview_with_look(&self.interactive_preview, &adapted_look);
@@ -644,6 +697,90 @@ mod tests {
             result.applied_look.exposure_ev.abs() <= 0.5 + f32::EPSILON,
             "esposizione applicata fuori dal guardrail Smart-Batch (max 0.5 EV): {}",
             result.applied_look.exposure_ev
+        );
+    }
+
+    #[test]
+    fn taper_contrast_and_tone_curve_leaves_look_literal_at_zero_strength() {
+        let mut original = core_types::HarmonicLook::default();
+        original.contrast = -60;
+        original.tone_curve = vec![(0, 0), (64, 100), (128, 128), (192, 140), (255, 255)];
+        let mut adapted = original.clone();
+
+        taper_contrast_and_tone_curve_toward_neutral(&mut adapted, &original, 0.0);
+
+        assert_eq!(adapted.contrast, original.contrast, "a intensità 0 il contrasto deve restare quello letterale del campione");
+        assert_eq!(adapted.tone_curve, original.tone_curve, "a intensità 0 la tone curve deve restare quella letterale del campione");
+    }
+
+    #[test]
+    fn taper_contrast_and_tone_curve_becomes_fully_neutral_at_max_strength() {
+        // Riproduce il bug reale segnalato dall'utente ("rettangoli grigi",
+        // "mancanza totale di contrasto"): a intensità massima, contrasto e
+        // tone curve non devono più portare NULLA del valore piatto/letterale
+        // estratto dal campione — deve restare solo la tonalità originale
+        // del target (contrasto neutro, curva identità x == y per ogni punto).
+        let mut original = core_types::HarmonicLook::default();
+        original.contrast = -60;
+        original.tone_curve = vec![(0, 0), (64, 100), (128, 128), (192, 140), (255, 255)];
+        let mut adapted = original.clone();
+
+        taper_contrast_and_tone_curve_toward_neutral(&mut adapted, &original, 1.0);
+
+        assert_eq!(adapted.contrast, 0, "a intensità 1.0 il contrasto deve azzerarsi (neutro)");
+        for &(x, y) in &adapted.tone_curve {
+            assert_eq!(y, x, "a intensità 1.0 ogni punto della tone curve deve tornare all'identità (x=y): punto ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn taper_contrast_and_tone_curve_is_a_partial_blend_at_half_strength() {
+        let mut original = core_types::HarmonicLook::default();
+        original.contrast = -60;
+        original.tone_curve = vec![(0, 0), (128, 178), (255, 255)]; // punto 128 -> 178, deviazione di +50 dall'identità
+        let mut adapted = original.clone();
+
+        taper_contrast_and_tone_curve_toward_neutral(&mut adapted, &original, 0.5);
+
+        assert_eq!(adapted.contrast, -30, "a metà intensità il contrasto deve dimezzarsi verso lo zero");
+        let mid_point = adapted.tone_curve.iter().find(|&&(x, _)| x == 128).unwrap();
+        assert_eq!(mid_point.1, 153, "a metà intensità la deviazione dall'identità (+50) deve dimezzarsi: atteso 128+25=153");
+    }
+
+    #[test]
+    fn paste_look_from_sample_flattens_less_at_full_adaptation_strength_than_at_zero() {
+        // End-to-end: una foto campione con un forte gradiente verticale (non
+        // tinta unita) produce dalla Sintesi Armonica un contrasto/tone curve
+        // non banali da estrarre. Il contrasto (in valore assoluto) applicato
+        // al target con intensità di adattamento MASSIMA (1.0) non deve mai
+        // superare quello applicato con intensità ZERO (copia letterale) —
+        // altrimenti il fix sopra non sarebbe collegato a "Incolla
+        // impostazioni".
+        use image::{ImageBuffer, Rgba};
+        let mut buf = Vec::new();
+        let gradient = ImageBuffer::from_fn(32, 32, |_, y| {
+            let v = (y * 255 / 31) as u8;
+            Rgba([v, v, v, 255])
+        });
+        image::DynamicImage::ImageRgba8(gradient)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let sample_bytes = buf;
+        let target_bytes = png_bytes_of_solid_color(6, [128, 128, 128]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+
+        let at_zero = session
+            .paste_look_from_sample(sample_bytes.clone(), "gradiente.png".to_string(), "L".to_string(), 0.0)
+            .unwrap();
+        let at_max = session
+            .paste_look_from_sample(sample_bytes, "gradiente.png".to_string(), "L".to_string(), 1.0)
+            .unwrap();
+
+        assert!(
+            at_max.applied_look.contrast.abs() <= at_zero.applied_look.contrast.abs(),
+            "il contrasto a intensità massima ({}) non deve superare in valore assoluto quello a intensità zero ({})",
+            at_max.applied_look.contrast,
+            at_zero.applied_look.contrast
         );
     }
 

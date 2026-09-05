@@ -115,6 +115,57 @@ fn interpolate_hsl_band(values: &[i32; 8], hue: f32) -> f32 {
     low_v + (high_v - low_v) * frac
 }
 
+/// Sotto quale CROMA ASSOLUTA (0..1, vedi `hue_band_weight`) del pixel
+/// l'aggiustamento HSL per banda viene attenuato invece che applicato a
+/// piena forza. Vedi il commento esteso su `hue_band_weight` per il bug
+/// reale che questa soglia corregge e per il motivo per cui è la croma
+/// ASSOLUTA — non la saturazione HSL — la quantità giusta da usare qui.
+const HUE_BAND_LOW_CHROMA_RAMP: f32 = 0.05;
+
+/// Peso (0..1) con cui applicare l'aggiustamento hue-selettivo per banda
+/// (estratto dalla Sintesi Armonica) a un pixel di croma assoluta `chroma`
+/// (0..1 — la `d = max(R,G,B) - min(R,G,B)` di `rgb_to_hsl`, PRIMA di
+/// qualunque aggiustamento). **Quarto bug reale, distinto dal precedente
+/// "salto ripido fra bande" già corretto**: `interpolate_hsl_band` sceglie
+/// l'aggiustamento in base alla TONALITÀ del pixel — ma per un pixel quasi
+/// grigio (poco o nulla colorato: cielo uniforme, asfalto in ombra, sotto lo
+/// scocco dell'auto) la tonalità è numericamente instabile. Quando R, G e B
+/// sono tutti vicini fra loro E vicini a zero, il minimo rumore del sensore
+/// o della compressione JPEG (presente in QUALUNQUE foto reale) fa oscillare
+/// selvaggiamente quale canale risulti max/min — e quindi la tonalità
+/// calcolata può saltare di decine o centinaia di gradi da un pixel al
+/// successivo, pur essendo i due pixel visivamente identici (grigio scuro).
+///
+/// **Un primo tentativo di questo fix pesava in base a `hsl[1]` (la
+/// saturazione HSL classica) e non ha funzionato**: misurato sulla foto
+/// vera, il glitch nel paraurti scuro restava quasi identico. La causa è
+/// nella formula stessa di `rgb_to_hsl`: `s = d / (1 - |2L - 1|)`, che ha un
+/// polo esattamente a L=0 e L=1 (nero e bianco puri) — vicino a L=0 il
+/// denominatore tende a zero, quindi anche una croma assoluta `d`
+/// minuscola (rumore reale, pochi millesimi) produce una saturazione HSL
+/// riportata vicina a 1.0, cioè l'OPPOSTO di "poco saturo": pesare su
+/// `hsl[1]` lasciava questi pixel a piena forza proprio dove serviva
+/// proteggerli di più. La croma assoluta `d` non ha questo polo (è sempre
+/// in 0..1, proporzionale alla vera differenza fra i canali) ed è la
+/// quantità che la Sintesi Armonica avrebbe dovuto guardare fin da
+/// principio per decidere "quanto è colorato davvero questo pixel".
+///
+/// La correzione applica lo stesso principio di qualunque editor HSL
+/// selettivo: un pixel che non ha (quasi) colore non ha nemmeno una
+/// tonalità affidabile da cui decidere QUANTO aggiustarlo, quindi va
+/// toccato poco o nulla, indipendentemente da cosa dice la tonalità
+/// calcolata. Sotto `HUE_BAND_LOW_CHROMA_RAMP` di croma il peso sale con
+/// uno smoothstep (0 a croma=0, 1 a croma=`HUE_BAND_LOW_CHROMA_RAMP`)
+/// invece di un taglio netto — un gradino produrrebbe comunque un contorno
+/// visibile ovunque la croma attraversasse quella soglia, lo stesso tipo di
+/// bug già corretto altrove per i confini fra bande. Sopra la soglia il
+/// peso resta 1.0: pixel già chiaramente colorati (pelle, cielo azzurro,
+/// fogliame) mantengono l'aggiustamento hue-selettivo pieno e immutato.
+fn hue_band_weight(chroma: f32) -> f32 {
+    let t = (chroma / HUE_BAND_LOW_CHROMA_RAMP).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t) // smoothstep
+}
+
 /// Peso (0..1) di quanto un pixel di luminanza `luma` (0..1, spazio sRGB)
 /// appartiene alla zona "ombre": pieno sotto 0.0, zero da 0.4 in su.
 fn shadow_mask(luma: f32) -> f32 {
@@ -438,9 +489,23 @@ pub fn render_preview_with_look(image: &DynamicImage, look: &HarmonicLook) -> Dy
                 // Interpolazione circolare fra bande adiacenti (vedi
                 // `interpolate_hsl_band`): niente più confine netto ogni 45°.
                 let mut hsl = rgb_to_hsl(srgb);
-                let hue_adjust = interpolate_hsl_band(&look.hsl.hue, hsl[0]);
-                let sat_adjust = interpolate_hsl_band(&look.hsl.sat, hsl[0]);
-                let lum_adjust = interpolate_hsl_band(&look.hsl.lum, hsl[0]);
+                // Peso hue-selettivo: vedi il commento esteso su
+                // `hue_band_weight` per il quarto bug reale che corregge
+                // (chiazze di rumore cromatico nelle zone scure/neutre dove
+                // la tonalità calcolata è instabile). Si ricava la croma
+                // ASSOLUTA (`d = max-min` di `rgb_to_hsl`) invertendo
+                // algebricamente la formula della saturazione HSL
+                // (`s = d / (1 - |2L-1|)`, quindi `d = s * (1 - |2L-1|)`)
+                // invece di ricalcolarla da `srgb` daccapo — stesso valore,
+                // niente di nuovo da importare. Va usata la croma assoluta e
+                // non `hsl[1]` (la saturazione HSL) proprio perché
+                // quest'ultima è instabile vicino al nero: vedi il commento
+                // su `hue_band_weight` per la spiegazione completa.
+                let chroma = hsl[1] * (1.0 - (2.0 * hsl[2] - 1.0).abs());
+                let band_weight = hue_band_weight(chroma);
+                let hue_adjust = interpolate_hsl_band(&look.hsl.hue, hsl[0]) * band_weight;
+                let sat_adjust = interpolate_hsl_band(&look.hsl.sat, hsl[0]) * band_weight;
+                let lum_adjust = interpolate_hsl_band(&look.hsl.lum, hsl[0]) * band_weight;
                 hsl[0] = (hsl[0] + hue_adjust).rem_euclid(360.0);
                 // Bias per banda (hue-selettivo, trasferito dal campione) e
                 // saturazione piatta (intento esplicito dell'utente) prima,
@@ -932,6 +997,88 @@ mod tests {
         assert!(
             vivid_relative_drop < 0.15,
             "un pixel molto saturo non deve perdere più del 15% della saturazione: calo={vivid_relative_drop:.3}"
+        );
+    }
+
+    #[test]
+    fn hue_band_weight_ramps_from_zero_to_one_and_stays_at_one_above_the_threshold() {
+        assert_eq!(hue_band_weight(0.0), 0.0);
+        assert_eq!(hue_band_weight(HUE_BAND_LOW_CHROMA_RAMP), 1.0);
+        assert_eq!(hue_band_weight(1.0), 1.0);
+        let mid = hue_band_weight(HUE_BAND_LOW_CHROMA_RAMP / 2.0);
+        assert!(mid > 0.0 && mid < 1.0, "il peso a metà rampa deve essere strettamente fra 0 e 1: {mid}");
+    }
+
+    #[test]
+    fn hue_band_weight_is_low_for_a_near_black_pixel_even_when_its_hsl_saturation_reads_high() {
+        // Verifica diretta del motivo per cui il primo tentativo di questo
+        // fix (pesare su `hsl[1]`, la saturazione HSL) non funzionava: vicino
+        // al nero (L piccola) la formula di `rgb_to_hsl` fa esplodere `s`
+        // anche per una croma assoluta minuscola. Un pixel con L=0.02 e
+        // saturazione HSL RIPORTATA di 0.5 (che con la vecchia soglia
+        // 0.12 avrebbe ricevuto peso 1.0, cioè PIENO effetto) ha in realtà
+        // una croma assoluta di appena 0.5*(1-|2*0.02-1|) = 0.5*0.04 = 0.02
+        // — praticamente nessun colore vero. Pesando sulla croma, il peso
+        // deve restare basso.
+        let l = 0.02_f32;
+        let s = 0.5_f32;
+        let chroma = s * (1.0 - (2.0 * l - 1.0).abs());
+        assert!(chroma < 0.03, "croma attesa minuscola per questo caso: {chroma}");
+        let weight = hue_band_weight(chroma);
+        assert!(
+            weight < 0.5,
+            "un pixel quasi nero non deve ricevere piena forza solo perché la sua saturazione HSL riportata è alta: chroma={chroma} peso={weight}"
+        );
+    }
+
+    #[test]
+    fn near_black_pixels_are_shielded_from_per_band_hsl_noise_even_across_opposite_hue_bands() {
+        // Regressione end-to-end del **quarto bug reale**, distinto dal
+        // precedente "salto ripido fra bande": un pixel quasi nero (come il
+        // paraurti scuro di una foto vera in ombra) ha una tonalità
+        // numericamente instabile — il minimo rumore di sensore o JPEG lo fa
+        // oscillare da una banda all'altra, E la sua saturazione HSL
+        // riportata può risultare artificialmente alta (vedi il test sopra e
+        // il commento esteso su `hue_band_weight`) anche quando la croma
+        // assoluta è minuscola. Se l'aggiustamento per banda venisse
+        // applicato a piena forza (o pesato sulla saturazione HSL invece che
+        // sulla croma), due pixel quasi identici — stessa luminanza quasi
+        // nera, stessa saturazione HSL "riportata", tonalità diversa solo
+        // per via del rumore — finirebbero con saturazioni finali molto
+        // diverse: la chiazza di rumore cromatico osservata sulla foto vera.
+        // Qui si simula il caso peggiore: due pixel quasi neri (L=0.02) con
+        // saturazione HSL riportata identica (0.5, volutamente alta per
+        // testare proprio il caso che il fix basato su `hsl[1]` non
+        // copriva) ma tonalità agli antipodi (10° contro 190°), con un Look
+        // che ha un bias di saturazione per banda molto diverso da un lato
+        // all'altro (+80 in una banda, -80 nella banda opposta).
+        let mut look = HarmonicLook::default();
+        look.hsl.sat[0] = 80; // banda centrata a 22.5° circa (copre l'hue=10°)
+        look.hsl.sat[4] = -80; // banda opposta, circa 202.5° (copre l'hue=190°)
+
+        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let low_hue_rgb = hsl_to_rgb([10.0, 0.5, 0.02]);
+        let high_hue_rgb = hsl_to_rgb([190.0, 0.5, 0.02]);
+        let img_low = solid_image(4, 4, [to_u8(low_hue_rgb[0]), to_u8(low_hue_rgb[1]), to_u8(low_hue_rgb[2])]);
+        let img_high = solid_image(4, 4, [to_u8(high_hue_rgb[0]), to_u8(high_hue_rgb[1]), to_u8(high_hue_rgb[2])]);
+
+        let rendered_low = render_preview_with_look(&img_low, &look).to_rgba8();
+        let rendered_high = render_preview_with_look(&img_high, &look).to_rgba8();
+
+        // Si confronta la CROMA ASSOLUTA finale, non la saturazione HSL: è
+        // proprio l'instabilità di quest'ultima vicino al nero il punto che
+        // questo test verifica, quindi usarla anche per l'assert
+        // renderebbe il confronto inaffidabile esattamente dove conta.
+        let px_to_chroma = |px: image::Rgba<u8>| {
+            let rgb = [px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0];
+            rgb.iter().cloned().fold(f32::MIN, f32::max) - rgb.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        let chroma_low = px_to_chroma(*rendered_low.get_pixel(0, 0));
+        let chroma_high = px_to_chroma(*rendered_high.get_pixel(0, 0));
+
+        assert!(
+            (chroma_low - chroma_high).abs() < 0.03,
+            "due pixel quasi neri non devono divergere in croma solo per un bias di banda opposto: chroma_low={chroma_low} chroma_high={chroma_high}"
         );
     }
 
