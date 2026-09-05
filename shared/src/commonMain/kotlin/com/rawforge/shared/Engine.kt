@@ -81,7 +81,31 @@ expect object Engine {
      * adattato — mai due calcoli separati che potrebbero divergere.
      */
     fun generateXmpForLook(look: EditableLook): Result<String>
+
+    /**
+     * Curva (256 pesi, 0f..1f, uno per bin di luma — stessa convenzione di
+     * bin di `RenderedPreview.luminanceHistogram`) di quanto lo slider tonale
+     * `kind` modifica ciascuna fascia dell'istogramma
+     * (`look_render::tonal_mask_curve` lato Rust: la STESSA funzione di
+     * maschera usata dal rendering reale, non una sua riscrittura qui).
+     * Indipendente dalla foto aperta — la UI la richiede una volta per
+     * ciascuno dei quattro valori e la tiene in cache (vedi `tonalMaskCurves`
+     * in `DevelopPanel`, `App.kt`), per disegnare sopra l'istogramma a
+     * schermo quale parte lo slider attualmente trascinato sta modificando
+     * (richiesta esplicita dell'utente: "aggiungi anche un istogramma a
+     * schermo che evidenzia le parti che stai modificando mentre muovi lo
+     * slider").
+     */
+    fun tonalMaskCurve(kind: TonalMaskKind): List<Float>
 }
+
+/**
+ * Controparte comune di `uniffi.rawforge_ffi.TonalMaskKindFfi` — stessa
+ * ragione di `MaskTarget` rispetto a `MaskTargetFfi`: quale dei quattro
+ * slider tonali mascherati per zona (Ombre/Luci/Neri/Bianchi) la UI vuole
+ * disegnare sopra l'istogramma a schermo.
+ */
+enum class TonalMaskKind { SHADOWS, HIGHLIGHTS, BLACKS, WHITES }
 
 /**
  * Una foto aperta per l'editing (vedi `Engine.openPhotoForEditing`). Incapsula
@@ -140,6 +164,21 @@ expect class PhotoEditSession {
      */
     fun renderFullResolutionExport(look: EditableLook): Result<FullResolutionExport>
 
+    /**
+     * Restituisce la foto attualmente aperta in questa sessione, con `look`
+     * applicato, codificata come PNG in memoria — pensata per essere passata
+     * subito come `sampleBytes`/`sampleFileName` (con un nome qualunque che
+     * finisca in ".png") a `pasteLookFromSample` di un'ALTRA sessione,
+     * durante un batch. Permette di usare come "foto campione" per la
+     * Sintesi Armonica/Smart-Batch uno scatto RAW già aperto e modificato a
+     * mano in questa stessa sessione, invece di richiedere sempre un file
+     * scelto da disco (richiesta esplicita dell'utente: "trova un modo per
+     * creare la foto di riferimento da uno scatto raw editato direttamente
+     * in app"). Economica quanto `renderPreview` (lavora sulla stessa copia
+     * ridotta), non quanto un export a piena risoluzione.
+     */
+    fun exportCurrentEditAsSamplePng(look: EditableLook): Result<ByteArray>
+
     /** Libera la foto decodificata cacheiata lato Rust. Va chiamata quando
      * questa sessione non serve più (nuova foto importata, o chiusura app). */
     fun close()
@@ -183,6 +222,13 @@ data class RenderedPreview(
     val imageBytes: ByteArray,
     val shadowClipFraction: Float,
     val highlightClipFraction: Float,
+    /** Istogramma di luminanza a 256 bin di QUESTO rendering (vedi
+     * `look_render::luminance_histogram` lato Rust) — aggiunto in questo
+     * giro per l'istogramma a schermo del pannello Develop (richiesta
+     * esplicita dell'utente), sincronizzato per costruzione con
+     * `imageBytes` invece di essere ricalcolato lato Kotlin da un giro
+     * separato di decodifica del PNG. */
+    val luminanceHistogram: List<Int>,
 )
 
 /**

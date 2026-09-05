@@ -22,6 +22,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -30,10 +31,12 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.withContext
@@ -63,12 +66,17 @@ private data class ImportState(
  * finché non è ancora arrivato un rendering dal motore — es. subito dopo
  * l'importazione) sono il segnale per "slider sicuri": la frazione di pixel
  * ai limiti dinamici dell'ULTIMO rendering, non dell'intero range possibile
- * di uno slider (vedi `RenderedPreview`). */
+ * di uno slider (vedi `RenderedPreview`). `luminanceHistogram` (aggiunto in
+ * questo giro) è l'istogramma a 256 bin di QUELLO STESSO rendering, per
+ * l'istogramma a schermo del pannello Develop — lista vuota (default) finché
+ * non è ancora arrivato un rendering vero, stesso significato di `null` per
+ * le due frazioni di clipping sopra. */
 private data class PreviewState(
     val bytes: ByteArray,
     val bitmap: ImageBitmap?,
     val shadowClipFraction: Float? = null,
     val highlightClipFraction: Float? = null,
+    val luminanceHistogram: List<Int> = emptyList(),
 )
 
 // Palette scura in stile "camera oscura" da software di editing fotografico
@@ -228,6 +236,10 @@ fun RawForgeApp() {
     var harmonicError by remember { mutableStateOf<String?>(null) }
     var presetSaveMessage by remember { mutableStateOf<String?>(null) }
     var presetSaveError by remember { mutableStateOf<String?>(null) }
+    // "Usa questa modifica come campione" (vedi `useCurrentEditAsSample` più
+    // sotto) — esito dell'ultima chiamata, mostrato nel pannello Develop.
+    var useAsSampleMessage by remember { mutableStateOf<String?>(null) }
+    var useAsSampleError by remember { mutableStateOf<String?>(null) }
 
     var targetState by remember { mutableStateOf<ImportState?>(null) }
     var targetError by remember { mutableStateOf<String?>(null) }
@@ -486,6 +498,8 @@ fun RawForgeApp() {
         saliencyBitmap = null
         saliencyBusy = false
         saliencyError = null
+        useAsSampleMessage = null
+        useAsSampleError = null
         if (target != null) {
             Engine.openPhotoForEditing(target.rawBytes, target.fileName).fold(
                 onSuccess = { opened -> session = opened },
@@ -511,6 +525,7 @@ fun RawForgeApp() {
                         decodeImageBitmapOrNull(rendered.imageBytes),
                         rendered.shadowClipFraction,
                         rendered.highlightClipFraction,
+                        rendered.luminanceHistogram,
                     )
                     renderError = null
                 },
@@ -708,6 +723,49 @@ fun RawForgeApp() {
         )
     }
 
+    // "Usa questa modifica come campione" (richiesta esplicita dell'utente:
+    // "trova un modo per creare la foto di riferimento da uno scatto raw
+    // editato direttamente in app"): prima la foto "campione" per la Sintesi
+    // Armonica/Smart-Batch (`sampleState`/`batchSampleState`) poteva venire
+    // SOLO da un file scelto da disco (`launchSamplePicker`/
+    // `launchBatchSamplePicker`) — non c'era modo di usare come riferimento
+    // uno scatto RAW già aperto e modificato a mano in questa stessa
+    // sessione. Renderizza lo stato attuale (Look corrente, scalato per
+    // `editIntensity` come ogni altro rendering/esportazione) in PNG
+    // (`exportCurrentEditAsSamplePng`, lato Rust: economico, lavora sulla
+    // copia ridotta — vedi il commento lì) e lo incapsula in un `ImportState`
+    // come una qualunque foto importata da file: da qui in poi è
+    // indistinguibile, per il resto della UI, da un campione scelto da
+    // disco. Aggiorna SIA `sampleState` (usato da "Incolla impostazioni" sulla
+    // foto singola) SIA `batchSampleState` (usato dall'elaborazione in
+    // batch): la stessa modifica appena fatta diventa subito disponibile in
+    // entrambi i contesti, senza dover ripetere l'operazione.
+    fun useCurrentEditAsSample() {
+        val activeSession = session ?: return
+        useAsSampleError = null
+        val baseName = (targetState?.fileName ?: "foto").substringBeforeLast('.').ifBlank { "foto" }
+        val sampleFileName = "${baseName}_campione.png"
+        activeSession.exportCurrentEditAsSamplePng(currentLook.scaledBy(editIntensity)).fold(
+            onSuccess = { pngBytes ->
+                val newSample = ImportState(
+                    fileName = sampleFileName,
+                    rawBytes = pngBytes,
+                    previewImageBytes = pngBytes,
+                    cameraLabel = targetState?.cameraLabel,
+                    bitmap = decodeImageBitmapOrNull(pngBytes),
+                )
+                sampleState = newSample
+                sampleError = null
+                batchSampleState = newSample
+                batchSampleError = null
+                useAsSampleMessage = "Foto corrente impostata come campione (\"$sampleFileName\")"
+            },
+            onFailure = { error ->
+                useAsSampleError = error.message ?: "Errore durante la creazione del campione"
+            }
+        )
+    }
+
     MaterialTheme(colors = RawForgeDarkColors) {
         Surface(modifier = Modifier.fillMaxSize(), color = PanelBackground) {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -781,6 +839,10 @@ fun RawForgeApp() {
                         renderError = renderError,
                         shadowClipFraction = preview?.shadowClipFraction,
                         highlightClipFraction = preview?.highlightClipFraction,
+                        luminanceHistogram = preview?.luminanceHistogram ?: emptyList(),
+                        onUseAsSample = { useCurrentEditAsSample() },
+                        useAsSampleMessage = useAsSampleMessage,
+                        useAsSampleError = useAsSampleError,
                     )
                 } else {
                 // Sotto una soglia di larghezza (telefoni, sia in verticale
@@ -1003,6 +1065,10 @@ fun RawForgeApp() {
                                     saliencyBitmap = saliencyBitmap,
                                     saliencyBusy = saliencyBusy,
                                     saliencyError = saliencyError,
+                                    luminanceHistogram = preview?.luminanceHistogram ?: emptyList(),
+                                    onUseAsSample = { useCurrentEditAsSample() },
+                                    useAsSampleMessage = useAsSampleMessage,
+                                    useAsSampleError = useAsSampleError,
                                 )
                             }
                         }
@@ -1082,6 +1148,10 @@ fun RawForgeApp() {
                                     saliencyBitmap = saliencyBitmap,
                                     saliencyBusy = saliencyBusy,
                                     saliencyError = saliencyError,
+                                    luminanceHistogram = preview?.luminanceHistogram ?: emptyList(),
+                                    onUseAsSample = { useCurrentEditAsSample() },
+                                    useAsSampleMessage = useAsSampleMessage,
+                                    useAsSampleError = useAsSampleError,
                                 )
                             }
                         }
@@ -1117,6 +1187,10 @@ private fun FullScreenDevelopView(
     renderError: String?,
     shadowClipFraction: Float?,
     highlightClipFraction: Float?,
+    luminanceHistogram: List<Int> = emptyList(),
+    onUseAsSample: (() -> Unit)? = null,
+    useAsSampleMessage: String? = null,
+    useAsSampleError: String? = null,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -1195,6 +1269,10 @@ private fun FullScreenDevelopView(
                         onEditIntensityChange = onEditIntensityChange,
                         shadowClipFraction = shadowClipFraction,
                         highlightClipFraction = highlightClipFraction,
+                        luminanceHistogram = luminanceHistogram,
+                        onUseAsSample = onUseAsSample,
+                        useAsSampleMessage = useAsSampleMessage,
+                        useAsSampleError = useAsSampleError,
                     )
                 }
             } else {
@@ -1211,6 +1289,10 @@ private fun FullScreenDevelopView(
                         shadowClipFraction = shadowClipFraction,
                         highlightClipFraction = highlightClipFraction,
                         shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
+                        luminanceHistogram = luminanceHistogram,
+                        onUseAsSample = onUseAsSample,
+                        useAsSampleMessage = useAsSampleMessage,
+                        useAsSampleError = useAsSampleError,
                     )
                 }
             }
@@ -1669,14 +1751,18 @@ private const val ZOOM_SENSITIVITY = 0.08f
  * Un `Image` che si ingrandisce/rimpicciolisce con la rotella del mouse
  * quando il cursore è sopra di esso (lo scroll è consegnato solo al
  * componente sotto il puntatore, non serve altro per limitarlo "quando si
- * passa sopra la foto col cursore"). Zoom centrato (nessun pan): scorrere in
- * avanti (lontano da sé) ingrandisce, scorrere all'indietro rimpicciolisce,
- * fino a tornare esattamente alla dimensione "adatta al riquadro" — mai più
- * piccola. `resetKey` azzera lo zoom quando cambia (es. una foto diversa
- * importata nello stesso riquadro): NON va legato al bitmap stesso, che
- * cambia ad ogni singolo fotogramma durante il rendering dal vivo mentre si
- * trascina uno slider — altrimenti lo zoom si azzererebbe continuamente
- * durante l'editing invece di restare stabile.
+ * passa sopra la foto col cursore"), e — **nuovo in questo giro, richiesta
+ * esplicita dell'utente** ("aggiungi la possibilità di trascinare
+ * l'immagine quando si zooma") — si può trascinare per spostare la vista
+ * una volta ingrandita oltre [MIN_ZOOM]: prima lo zoom era sempre centrato,
+ * senza modo di spostarsi su un dettaglio non al centro dell'inquadratura.
+ * Scorrere in avanti (lontano da sé) ingrandisce, scorrere all'indietro
+ * rimpicciolisce, fino a tornare esattamente alla dimensione "adatta al
+ * riquadro" — mai più piccola. `resetKey` azzera zoom e pan quando cambia
+ * (es. una foto diversa importata nello stesso riquadro): NON va legato al
+ * bitmap stesso, che cambia ad ogni singolo fotogramma durante il rendering
+ * dal vivo mentre si trascina uno slider — altrimenti zoom e pan si
+ * azzererebbero continuamente durante l'editing invece di restare stabili.
  */
 @Composable
 private fun ZoomableImage(
@@ -1686,31 +1772,85 @@ private fun ZoomableImage(
     modifier: Modifier = Modifier,
 ) {
     var zoom by remember(resetKey) { mutableStateOf(1f) }
-    Box(
-        modifier = modifier
-            .clipToBounds()
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        if (event.type == PointerEventType.Scroll) {
-                            val scrollDelta = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
-                            if (scrollDelta != 0f) {
-                                zoom = (zoom * (1f - scrollDelta * ZOOM_SENSITIVITY)).coerceIn(MIN_ZOOM, MAX_ZOOM)
-                                event.changes.forEach { it.consume() }
+    // Spostamento (in pixel del riquadro, NON scalati dallo zoom) applicato
+    // all'immagine mentre è ingrandita — vedi il commento sopra la funzione.
+    var offset by remember(resetKey) { mutableStateOf(Offset.Zero) }
+
+    BoxWithConstraints(modifier = modifier.clipToBounds()) {
+        val density = LocalDensity.current
+        val boxWidthPx = with(density) { maxWidth.toPx() }
+        val boxHeightPx = with(density) { maxHeight.toPx() }
+
+        // Il pan non può mai portare l'immagine così lontano da scoprire un
+        // bordo vuoto attorno ad essa: oltre metà dell'"eccedenza" introdotta
+        // dallo zoom (in ciascuna direzione, con `ContentScale.Fit` il
+        // riquadro pieno corrisponde circa alla dimensione dell'immagine a
+        // zoom=1) non ci sarebbe altro dettaglio della foto da mostrare, solo
+        // sfondo vuoto — lo stesso limite di qualunque visualizzatore foto
+        // con zoom+pan. A zoom=1 (`MIN_ZOOM`) l'eccedenza è 0, quindi
+        // `clampOffset` forza sempre l'offset a zero: coerente con "adatta al
+        // riquadro" restando sempre centrato quando non si è ingrandito.
+        fun clampOffset(candidate: Offset, currentZoom: Float): Offset {
+            val maxX = (boxWidthPx * (currentZoom - 1f) / 2f).coerceAtLeast(0f)
+            val maxY = (boxHeightPx * (currentZoom - 1f) / 2f).coerceAtLeast(0f)
+            return Offset(candidate.x.coerceIn(-maxX, maxX), candidate.y.coerceIn(-maxY, maxY))
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // Chiave su `boxWidthPx`/`boxHeightPx`, non solo `Unit`: senza
+                // questo, ridimensionare la finestra (Desktop) dopo aver
+                // ingrandito/spostato la vista lascerebbe questo blocco
+                // ancorato per sempre alle dimensioni del riquadro MISURATE AL
+                // PRIMO avvio (la coroutine di `pointerInput` non si
+                // riavvierebbe da sola), rendendo `clampOffset` scorretto da
+                // quel momento in poi. Riavviarsi solo quando la dimensione
+                // MISURATA cambia davvero (un ridimensionamento vero, non ogni
+                // fotogramma di rendering dal vivo) resta comunque economico.
+                .pointerInput(boxWidthPx, boxHeightPx) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            if (event.type == PointerEventType.Scroll) {
+                                val scrollDelta = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
+                                if (scrollDelta != 0f) {
+                                    val newZoom = (zoom * (1f - scrollDelta * ZOOM_SENSITIVITY)).coerceIn(MIN_ZOOM, MAX_ZOOM)
+                                    zoom = newZoom
+                                    // Ri-blocca subito il pan al nuovo livello di zoom (non solo
+                                    // quando torna esattamente a MIN_ZOOM): senza questo, rimpicciolire
+                                    // con la rotella mentre si è spostata la vista lascerebbe un
+                                    // offset ormai troppo grande per il nuovo zoom, "strappando" la
+                                    // foto fuori dal riquadro invece di restare coerente.
+                                    offset = clampOffset(offset, newZoom)
+                                    event.changes.forEach { it.consume() }
+                                }
                             }
                         }
                     }
                 }
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        Image(
-            bitmap = bitmap,
-            contentDescription = contentDescription,
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = zoom, scaleY = zoom),
-        )
+                .pointerInput(boxWidthPx, boxHeightPx) {
+                    detectDragGestures { change, dragAmount ->
+                        change.consume()
+                        if (zoom > MIN_ZOOM) {
+                            offset = clampOffset(offset + dragAmount, zoom)
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = contentDescription,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize().graphicsLayer(
+                    scaleX = zoom,
+                    scaleY = zoom,
+                    translationX = offset.x,
+                    translationY = offset.y,
+                ),
+            )
+        }
     }
 }
 
@@ -1747,6 +1887,22 @@ private fun DevelopPanel(
     saliencyBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
     saliencyBusy: Boolean = false,
     saliencyError: String? = null,
+    // Istogramma di luminanza (256 bin) dell'ULTIMO rendering mostrato a
+    // schermo (`RenderedPreview.luminanceHistogram` lato Kotlin,
+    // `look_render::luminance_histogram` lato Rust) — nuovo in questo giro,
+    // richiesta esplicita dell'utente ("aggiungi anche un istogramma a
+    // schermo"). Lista vuota (default) finché nessun rendering è ancora
+    // arrivato: `HistogramView` mostra allora un riquadro vuoto invece di
+    // un errore.
+    luminanceHistogram: List<Int> = emptyList(),
+    // "Usa questa modifica come campione" (richiesta esplicita dell'utente:
+    // "trova un modo per creare la foto di riferimento da uno scatto raw
+    // editato direttamente in app") — `null` (default) nasconde il pulsante,
+    // esattamente come `onDetectSubject`: non tutti i chiamanti di
+    // `DevelopPanel` hanno una sessione/foto campione da aggiornare.
+    onUseAsSample: (() -> Unit)? = null,
+    useAsSampleMessage: String? = null,
+    useAsSampleError: String? = null,
 ) {
     // "Slider sicuri" (idea approvata, vedi README.md): solo un avviso sul
     // valore CORRENTE — quanto di QUESTO rendering sta bruciando le luci o
@@ -1754,6 +1910,23 @@ private fun DevelopPanel(
     // slider (richiederebbe ri-renderizzare per ogni posizione possibile).
     val highlightsClipping = (highlightClipFraction ?: 0f) > CLIP_WARNING_THRESHOLD
     val shadowsClipping = (shadowClipFraction ?: 0f) > CLIP_WARNING_THRESHOLD
+
+    // Quale slider tonale mascherato per zona (Ombre/Alte luci/Bianchi/Neri)
+    // l'utente sta trascinando ORA — `null` quando nessuno (a riposo, o si
+    // sta muovendo un altro slider qualunque): `HistogramView` lo usa per
+    // evidenziare, sopra l'istogramma, solo la fascia tonale che quello
+    // specifico slider sta modificando (vedi il commento esteso su
+    // `HistogramView`). Impostato dagli `onChange`/svuotato dagli
+    // `onValueChangeFinished` dei quattro `IntSlider` nella sezione "Base"
+    // sotto — stato LOCALE a questo pannello (non c'è motivo di farlo
+    // risalire più in alto, nessun altro punto della UI ne ha bisogno).
+    var activeTonalMask by remember { mutableStateOf<TonalMaskKind?>(null) }
+    // Le quattro curve di maschera sono una proprietà della sola FORMULA
+    // (`look_render::tonal_mask_curve` lato Rust), non della foto aperta:
+    // calcolate una volta sola qui e tenute in cache per l'intera vita di
+    // questo pannello, non ricalcolate ad ogni fotogramma di trascinamento.
+    val tonalMaskCurves = remember { TonalMaskKind.values().associateWith { Engine.tonalMaskCurve(it) } }
+
     Column(
         modifier = modifier.background(PanelSurface, shape).verticalScroll(rememberScrollState()).padding(20.dp),
     ) {
@@ -1763,10 +1936,40 @@ private fun DevelopPanel(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Develop", style = MaterialTheme.typography.h6, fontWeight = FontWeight.Bold, color = TextPrimary)
-            TextButton(onClick = onReset, shape = PillShape) { Text("Reimposta", style = MaterialTheme.typography.caption) }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (onUseAsSample != null) {
+                    TextButton(onClick = onUseAsSample, shape = PillShape) {
+                        Text("Usa come campione", style = MaterialTheme.typography.caption)
+                    }
+                }
+                TextButton(onClick = onReset, shape = PillShape) { Text("Reimposta", style = MaterialTheme.typography.caption) }
+            }
+        }
+        (useAsSampleError ?: useAsSampleMessage)?.let {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                it,
+                style = MaterialTheme.typography.caption,
+                color = if (useAsSampleError != null) MaterialTheme.colors.error else TextMuted,
+            )
         }
         Spacer(Modifier.height(4.dp))
         Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(AccentGradient, shape = RoundedCornerShape(1.dp)))
+        Spacer(Modifier.height(12.dp))
+
+        HistogramView(
+            histogram = luminanceHistogram,
+            highlightCurve = activeTonalMask?.let { tonalMaskCurves[it] },
+            activeLabel = when (activeTonalMask) {
+                TonalMaskKind.SHADOWS -> "Ombre"
+                TonalMaskKind.HIGHLIGHTS -> "Alte luci"
+                TonalMaskKind.BLACKS -> "Neri"
+                TonalMaskKind.WHITES -> "Bianchi"
+                null -> null
+            },
+        )
+        Spacer(Modifier.height(12.dp))
+        Divider(color = PanelDivider, thickness = 1.dp)
         Spacer(Modifier.height(12.dp))
 
         // Dial "Intensità edit": scala l'INTERO editing verso lo zero (o lo
@@ -1789,17 +1992,33 @@ private fun DevelopPanel(
         Divider(color = PanelDivider, thickness = 1.dp)
         Spacer(Modifier.height(12.dp))
 
-        DevelopSection("Base") {
+        DevelopSection("Base", initiallyExpanded = true) {
             FloatSlider(
                 "Esposizione (EV)", look.exposureEv, -5f..5f,
                 warning = highlightsClipping || shadowsClipping,
                 onChange = { onEdit { l -> l.copy(exposureEv = it) } },
             ) { "%.2f".format(it) }
             IntSlider("Contrasto", look.contrast, -100..100) { onEdit { l -> l.copy(contrast = it) } }
-            IntSlider("Alte luci", look.highlights, -100..100, warning = highlightsClipping) { onEdit { l -> l.copy(highlights = it) } }
-            IntSlider("Ombre", look.shadows, -100..100, warning = shadowsClipping) { onEdit { l -> l.copy(shadows = it) } }
-            IntSlider("Bianchi", look.whites, -100..100, warning = highlightsClipping) { onEdit { l -> l.copy(whites = it) } }
-            IntSlider("Neri", look.blacks, -100..100, warning = shadowsClipping) { onEdit { l -> l.copy(blacks = it) } }
+            IntSlider(
+                "Alte luci", look.highlights, -100..100, warning = highlightsClipping,
+                onValueChangeFinished = { activeTonalMask = null },
+                onChange = { activeTonalMask = TonalMaskKind.HIGHLIGHTS; onEdit { l -> l.copy(highlights = it) } },
+            )
+            IntSlider(
+                "Ombre", look.shadows, -100..100, warning = shadowsClipping,
+                onValueChangeFinished = { activeTonalMask = null },
+                onChange = { activeTonalMask = TonalMaskKind.SHADOWS; onEdit { l -> l.copy(shadows = it) } },
+            )
+            IntSlider(
+                "Bianchi", look.whites, -100..100, warning = highlightsClipping,
+                onValueChangeFinished = { activeTonalMask = null },
+                onChange = { activeTonalMask = TonalMaskKind.WHITES; onEdit { l -> l.copy(whites = it) } },
+            )
+            IntSlider(
+                "Neri", look.blacks, -100..100, warning = shadowsClipping,
+                onValueChangeFinished = { activeTonalMask = null },
+                onChange = { activeTonalMask = TonalMaskKind.BLACKS; onEdit { l -> l.copy(blacks = it) } },
+            )
             if (highlightsClipping || shadowsClipping) {
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -2119,11 +2338,137 @@ private fun HslPanel(
     }
 }
 
+/** Altezza fissa del riquadro istogramma — leggibile senza rubare troppo
+ * spazio verticale al resto del pannello, che ha già il proprio scroll
+ * interno per le categorie sottostanti. */
+private val HistogramHeight = 90.dp
+
+/**
+ * Istogramma di luminanza (256 bin) del rendering corrente, con evidenziata
+ * — mentre l'utente trascina uno dei quattro slider tonali mascherati per
+ * zona (Ombre/Alte luci/Bianchi/Neri) — la fascia che quello slider sta
+ * davvero modificando (`highlightCurve`: uno dei quattro set di 256 pesi
+ * 0f..1f prodotti da `look_render::tonal_mask_curve` lato Rust — la STESSA
+ * funzione di maschera usata dal rendering reale, non una sua riscrittura
+ * qui: vedi `Engine.tonalMaskCurve`/`DevelopPanel`). Nuovo in questo giro,
+ * richiesta esplicita dell'utente ("aggiungi anche un istogramma a schermo
+ * che evidenzia le parti che stai modificando mentre muovi lo slider") —
+ * la stessa richiesta segnalava anche che Bianchi/Alte luci/Neri
+ * cambiavano "una parte piccolissima dell'istogramma": corretto lato Rust
+ * allargando le zone di `blacks_mask`/`whites_mask` (vedi
+ * `look-render/src/lib.rs`), qui la UI rende finalmente visibile QUALE
+ * parte, invece di lasciare che l'utente lo scopra solo dall'effetto sui
+ * pixel.
+ *
+ * Ogni barra è scalata con una radice quadrata (non linearmente) rispetto
+ * al bin più alto: un istogramma fotografico reale ha quasi sempre un
+ * bin/una fascia enormemente più popolata delle altre (es. il grigio medio
+ * dominante di una scena) — in scala lineare quel singolo picco
+ * schiaccerebbe ogni altro bin a un filo invisibile vicino allo zero,
+ * rendendo l'istogramma illeggibile ovunque tranne che al picco stesso.
+ * `sqrt` comprime il picco senza invertire l'ordine relativo dei bin (resta
+ * comunque il più alto): la stessa tecnica di compressione usata
+ * dall'istogramma di qualunque editor fotografico reale.
+ */
 @Composable
-private fun DevelopSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Text(title.uppercase(), style = MaterialTheme.typography.overline, color = AccentBlue, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(4.dp))
-    Column(content = content)
+private fun HistogramView(
+    histogram: List<Int>,
+    highlightCurve: List<Float>?,
+    activeLabel: String?,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        Text(
+            activeLabel?.let { "Istogramma — zona modificata: $it" } ?: "Istogramma",
+            style = MaterialTheme.typography.caption,
+            color = if (activeLabel != null) AccentBlue else TextMuted,
+        )
+        Spacer(Modifier.height(4.dp))
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(HistogramHeight)
+                .background(PanelBackground, InnerShape)
+                .border(1.dp, PanelDivider, InnerShape),
+        ) {
+            if (histogram.isEmpty()) return@Canvas
+            val w = size.width
+            val h = size.height
+            val maxCount = (histogram.maxOrNull() ?: 0).takeIf { it > 0 } ?: return@Canvas
+            val barWidth = w / histogram.size
+            for (i in histogram.indices) {
+                val normalized = sqrt(histogram[i].toFloat() / maxCount.toFloat())
+                val barHeight = normalized * h
+                if (barHeight <= 0f) continue
+                val x = i * barWidth
+                // Barra base: il profilo tonale "neutro" dell'istogramma,
+                // sempre visibile qualunque slider si stia muovendo (o
+                // nessuno).
+                drawRect(
+                    color = TextMuted,
+                    topLeft = Offset(x, h - barHeight),
+                    size = Size(barWidth, barHeight),
+                )
+                // Evidenziazione: sovrapposta SOLO dove `highlightCurve[i]`
+                // è positivo, con un'opacità proporzionale al peso della
+                // maschera in quel bin — un'evidenziazione "a scalino"
+                // (sì/no) suggerirebbe all'utente un confine netto che la
+                // maschera reale non ha (sfuma con continuità, vedi
+                // `look_render::tonal_mask_curve`).
+                val weight = highlightCurve?.getOrNull(i) ?: 0f
+                if (weight > 0f) {
+                    drawRect(
+                        color = AccentBlue.copy(alpha = (0.25f + weight * 0.65f).coerceIn(0f, 1f)),
+                        topLeft = Offset(x, h - barHeight),
+                        size = Size(barWidth, barHeight),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Una categoria di slider del pannello Develop, ora COLLASSABILE — richiesta
+ * esplicita dell'utente: "le categorie di slider rendile collassabili, così
+ * espando solo quelle che mi servono al momento" (prima ogni sezione era
+ * sempre interamente visibile, costringendo a scorrere un pannello lungo
+ * anche solo per raggiungere l'ultima categoria). Lo stato aperto/chiuso è
+ * `remember`ato SENZA una chiave esplicita: ogni chiamata a `DevelopSection`
+ * occupa una posizione fissa e distinta nel codice sorgente (sempre le
+ * stesse 9 categorie, sempre nello stesso ordine, mai dentro un `if`/ciclo
+ * condizionale), quindi la posizione nella slot table di Compose la
+ * distingue già da sola dalle altre — non serve legarla al `title` per
+ * evitare che due sezioni si scambino lo stato. `initiallyExpanded` esiste
+ * solo per far partire "Base" (la categoria più usata, esposizione/
+ * contrasto/luci/ombre/bianchi/neri — le stesse sempre aperte di default
+ * anche nel pannello Base di Lightroom) già aperta, tutte le altre partono
+ * chiuse.
+ */
+@Composable
+private fun DevelopSection(
+    title: String,
+    initiallyExpanded: Boolean = false,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    var expanded by remember { mutableStateOf(initiallyExpanded) }
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title.uppercase(), style = MaterialTheme.typography.overline, color = AccentBlue, fontWeight = FontWeight.Bold)
+        Text(
+            if (expanded) "▾" else "▸",
+            style = MaterialTheme.typography.overline,
+            color = AccentBlue,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+    if (expanded) {
+        Spacer(Modifier.height(4.dp))
+        Column(content = content)
+    }
     Spacer(Modifier.height(12.dp))
     Divider(color = PanelDivider, thickness = 1.dp)
     Spacer(Modifier.height(12.dp))
@@ -2143,6 +2488,13 @@ private fun IntSlider(
     range: IntRange,
     swatchColor: Color? = null,
     warning: Boolean = false,
+    // Chiamata al rilascio del trascinamento (non ad ogni tick, a differenza
+    // di `onChange`) — nuovo in questo giro, usato SOLO dai quattro slider
+    // tonali mascherati per zona (Ombre/Alte luci/Bianchi/Neri) per spegnere
+    // l'evidenziazione sull'istogramma quando l'utente smette di trascinare
+    // (vedi `HistogramView`/`activeTonalMask` in `DevelopPanel`). `null` per
+    // ogni altro slider: comportamento invariato.
+    onValueChangeFinished: (() -> Unit)? = null,
     onChange: (Int) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -2164,6 +2516,7 @@ private fun IntSlider(
         Slider(
             value = value.toFloat(),
             onValueChange = { onChange(it.roundToInt()) },
+            onValueChangeFinished = onValueChangeFinished,
             valueRange = range.first.toFloat()..range.last.toFloat(),
             colors = if (warning) {
                 SliderDefaults.colors(thumbColor = ClipWarningColor, activeTrackColor = ClipWarningColor)

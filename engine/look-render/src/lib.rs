@@ -296,39 +296,120 @@ fn hue_band_weight(chroma: f32) -> f32 {
     t * t * (3.0 - 2.0 * t) // smoothstep
 }
 
-/// Peso (0..1) di quanto un pixel di luminanza `luma` (0..1, spazio sRGB)
-/// appartiene alla zona "ombre": pieno sotto 0.0, zero da 0.4 in su.
-fn shadow_mask(luma: f32) -> f32 {
-    (1.0 - luma * 2.5).clamp(0.0, 1.0)
-}
-
-/// Come [`shadow_mask`] ma per la zona "luci": zero sotto 0.6, pieno a 1.0.
-fn highlight_mask(luma: f32) -> f32 {
-    ((luma - 0.6) * 2.5).clamp(0.0, 1.0)
-}
-
-/// **Bug reale scoperto e corretto in questo giro**: `look.whites`/`look.blacks`
-/// (gli slider "Bianchi"/"Neri" della UI, distinti da "Luci"/"Ombre") esistevano
-/// nel modello dati, attraversavano FFI e l'export `.xmp`, ma non venivano MAI
-/// letti da questo renderer — non avevano alcun effetto sull'immagine mostrata.
-/// Per l'utente che aveva impostato Neri=-60 in risposta all'avviso "ombre
-/// schiacciate" delle slider sicure, questo significava che l'unico strumento a
-/// disposizione per correggere l'avviso non faceva nulla, lasciando il problema
-/// visibile invariato.
+/// Ampiezza (in luma, 0..1) della zona "ombre"/"luci": condivisa da
+/// `shadow_mask` e `highlight_mask` così che le due zone restino
+/// simmetriche per costruzione (non due costanti separate che potrebbero
+/// scollegarsi silenziosamente in una modifica futura).
 ///
-/// `blacks_mask`/`whites_mask` seguono lo stesso schema di `shadow_mask`/
-/// `highlight_mask` ma con zone più STRETTE, mirate ai soli estremi tonali veri
-/// (nero/bianco pieno) invece dell'ampia metà inferiore/superiore del range
-/// tonale coperta da ombre/luci — la stessa distinzione concettuale che in
-/// Lightroom separa "Ombre"/"Luci" (zone ampie, morbide) da "Neri"/"Bianchi"
-/// (solo gli estremi, per fissare il punto di nero/bianco).
-fn blacks_mask(luma: f32) -> f32 {
-    (1.0 - luma * (1.0 / 0.12)).clamp(0.0, 1.0)
+/// **Allargata in questo giro** da 0.4 a 0.5 (era `luma * 2.5`, cioè un
+/// fattore che dava zero effetto già a luma=0.4): segnalato dall'utente
+/// ("gli slider di bianchi, alte luci e neri cambiano una parte
+/// piccolissima dell'istogramma") insieme al bug più marcato di
+/// `blacks_mask`/`whites_mask` qui sotto. Per "Luci" da solo l'effetto era
+/// meno drastico che per "Bianchi"/"Neri" (zona già ampia il 40% del range),
+/// ma su molte foto editoriali reali (esposizione corretta, poca pelle/cielo
+/// sopra luma 0.6) la fascia realmente "toccata" nell'istogramma a schermo
+/// resta comunque piccola: allargare leggermente la zona (fino a metà
+/// dell'intero range tonale, il punto naturale in cui ombre e luci si
+/// incontrano) fa sì che lo slider produca un cambiamento visibile su una
+/// porzione più ampia di istogrammi tipici, senza intaccare la sua funzione
+/// (restare "morbido", a differenza della zona stretta di Bianchi/Neri sotto).
+const TONAL_ZONE_WIDTH: f32 = 0.5;
+
+/// Peso (0..1) di quanto un pixel di luminanza `luma` (0..1, spazio sRGB)
+/// appartiene alla zona "ombre": pieno a 0.0, zero da [`TONAL_ZONE_WIDTH`] in su.
+fn shadow_mask(luma: f32) -> f32 {
+    (1.0 - luma / TONAL_ZONE_WIDTH).clamp(0.0, 1.0)
 }
 
-/// Come [`blacks_mask`] ma per la zona "bianchi": zero sotto 0.88, pieno a 1.0.
+/// Come [`shadow_mask`] ma per la zona "luci": zero sotto
+/// `1.0 - TONAL_ZONE_WIDTH`, pieno a 1.0.
+fn highlight_mask(luma: f32) -> f32 {
+    ((luma - (1.0 - TONAL_ZONE_WIDTH)) / TONAL_ZONE_WIDTH).clamp(0.0, 1.0)
+}
+
+/// **Bug reale scoperto e corretto in un giro precedente**: `look.whites`/
+/// `look.blacks` (gli slider "Bianchi"/"Neri" della UI, distinti da "Luci"/
+/// "Ombre") esistevano nel modello dati, attraversavano FFI e l'export
+/// `.xmp`, ma non venivano MAI letti da questo renderer — non avevano alcun
+/// effetto sull'immagine mostrata. Per l'utente che aveva impostato Neri=-60
+/// in risposta all'avviso "ombre schiacciate" delle slider sicure, questo
+/// significava che l'unico strumento a disposizione per correggere l'avviso
+/// non faceva nulla, lasciando il problema visibile invariato.
+///
+/// **Secondo bug reale, scoperto in QUESTO giro**: la zona di `blacks_mask`/
+/// `whites_mask` era larga solo 0.12 (12% del range tonale) — molto più
+/// stretta della zona 0.4 (poi 0.5, vedi [`TONAL_ZONE_WIDTH`]) di
+/// `shadow_mask`/`highlight_mask`. Segnalato dall'utente con foto vere:
+/// "gli slider di bianchi, alte luci e neri cambiano una parte piccolissima
+/// dell'istogramma" — su un istogramma tipico (poca massa di pixel
+/// esattamente a luma <=0.12 o >=0.88), il risultato era che questi due
+/// slider sembravano fare pochissimo, anche a valore massimo. La zona
+/// stretta era una scelta deliberata (per distinguere concettualmente
+/// "Neri"/"Bianchi", pensati per fissare il punto di nero/bianco, da
+/// "Ombre"/"Luci", zone ampie e morbide — la stessa distinzione di
+/// Lightroom) ma 0.12 era troppo stretta per essere uno strumento
+/// utilizzabile in pratica: a quell'ampiezza lo slider tocca solo pixel già
+/// vicinissimi al nero/bianco puro, che in una foto correttamente esposta
+/// sono spesso una frazione minima del totale.
+///
+/// Corretto riusando la STESSA zona ampia di `shadow_mask`/`highlight_mask`
+/// (niente più una costante di ampiezza separata da tenere sincronizzata a
+/// mano) ma con una caduta QUADRATICA invece che lineare
+/// (`shadow_mask(luma)^2`): il quadrato di un valore in 0..1 è sempre
+/// minore o uguale all'originale e scende più ripidamente vicino a 0,
+/// quindi la curva resta concentrata vicino al vero estremo tonale (il
+/// carattere "punto di nero/bianco" che li distingue da Ombre/Luci è
+/// preservato) ma ora si estende — sia pure con peso decrescente — su
+/// tutta la stessa fascia 0..0.5/0.5..1.0, non solo sul 12% più estremo:
+/// un cambiamento di questo slider è ora visibile su una porzione
+/// dell'istogramma paragonabile a quella di Ombre/Luci, invece di una
+/// piccola frazione di essa.
+fn blacks_mask(luma: f32) -> f32 {
+    shadow_mask(luma).powi(2)
+}
+
+/// Come [`blacks_mask`] ma per la zona "bianchi" — vedi lì per la spiegazione
+/// completa del fix.
 fn whites_mask(luma: f32) -> f32 {
-    ((luma - 0.88) * (1.0 / 0.12)).clamp(0.0, 1.0)
+    highlight_mask(luma).powi(2)
+}
+
+/// I quattro slider tonali mascherati per zona (Ombre/Luci/Neri/Bianchi) di
+/// [`render_look_core`] — usato da [`tonal_mask_curve`] per esporre alla UI
+/// QUALE parte dell'istogramma un dato slider sta modificando, campionando
+/// la stessa identica funzione di maschera usata dal rendering reale (non
+/// una sua riscrittura lato Kotlin, che potrebbe scollegarsi silenziosamente
+/// da questa in una modifica futura).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TonalMaskKind {
+    Shadows,
+    Highlights,
+    Blacks,
+    Whites,
+}
+
+/// Campiona la funzione di maschera di `kind` sui 256 valori di luma (0..255,
+/// stessa convenzione di bin di [`luminance_histogram`]) — pensato perché la
+/// UI possa disegnare, sopra l'istogramma a schermo, quale porzione di esso
+/// lo slider attualmente trascinato sta davvero modificando (richiesta
+/// esplicita dell'utente: "aggiungi anche un istogramma a schermo che
+/// evidenzia le parti che stai modificando mentre muovi lo slider"), un peso
+/// (0.0 = nessun effetto in quel bin, 1.0 = effetto pieno) per ciascun bin
+/// invece di un singolo numero — la maschera non è un confine netto, quindi
+/// nemmeno la sua rappresentazione a schermo deve esserlo.
+pub fn tonal_mask_curve(kind: TonalMaskKind) -> [f32; 256] {
+    let mask_fn: fn(f32) -> f32 = match kind {
+        TonalMaskKind::Shadows => shadow_mask,
+        TonalMaskKind::Highlights => highlight_mask,
+        TonalMaskKind::Blacks => blacks_mask,
+        TonalMaskKind::Whites => whites_mask,
+    };
+    let mut curve = [0f32; 256];
+    for (i, slot) in curve.iter_mut().enumerate() {
+        *slot = mask_fn(i as f32 / 255.0);
+    }
+    curve
 }
 
 /// Frazione (0.0..1.0) di pixel "vicini al nero puro" (luma <= 2) e "vicini al
@@ -1310,6 +1391,84 @@ mod tests {
         let mid_delta = mean_luma(&render_preview_with_look(&midtone, &look)) - mean_luma(&midtone);
         assert!(white_delta < mid_delta, "white_delta={white_delta} mid_delta={mid_delta}");
         assert!(white_delta < 0.0);
+    }
+
+    #[test]
+    fn blacks_mask_reaches_well_beyond_the_old_12_percent_zone() {
+        // Un pixel a luma=0.30 era completamente fuori dalla vecchia zona
+        // stretta (0..0.12, peso sempre 0 oltre 0.12) — ora deve avere un
+        // peso chiaramente positivo, perché la nuova zona si estende fino a
+        // `TONAL_ZONE_WIDTH` (0.5), la stessa di `shadow_mask`.
+        let weight_at_0_30 = blacks_mask(0.30);
+        assert!(weight_at_0_30 > 0.1, "weight_at_0_30={weight_at_0_30}");
+        // Resta comunque MOLTO più concentrata verso il vero nero della
+        // corrispondente `shadow_mask` (caduta quadratica, non lineare): a
+        // parità di luma il peso di `blacks_mask` è sempre <= quello di
+        // `shadow_mask` (il carattere "punto di nero", non "ombre ampie",
+        // che le distingue).
+        assert!(blacks_mask(0.30) < shadow_mask(0.30));
+        assert!(blacks_mask(0.05) < shadow_mask(0.05));
+    }
+
+    #[test]
+    fn whites_mask_reaches_well_beyond_the_old_12_percent_zone() {
+        // Simmetrico al test su `blacks_mask`: un pixel a luma=0.70 era
+        // completamente fuori dalla vecchia zona stretta (0.88..1.0).
+        let weight_at_0_70 = whites_mask(0.70);
+        assert!(weight_at_0_70 > 0.1, "weight_at_0_70={weight_at_0_70}");
+        assert!(whites_mask(0.70) < highlight_mask(0.70));
+        assert!(whites_mask(0.95) < highlight_mask(0.95));
+    }
+
+    #[test]
+    fn shadow_and_highlight_masks_meet_at_the_tonal_midpoint() {
+        // Con `TONAL_ZONE_WIDTH = 0.5` le due zone si toccano esattamente a
+        // luma=0.5 (né l'una né l'altra hanno più effetto oltre quel punto
+        // verso il centro) — nessuna sovrapposizione né buco imprevisto.
+        assert_eq!(shadow_mask(0.5), 0.0);
+        assert_eq!(highlight_mask(0.5), 0.0);
+        assert!(shadow_mask(0.49) > 0.0);
+        assert!(highlight_mask(0.51) > 0.0);
+    }
+
+    #[test]
+    fn tonal_mask_curve_matches_the_underlying_mask_function_at_every_bin() {
+        for (kind, mask_fn) in [
+            (TonalMaskKind::Shadows, shadow_mask as fn(f32) -> f32),
+            (TonalMaskKind::Highlights, highlight_mask as fn(f32) -> f32),
+            (TonalMaskKind::Blacks, blacks_mask as fn(f32) -> f32),
+            (TonalMaskKind::Whites, whites_mask as fn(f32) -> f32),
+        ] {
+            let curve = tonal_mask_curve(kind);
+            for i in 0..256 {
+                let expected = mask_fn(i as f32 / 255.0);
+                assert!(
+                    (curve[i] - expected).abs() < 1e-6,
+                    "kind={kind:?} i={i} curve={} expected={expected}",
+                    curve[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tonal_mask_curve_is_zero_at_the_start_for_shadows_and_blacks() {
+        let shadows = tonal_mask_curve(TonalMaskKind::Shadows);
+        let blacks = tonal_mask_curve(TonalMaskKind::Blacks);
+        assert_eq!(shadows[0], 1.0);
+        assert_eq!(blacks[0], 1.0);
+        assert_eq!(shadows[255], 0.0);
+        assert_eq!(blacks[255], 0.0);
+    }
+
+    #[test]
+    fn tonal_mask_curve_is_full_at_the_end_for_highlights_and_whites() {
+        let highlights = tonal_mask_curve(TonalMaskKind::Highlights);
+        let whites = tonal_mask_curve(TonalMaskKind::Whites);
+        assert_eq!(highlights[255], 1.0);
+        assert_eq!(whites[255], 1.0);
+        assert_eq!(highlights[0], 0.0);
+        assert_eq!(whites[0], 0.0);
     }
 
     #[test]

@@ -3,6 +3,7 @@ package com.rawforge.shared
 import uniffi.rawforge_ffi.HarmonicLookFfi
 import uniffi.rawforge_ffi.MaskTargetFfi
 import uniffi.rawforge_ffi.SubjectMaskFfi
+import uniffi.rawforge_ffi.TonalMaskKindFfi
 import uniffi.rawforge_ffi.TonePointFfi
 import uniffi.rawforge_ffi.decodeRawFilePreview
 import uniffi.rawforge_ffi.engineVersion
@@ -12,6 +13,7 @@ import uniffi.rawforge_ffi.generateLightroomPresetXmp
 import uniffi.rawforge_ffi.isKnownRawFileName
 import uniffi.rawforge_ffi.PhotoEditSession as NativePhotoEditSession
 import uniffi.rawforge_ffi.computeSubjectSaliencyPreview as nativeComputeSubjectSaliencyPreview
+import uniffi.rawforge_ffi.tonalMaskCurve as nativeTonalMaskCurve
 
 private fun MaskTarget.toFfi(): MaskTargetFfi = when (this) {
     MaskTarget.SUBJECT -> MaskTargetFfi.SUBJECT
@@ -21,6 +23,13 @@ private fun MaskTarget.toFfi(): MaskTargetFfi = when (this) {
 private fun MaskTargetFfi.toCommon(): MaskTarget = when (this) {
     MaskTargetFfi.SUBJECT -> MaskTarget.SUBJECT
     MaskTargetFfi.BACKGROUND -> MaskTarget.BACKGROUND
+}
+
+private fun TonalMaskKind.toFfi(): TonalMaskKindFfi = when (this) {
+    TonalMaskKind.SHADOWS -> TonalMaskKindFfi.SHADOWS
+    TonalMaskKind.HIGHLIGHTS -> TonalMaskKindFfi.HIGHLIGHTS
+    TonalMaskKind.BLACKS -> TonalMaskKindFfi.BLACKS
+    TonalMaskKind.WHITES -> TonalMaskKindFfi.WHITES
 }
 
 /**
@@ -131,6 +140,7 @@ actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
             imageBytes = result.previewPngBytes,
             shadowClipFraction = result.shadowClipFraction,
             highlightClipFraction = result.highlightClipFraction,
+            luminanceHistogram = result.luminanceHistogram.map { it.toInt() },
         )
     }
 
@@ -140,6 +150,10 @@ actual class PhotoEditSession(private val inner: NativePhotoEditSession) {
             jpegBytes = result.jpegBytes,
             masterTiffBytes = result.masterTiffBytes,
         )
+    }
+
+    actual fun exportCurrentEditAsSamplePng(look: EditableLook): Result<ByteArray> = runCatching {
+        inner.exportCurrentEditAsSamplePng(look.toFfi())
     }
 
     actual fun close() = inner.close()
@@ -242,4 +256,6 @@ actual object Engine {
     actual fun generateXmpForLook(look: EditableLook): Result<String> = runCatching {
         generateLightroomPresetXmp(look.toFfi())
     }
+
+    actual fun tonalMaskCurve(kind: TonalMaskKind): List<Float> = nativeTonalMaskCurve(kind.toFfi())
 }

@@ -4,8 +4,8 @@ Workspace del motore nativo di RawForge, come descritto in `../docs/ARCHITECTURE
 
 ## Stato attuale
 
-Crate reali, compilati e testati (142 test, tutti verdi — `color_science` 6, `core_types` 0,
-`gpu_pipe` 3, `harmonic` 21, `look_render` 45, `metadata` 3, `raw_decode` 20, `ffi` 36, `smartbatch`
+Crate reali, compilati e testati (152 test, tutti verdi — `color_science` 6, `core_types` 0,
+`gpu_pipe` 3, `harmonic` 21, `look_render` 51, `metadata` 3, `raw_decode` 20, `ffi` 40, `smartbatch`
 5, `xmp` 3):
 
 | Crate | Cosa fa | Rif. architettura |
@@ -959,6 +959,79 @@ progetto) — X-Trans e altri layout CFA restano esplicitamente rifiutati, non s
 mal gestiti. Le modifiche Kotlin (nuovo tipo `FullResolutionExport`, due selettori di destinazione in
 sequenza per JPEG+TIFF sulla foto singola, doppia scrittura per il batch) restano non verificate da
 un compilatore in questo ambiente, come sempre in questo progetto — verifica alla prossima build CI.
+
+## Nuovo/Corretto (questo giro): zone tonali di Bianchi/Alte luci/Neri allargate, istogramma a schermo, campione dalla foto già modificata
+
+Richiesta dell'utente (verbatim): *"ho notato che gli slider di bianchi, alte luci e neri cambiano
+una parte piccolissima dell'istogramma, risolvi e aggiungi anche un istogramma a schermo che
+evidenzia le parti che stai modificando mentre muovi lo slider"*, più — nello stesso messaggio —
+"trova un modo per creare la foto di riferimento da uno scatto raw editato direttamente in app",
+"aggiungi la possibilità di trascinare l'immagine quando si zooma" e "le categorie di slider rendile
+collassabili". Le prime due (mascheratura tonale + istogramma) toccano `look-render`/`ffi`, quindi
+sono la parte verificabile con `cargo test` in questo ambiente; le altre tre sono solo Kotlin (vedi
+`../README.md` per i dettagli lato UI) e restano non verificate da un compilatore qui, come sempre
+in questo progetto.
+
+**Bug reale corretto: `blacks_mask`/`whites_mask` (`look-render/src/lib.rs`)**. Le due funzioni
+avevano una zona d'effetto larga solo 0.12 (12% del range tonale 0..1) contro lo 0.4 di
+`shadow_mask`/`highlight_mask` — una scelta deliberata all'epoca (distinguere concettualmente
+"Neri"/"Bianchi", pensati per il solo punto di nero/bianco, da "Ombre"/"Luci", zone ampie e morbide),
+ma 0.12 era troppo stretta per essere uno strumento utilizzabile in pratica: su un istogramma tipico
+(poca massa di pixel esattamente a luma <=0.12 o >=0.88) lo slider sembrava fare pochissimo anche a
+valore massimo — esattamente il sintomo segnalato. Corretto riusando la stessa ampiezza di
+`shadow_mask`/`highlight_mask` (introdotta una singola costante condivisa, `TONAL_ZONE_WIDTH = 0.5`,
+allargata anche lei da 0.4: la stessa segnalazione includeva "alte luci" fra gli slider con effetto
+troppo piccolo) ma con una caduta QUADRATICA invece che lineare (`blacks_mask(luma) =
+shadow_mask(luma)^2`, idem per `whites_mask`/`highlight_mask`): il quadrato di un valore 0..1 è
+sempre <= l'originale e scende più ripidamente vicino al centro del range tonale, quindi la curva
+resta concentrata verso il vero estremo (il carattere "punto di nero/bianco" che distingue questi due
+slider da Ombre/Luci non si perde) ma ora si estende, sia pure con peso via via decrescente, su tutta
+la stessa fascia 0..0.5/0.5..1.0 — non solo sul 12% più estremo. 6 nuovi test in `look-render` (51
+totali, era 45): verificano che un pixel a luma 0.30 (blacks) o 0.70 (whites) — completamente FUORI
+dalla vecchia zona stretta — abbia ora un peso chiaramente positivo, che la nuova maschera resti
+comunque sempre <= la corrispondente `shadow_mask`/`highlight_mask` a parità di luma (non "diventata
+uguale a Ombre/Luci", solo meno inutilmente stretta), che le due zone Ombre/Luci si incontrino
+esattamente al centro (luma 0.5, nessun buco né sovrapposizione inattesa), e — per la nuova
+`tonal_mask_curve` sotto — che la curva campionata corrisponda esattamente alla funzione di maschera
+sottostante in tutti i 256 bin.
+
+**Nuovo: `look_render::tonal_mask_curve`/`TonalMaskKind`**. Campiona una delle quattro funzioni di
+maschera (Ombre/Alte luci/Neri/Bianchi) sui 256 valori di luma, nella stessa convenzione di bin di
+`luminance_histogram` — pensata perché la UI possa disegnare, sopra l'istogramma a schermo, quale
+porzione di esso lo slider attualmente trascinato sta davvero modificando (la richiesta esplicita
+dell'utente). Riusa le stesse funzioni `shadow_mask`/`highlight_mask`/`blacks_mask`/`whites_mask` del
+rendering reale — nessuna riscrittura della formula lato Kotlin che potrebbe scollegarsi da questa in
+una modifica futura.
+
+**Nuovo lato `rawforge-ffi`**:
+- `RenderedPreviewFfi` guadagna un campo `luminance_histogram: Vec<u32>` (256 bin), calcolato in
+  `PhotoEditSession::render_preview` sullo STESSO rendering appena prodotto (`look_render::
+  luminance_histogram`) — arriva già pronto ad ogni tick di trascinamento di uno slider,
+  sincronizzato per costruzione con l'anteprima PNG che lo accompagna, non ricalcolato lato Kotlin da
+  un giro separato di decodifica del PNG.
+- Nuova funzione top-level `tonal_mask_curve(kind: TonalMaskKindFfi) -> Vec<f32>` — espone
+  `look_render::tonal_mask_curve` alla UI; indipendente dalla foto aperta (una proprietà della sola
+  formula), quindi la UI la richiede una volta per ciascuno dei quattro valori e la tiene in cache.
+- Nuovo metodo `PhotoEditSession::export_current_edit_as_sample_png(look) -> Vec<u8>` — restituisce
+  la foto attualmente aperta in editing, con `look` applicato, codificata come PNG in memoria: pensata
+  per rientrare subito come `sample_bytes`/`sample_file_name` in `paste_look_from_sample` di un'ALTRA
+  sessione, così una foto RAW già aperta e modificata a mano diventa la "foto campione" per la Sintesi
+  Armonica/Smart-Batch senza dover passare da un file scelto da disco (la richiesta esplicita
+  dell'utente). PNG e non JPEG: l'estrazione del Look legge istogrammi e bande di tonalità — una
+  compressione con perdita introdurrebbe negli stessi istogrammi/bande artefatti di blocco/colore
+  che il rendering originale non ha. Lavora sulla copia RIDOTTA (`interactive_preview`), non su
+  `full_res`: l'estrazione del Look è una statistica sull'intera immagine, non un dettaglio
+  pixel-per-pixel, quindi economica quanto `render_preview`, non quanto un export a piena
+  risoluzione.
+
+**Verifica**: workspace passato da 148 a 152 test (`look_render` 45 -> 51 già contati sopra, `ffi` 36
+-> 40). I 4 nuovi test `ffi`: l'istogramma di `render_preview` ha sempre 256 bin e la somma corrisponde
+esattamente al numero di pixel dell'anteprima; `tonal_mask_curve` (la funzione FFI) restituisce
+per ciascuno dei quattro valori esattamente gli stessi 256 pesi della funzione `look_render`
+sottostante; `export_current_edit_as_sample_png` produce un PNG valido, decodificabile, alla
+dimensione della copia ridotta; e — il test che verifica la ragion d'essere del metodo — i bytes che
+produce sono accettati senza errori da `paste_look_from_sample` di un'altra sessione, esattamente come
+un file scelto da disco.
 
 ## Comandi
 

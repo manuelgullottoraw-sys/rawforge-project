@@ -46,6 +46,40 @@ impl From<MaskTargetFfi> for core_types::MaskTarget {
     }
 }
 
+/// Controparte UniFFI di `look_render::TonalMaskKind` — quale dei quattro
+/// slider tonali mascherati per zona (Ombre/Luci/Neri/Bianchi) la UI vuole
+/// disegnare sopra l'istogramma a schermo (vedi [`tonal_mask_curve`]).
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TonalMaskKindFfi {
+    Shadows,
+    Highlights,
+    Blacks,
+    Whites,
+}
+
+impl From<TonalMaskKindFfi> for look_render::TonalMaskKind {
+    fn from(kind: TonalMaskKindFfi) -> Self {
+        match kind {
+            TonalMaskKindFfi::Shadows => look_render::TonalMaskKind::Shadows,
+            TonalMaskKindFfi::Highlights => look_render::TonalMaskKind::Highlights,
+            TonalMaskKindFfi::Blacks => look_render::TonalMaskKind::Blacks,
+            TonalMaskKindFfi::Whites => look_render::TonalMaskKind::Whites,
+        }
+    }
+}
+
+/// Espone `look_render::tonal_mask_curve` alla UI: 256 pesi (0.0..1.0, uno
+/// per bin di luma, stessa convenzione di `RenderedPreviewFfi::
+/// luminance_histogram`) che dicono quanto lo slider `kind` sta modificando
+/// ciascuna fascia tonale — indipendente dalla foto aperta (è una proprietà
+/// della sola formula di maschera, non dei suoi pixel), quindi la UI può
+/// chiamarlo una volta sola per ciascuno dei quattro valori e tenere il
+/// risultato in cache, invece di richiederlo ad ogni tick di trascinamento.
+#[uniffi::export]
+pub fn tonal_mask_curve(kind: TonalMaskKindFfi) -> Vec<f32> {
+    look_render::tonal_mask_curve(kind.into()).to_vec()
+}
+
 /// Controparte UniFFI di `core_types::SubjectMask` — vedi lì per la
 /// spiegazione completa dei campi.
 #[derive(uniffi::Record, Clone, Debug)]
@@ -587,11 +621,20 @@ fn downscale_for_interactive_preview(image: &image::DynamicImage) -> image::Dyna
 /// valore ATTUALE sta bruciando le luci o schiacciando le ombre. Calcolato
 /// solo sul rendering appena prodotto, non su ogni possibile valore dello
 /// slider (vedi `look_render::clipping_fractions`).
+///
+/// `luminance_histogram` (aggiunto in questo giro, richiesta esplicita
+/// dell'utente: "aggiungi anche un istogramma a schermo") — 256 bin,
+/// calcolato sullo STESSO rendering appena prodotto (`look_render::
+/// luminance_histogram`), non ricalcolato lato Kotlin da un giro separato di
+/// decodifica del PNG appena ricevuto: arriva già pronto ad ogni tick di
+/// trascinamento di uno slider, sincronizzato per costruzione con quello che
+/// l'utente vede a schermo.
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct RenderedPreviewFfi {
     pub preview_png_bytes: Vec<u8>,
     pub shadow_clip_fraction: f32,
     pub highlight_clip_fraction: f32,
+    pub luminance_histogram: Vec<u32>,
 }
 
 /// **Bug reale scoperto e corretto in questo giro**: segnalato dall'utente
@@ -739,12 +782,57 @@ impl PhotoEditSession {
         let core_look: core_types::HarmonicLook = look.into();
         let rendered = look_render::render_preview_with_look(&self.interactive_preview, &core_look);
         let (shadow_clip_fraction, highlight_clip_fraction) = look_render::clipping_fractions(&rendered);
+        let luminance_histogram = look_render::luminance_histogram(&rendered).to_vec();
         let preview_png_bytes = encode_preview_as_png(&rendered)?;
         Ok(RenderedPreviewFfi {
             preview_png_bytes,
             shadow_clip_fraction,
             highlight_clip_fraction,
+            luminance_histogram,
         })
+    }
+
+    /// Restituisce la foto attualmente aperta in editing, con il Look
+    /// CORRENTE (passato da chi chiama — di solito lo stato attuale dei
+    /// controlli del pannello "Develop") già applicato, codificata come PNG
+    /// in memoria — pensata per essere passata come `sample_bytes` (con
+    /// `sample_file_name` una stringa qualunque terminante in `.png`, così
+    /// `decode_any_photo` non la scambia per un file RAW) a
+    /// `paste_look_from_sample`, chiamato su ALTRE sessioni di editing
+    /// durante un batch.
+    ///
+    /// **Perché serve** (richiesta esplicita dell'utente: "trova un modo per
+    /// creare la foto di riferimento da uno scatto raw editato direttamente
+    /// in app"): prima di questo metodo, la foto "campione" per la Sintesi
+    /// Armonica/Smart-Batch poteva venire SOLO da un file scelto da disco —
+    /// non c'era modo di usare come riferimento uno scatto RAW che l'utente
+    /// aveva già aperto e modificato manualmente in questa stessa sessione.
+    /// Questo metodo chiude quel buco: renderizza lo stato attuale (Look
+    /// applicato) e restituisce bytes pronti per rientrare, invariati, nello
+    /// stesso punto d'ingresso già usato per un file esterno — nessuna nuova
+    /// via di estrazione del Look da mantenere in parallelo.
+    ///
+    /// PNG, non JPEG: l'estrazione del Look legge istogrammi e bande di
+    /// tonalità (`harmonic::extract_look_from_reference`,
+    /// `analyze_hue_bands`) — una compressione con perdita introdurrebbe
+    /// proprio negli istogrammi/bande che quell'analisi misura artefatti di
+    /// blocco/colore che non esistono nel rendering originale, per un
+    /// beneficio (dimensione del file) che qui non serve: questi bytes non
+    /// vengono mai scritti su disco né mostrati, solo ridecodificati subito
+    /// dopo da `paste_look_from_sample`.
+    ///
+    /// Lavora sulla copia ridotta (`interactive_preview`), non su
+    /// `full_res`: l'estrazione del Look è una statistica sull'INTERA
+    /// immagine (istogrammi, bande di tonalità), non un dettaglio
+    /// pixel-per-pixel — la stessa approssimazione già accettata per il
+    /// rendering interattivo (`INTERACTIVE_PREVIEW_MAX_DIM`) vale anche qui,
+    /// e mantiene questa operazione economica quanto un `render_preview`
+    /// (chiamabile su un click, non solo in un contesto batch offline), non
+    /// quanto un export a piena risoluzione.
+    pub fn export_current_edit_as_sample_png(&self, look: HarmonicLookFfi) -> Result<Vec<u8>, EngineError> {
+        let core_look: core_types::HarmonicLook = look.into();
+        let rendered = look_render::render_preview_with_look(&self.interactive_preview, &core_look);
+        encode_preview_as_png(&rendered)
     }
 
     /// Rendering a piena risoluzione — per un RAW vero, dal demosaic COMPLETO
@@ -1276,6 +1364,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_preview_luminance_histogram_has_256_bins_summing_to_pixel_count() {
+        // Nuovo in questo giro (richiesta esplicita dell'utente: "aggiungi
+        // anche un istogramma a schermo"): l'istogramma restituito da
+        // `render_preview` deve avere sempre 256 bin (una voce per livello di
+        // luma 0..255) e la somma di tutti i bin deve corrispondere
+        // esattamente al numero di pixel dell'anteprima renderizzata —
+        // altrimenti la UI disegnerebbe un istogramma silenziosamente
+        // incompleto o con pixel contati più volte.
+        let target_bytes = png_bytes_of_solid_color(6, [128, 64, 32]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+
+        let result = session.render_preview(look).unwrap();
+        assert_eq!(result.luminance_histogram.len(), 256);
+        let total: u64 = result.luminance_histogram.iter().map(|&c| c as u64).sum();
+        assert_eq!(total, 6 * 6, "la somma dei bin deve contare ogni pixel esattamente una volta");
+    }
+
     // --- Orientamento EXIF (bug reale segnalato dall'utente con foto vere:
     // "l'orientamento è completamente sballato") + esportazione JPEG ad alta
     // qualità (bug reale segnalato dallo stesso utente: qualità pessima e
@@ -1490,5 +1597,72 @@ mod tests {
             let diff = (jpeg_px[c] as i32 - tiff_px[c] as i32).abs();
             assert!(diff <= 2, "canale {c}: JPEG={} TIFF={} (troppo distanti per essere lo stesso rendering)", jpeg_px[c], tiff_px[c]);
         }
+    }
+
+    #[test]
+    fn tonal_mask_curve_ffi_returns_256_weights_matching_look_render_for_every_kind() {
+        // La funzione FFI non deve riscrivere la formula di maschera: deve
+        // solo convertire l'enum ed esporre `look_render::tonal_mask_curve`
+        // così com'è — nessuna logica duplicata che potrebbe scollegarsi dal
+        // rendering reale in una modifica futura.
+        for (kind, expected) in [
+            (TonalMaskKindFfi::Shadows, look_render::TonalMaskKind::Shadows),
+            (TonalMaskKindFfi::Highlights, look_render::TonalMaskKind::Highlights),
+            (TonalMaskKindFfi::Blacks, look_render::TonalMaskKind::Blacks),
+            (TonalMaskKindFfi::Whites, look_render::TonalMaskKind::Whites),
+        ] {
+            let via_ffi = tonal_mask_curve(kind);
+            let direct = look_render::tonal_mask_curve(expected);
+            assert_eq!(via_ffi.len(), 256, "kind={kind:?}");
+            for i in 0..256 {
+                assert!(
+                    (via_ffi[i] - direct[i]).abs() < 1e-6,
+                    "kind={kind:?} i={i} via_ffi={} direct={}",
+                    via_ffi[i],
+                    direct[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn export_current_edit_as_sample_png_produces_a_valid_decodable_png_at_preview_size() {
+        // Nuovo in questo giro (richiesta esplicita dell'utente: "trova un
+        // modo per creare la foto di riferimento da uno scatto raw editato
+        // direttamente in app"): i bytes restituiti devono essere un PNG
+        // vero, decodificabile, alla dimensione della copia RIDOTTA usata
+        // per l'editing interattivo (non a piena risoluzione — vedi il
+        // commento esteso sul metodo: un campione serve solo a estrarre
+        // statistiche di tono/colore).
+        let target_bytes = png_bytes_of_solid_color(6, [10, 200, 50]);
+        let session = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let mut look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+        look.exposure_ev = 0.5;
+
+        let sample_png = session.export_current_edit_as_sample_png(look).unwrap();
+        let decoded = image::load_from_memory(&sample_png).unwrap();
+        use image::GenericImageView;
+        assert_eq!(decoded.dimensions(), (6, 6));
+    }
+
+    #[test]
+    fn export_current_edit_as_sample_png_output_is_usable_as_a_paste_look_from_sample_input() {
+        // La ragion d'essere del metodo: i bytes prodotti devono poter
+        // rientrare SUBITO come `sample_bytes` in `paste_look_from_sample`,
+        // esattamente come un file scelto da disco — nessun percorso
+        // speciale da aggiungere altrove per farli accettare.
+        let target_bytes = png_bytes_of_solid_color(6, [200, 150, 100]);
+        let session = PhotoEditSession::new(target_bytes.clone(), "target.png".to_string()).unwrap();
+        let look = HarmonicLookFfi::from(core_types::HarmonicLook::default());
+        let sample_png = session.export_current_edit_as_sample_png(look).unwrap();
+
+        let another_target = PhotoEditSession::new(target_bytes, "target.png".to_string()).unwrap();
+        let result = another_target.paste_look_from_sample(
+            sample_png,
+            "campione_dalla_modifica.png".to_string(),
+            "Look dalla modifica".to_string(),
+            1.0,
+        );
+        assert!(result.is_ok(), "atteso ok, got {:?}", result.err());
     }
 }

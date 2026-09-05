@@ -27,7 +27,7 @@ progettata secondo l'architettura descritta in [`docs/ARCHITECTURE.md`](docs/ARC
   Look ai pixel su CPU — bilanciamento del bianco anche a gradiente, esposizione, tone curve,
   contrasto, highlights/shadows, HSL per banda, split toning, texture a bande di frequenza) e
   **`ffi`** (la superficie UniFFI che collega tutto quanto sopra a Kotlin, incluso l'oggetto
-  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 142 test, tutti verdi,
+  stateful `PhotoEditSession` per il rendering dal vivo, vedi sotto). 152 test, tutti verdi,
   eseguiti in locale prima di ogni consegna. Dettagli in
   [`engine/README.md`](engine/README.md).
 - **`.github/workflows/build.yml`** — la pipeline di build automatica, in 5 fasi:
@@ -910,6 +910,59 @@ in silenzio. Il demosaic vero non è stato verificabile su uno scatto reale in q
 file RAW disponibile qui) — verificato tutto il resto (gestione errori, precisione `f32` end-to-end,
 coerenza fra JPEG e master TIFF); la verifica finale arriva alla prossima build con file veri
 dell'utente. Dettagli tecnici completi in [`engine/README.md`](engine/README.md).
+
+## Nuovo (questo giro): zoom con trascinamento, campione dalla foto già modificata, categorie collassabili, istogramma a schermo — e corretto l'effetto troppo debole di Bianchi/Alte luci/Neri
+
+Richiesta dell'utente (verbatim): *"ok ci siamo quasi, ora aggiungi la possibilità di trascinare
+l'immagine quando si zooma e trova un modo per creare la foto di riferimento da uno scatto raw
+editato direttamente in app. inoltre le categorie di slider rendile collassabili, così espando solo
+quelle che mi servono al momento. ho notato che gli slider di bianchi, alte luci e neri cambiano una
+parte piccolissima dell'istogramma, risolvi e aggiungi anche un istogramma a schermo che evidenzia le
+parti che stai modificando mentre muovi lo slider"* — cinque richieste in un solo messaggio.
+
+**Trascina per spostare la vista quando sei ingrandito**: prima lo zoom con la rotella del mouse era
+sempre centrato, senza modo di spostarsi su un dettaglio non al centro dell'inquadratura una volta
+ingranditi. Ora un trascinamento (mouse su Desktop, dito su Android) sposta la vista, bloccata in
+ogni direzione a non scoprire mai un bordo vuoto attorno all'immagine — lo stesso limite di qualunque
+visualizzatore foto con zoom+pan. Ridimensionare la finestra (Desktop) dopo aver ingrandito/spostato
+la vista ricalcola subito il limite corretto, invece di restare ancorato alle dimensioni misurate
+all'apertura.
+
+**"Usa come campione"**: un nuovo pulsante nel pannello Develop, accanto a "Reimposta". Prima la foto
+"campione" per la Sintesi Armonica/Smart-Batch poteva venire SOLO da un file scelto da disco — non
+c'era modo di usare come riferimento uno scatto RAW già aperto e modificato a mano nella stessa
+sessione. Ora rende disponibile la modifica corrente (con l'intensità edit già applicata) sia per
+"Incolla impostazioni" sulla foto singola sia per l'elaborazione in batch, con un solo click.
+
+**Categorie di slider collassabili**: le 9 sezioni del pannello Develop (Base, Colore, WB a
+gradiente, Curva tonale, HSL, Texture, Riduzione rumore, Maschera Soggetto/Sfondo, Split Toning) si
+espandono/richiudono singolarmente cliccando sul titolo — solo "Base" (esposizione/contrasto/luci/
+ombre/bianchi/neri, la categoria più usata) parte già aperta, come nel pannello Base di Lightroom;
+tutte le altre partono chiuse, così si espande solo quella che serve al momento invece di scorrere un
+pannello sempre interamente disteso.
+
+**Istogramma a schermo, con evidenziazione dal vivo**: sempre visibile in cima al pannello Develop,
+sotto il titolo. Mentre si trascina uno degli slider Ombre/Alte luci/Bianchi/Neri, la fascia tonale
+che quello slider sta davvero modificando si illumina sopra l'istogramma stesso, con un'opacità
+proporzionale al peso reale della maschera in quel punto (non un confine netto sì/no, che avrebbe
+suggerito un limite più rigido di quello vero) — calcolata dalla STESSA formula usata dal motore di
+rendering, non una sua riscrittura lato Kotlin.
+
+**Corretto — la causa segnalata dall'utente stesso**: gli slider Bianchi/Neri agivano su una fascia
+tonale larga solo il 12% del range (0..0.12 per i Neri, 0.88..1.0 per i Bianchi) — troppo stretta per
+avere un effetto visibile su un istogramma tipico, dove pochi pixel cadono esattamente in quelle
+fasce estreme. Allargata alla stessa ampiezza (ora il 50% del range, non più il 40%: anche Alte luci
+era fra gli slider segnalati) delle zone Ombre/Alte luci, ma con una caduta più ripida (quadratica
+invece che lineare) che mantiene questi due slider concentrati verso il vero punto di nero/bianco
+invece di comportarsi come un secondo Ombre/Alte luci. Dettagli tecnici completi, inclusa la verifica
+con 10 nuovi test Rust (workspace passato da 142 a 152, tutti verdi), in
+[`engine/README.md`](engine/README.md).
+
+**Non verificato in questo ambiente**: le quattro modifiche Kotlin (zoom+pan, pulsante "Usa come
+campione", sezioni collassabili, disegno dell'istogramma su `Canvas`) non sono compilabili qui — come
+sempre in questo progetto, la verifica arriva alla prossima build CI. Le due aggiunte lato motore
+(allargamento delle zone tonali, `tonal_mask_curve`/istogramma/campione-da-modifica in `rawforge-ffi`)
+sono invece compilate e testate in questo ambiente.
 
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 
