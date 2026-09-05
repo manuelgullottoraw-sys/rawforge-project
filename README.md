@@ -587,6 +587,19 @@ riferimento. Il principio strutturale (curve/contrasto sulla luminosità, non pe
 per-banda relativo alla stessa foto, non a una costante esterna) è invece una correzione solida,
 non un numero da ritarare.
 
+## Corretto: la build falliva su GitHub Actions con "Unresolved reference: graphicsLayer"
+
+Il primo giro di CI dopo l'aggiunta dello zoom con rotella del mouse è fallito su
+`:shared:compileKotlinDesktop` (runner Windows) con due errori identici in `App.kt`,
+righe 19 e 847: `Unresolved reference: graphicsLayer`. La causa era un semplice import
+dal pacchetto sbagliato: `androidx.compose.ui.draw.graphicsLayer` invece del pacchetto
+corretto `androidx.compose.ui.graphics.graphicsLayer` (l'estensione `Modifier.graphicsLayer`
+vive nel modulo `ui-graphics`, non `ui` base, a differenza di `clipToBounds` che invece è
+davvero in `androidx.compose.ui.draw` — da qui la confusione). Corretto l'import in
+`App.kt`; nessun'altra occorrenza nel progetto. Non è un problema specifico di Windows: lo
+stesso identico errore avrebbe bloccato anche la build Android, semplicemente il job
+Windows è quello che ha girato ed è fallito per primo.
+
 ## Build locale (facoltativo, per chi ha già Android Studio / JDK 17 / NDK installati)
 
 ```bash
